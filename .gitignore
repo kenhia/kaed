@@ -1,0 +1,7 @@
+.scratch/
+.env
+
+
+# Added by cargo
+
+/target
