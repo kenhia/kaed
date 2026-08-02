@@ -6,13 +6,15 @@
 
 ## Now
 
-- **Sprint 002 — candidate: blast-radius hardening.** The live test's
-  findings, mostly server-side and small: explicit project roots instead
-  of `$HOME` and/or a resolver-level denylist (#908), RFC 6750 error
-  attributes on 401s (#913), a stance on journal blobs retaining
+- **Sprint 002 — blast-radius hardening** (proposal in korg). The live
+  test's findings, mostly server-side and small: explicit project roots
+  instead of `$HOME` and/or a resolver-level denylist (#908), RFC 6750
+  error attributes on 401s (#913), a stance on journal blobs retaining
   credentials and third-party pre-images (#909), conflict/rollback
-  visibility in the journal (#910), and the token-rotation story decision
-  before fleet deploy (#914). Directly unblocks adding roots and clients.
+  visibility in the journal (#910), the token-rotation story decision
+  before fleet deploy (#914), and contract wording for version
+  durability — content-derived, survives restarts/rotation (#915).
+  Directly unblocks adding roots and clients.
 
 ## Next
 
