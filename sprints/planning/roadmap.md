@@ -6,13 +6,13 @@
 
 ## Now
 
-- **Sprint 001 — walking skeleton.** Smallest kaed that beats
-  base64-over-ssh: `roots`, `stat`, `list`, `read`, `search`, and `edit`
-  with `anchor_replace` / `range_replace` / `create` — full R1/R2 version
-  semantics, atomic multi-file apply, bearer auth, streamable HTTP.
-  Journal writes recorded (schema in place) but no `journal`/`diff`/
-  `revert` tools yet. Deploy to kai as a systemd user service behind
-  tailscale serve; wire into Desktop Claude; dogfood on a scratch repo.
+- **Sprint 002 — candidate: blast-radius hardening.** The live test's
+  findings, mostly server-side and small: explicit project roots instead
+  of `$HOME` and/or a resolver-level denylist (#908), RFC 6750 error
+  attributes on 401s (#913), a stance on journal blobs retaining
+  credentials and third-party pre-images (#909), conflict/rollback
+  visibility in the journal (#910), and the token-rotation story decision
+  before fleet deploy (#914). Directly unblocks adding roots and clients.
 
 ## Next
 
@@ -42,3 +42,12 @@
 - Per-region versioning for conflict-free disjoint edits.
 - MCP resources/subscriptions; metrics & observability; binary/non-UTF-8
   handling; journal → korg feedback promotion automation.
+
+## Done
+
+- **Sprint 001 — walking skeleton** (2026-08-02). The six core tools,
+  R1–R4 semantics, atomic apply, journal writes, bearer auth over
+  streamable HTTP; deployed to kai (systemd user unit + tailscale
+  serve) and verified end-to-end from Desktop Claude on cleo. Record:
+  `sprints/001-walking-skeleton/`; contract clarifications in its
+  `contract-notes.md`; follow-up WIs #908–#911, #913, #914.
