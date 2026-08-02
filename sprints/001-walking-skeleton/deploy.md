@@ -39,6 +39,17 @@ in config.toml must carry `kai.<tailnet>.ts.net` (and the `:4870`
 form). Symptom otherwise: 4xx before auth even runs. Same will apply on
 kubs0/kubsdb at fleet-deploy time.
 
+## 401 semantics (save future-you a hunt)
+
+kaed has **no token expiry**. A 401 means the presented token matched
+no configured identity — wrong or rotated, full stop. Clients may
+render it as "requires re-authorization (token expired)" (cleo's did);
+that's the client's generic 401 story, and there is no TTL to go
+looking for. Fix the client's token and restart it — Claude Code loads
+MCP servers only at session start. kaed reads its token env file only
+at startup too: after editing `~/.config/kaed/env`,
+`systemctl --user restart kaed`.
+
 ## Wiring a client (Desktop Claude on cleo)
 
 Add a custom connector / MCP server:

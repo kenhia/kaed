@@ -64,6 +64,12 @@ Implementation order and per-module decisions: [plan.md](plan.md).
   stay open for the next sprints. Tailnet hostname scrubbed from repo
   and history (placeholder `<tailnet>`; branch was never pushed, so an
   amend sufficed).
+- 2026-08-02 — Rotation follow-up from cleo: a 401 rendered client-side
+  as "token expired" — kaed has no expiry, so that misleads. 401
+  semantics documented in [deploy.md](deploy.md); WI #913 filed (RFC
+  6750 error attrs on the 401). Rotation-is-a-hard-cut concern judged
+  real on the server side (dual-token grace window, reload without
+  restart) → WI #914, decide before fleet deploy.
 
 ## Shipped
 
