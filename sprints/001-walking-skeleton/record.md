@@ -38,10 +38,36 @@ Implementation order and per-module decisions: [plan.md](plan.md).
 - 2026-08-02 — Sprint started. Planning docs read (summary, contract,
   architecture, overview). Record + plan written; korg proposal 898
   active.
+- 2026-08-02 — Milestones 1–6 landed in order, each green under `just
+  check`: scaffold/errors/config → addr+fsops → edit engine → journal →
+  search → MCP server. 80 unit + 5 integration tests. Contract
+  clarifications accumulated in [contract-notes.md](contract-notes.md).
+  rmcp 3.1.0 (API read from registry source — training-data versions were
+  long stale). Notable: rmcp's default `allowed_hosts` is loopback-only
+  (DNS-rebinding guard), so the tailnet hostname must be configured at
+  deploy — `server.allowed_hosts` config field exists for exactly this.
+
+- 2026-08-02 — Deployed to kai (we're *on* kai, so local install):
+  systemd user unit + `tailscale serve --https=4870`. Live-dogfooded the
+  full loop through the ts.net URL. Details + the Host-validation gotcha
+  in [deploy.md](deploy.md). k-homelab WI #907 records the machine
+  change; klams carries the deployment knowledge.
 
 ## Shipped
 
-_(filled in as work lands)_
+- The six walking-skeleton tools over streamable HTTP with bearer auth,
+  R1–R4 semantics throughout, atomic multi-file apply with mode
+  preservation, SQLite journal (txns/files/blobs/feedback schema) with
+  torn-txn detection at startup, conflict deltas served from retained
+  blobs. `kaed serve` + `kaed check-config`.
+- Deployed and verified on kai: https://kai.<tailnet>.ts.net:4870/mcp
+  (journal txn 1 = the dogfood edit, attributed and intent-tagged).
+
+## Remaining for sprint close
+
+- Desktop Claude on cleo wired to kaed (needs Ken: cleo is his Windows
+  desktop; connector URL + token per deploy.md) and a real dogfood
+  session from there — the sprint's actual exit criterion.
 
 ## Follow-ups
 
