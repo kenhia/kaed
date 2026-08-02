@@ -5,6 +5,7 @@
 
 pub mod addr;
 pub mod config;
+pub mod deny;
 pub mod errors;
 pub mod fsops;
 pub mod journal;

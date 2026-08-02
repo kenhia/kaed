@@ -12,6 +12,13 @@ agent-filed feedback. Nothing here is frozen.
 - **Auth:** `Authorization: Bearer <token>`; one token per agent identity
   (e.g. `claude`, `ghcp`). The token binds an **author identity** recorded
   on every journal entry. No anonymous mutation.
+- **Tokens do not expire.** A 401 means the presented token matches no
+  configured identity — wrong or rotated — and says so in the
+  `WWW-Authenticate` challenge (RFC 6750: `error="invalid_token"` plus a
+  description). There is no TTL to hunt for. Rotation is non-breaking
+  server-side: a previous token can be honoured during a grace window and
+  new tokens load on `SIGHUP` without dropping live sessions. Clients
+  still learn a new secret only when they restart.
 - **Statelessness:** no tool depends on hidden per-session server state.
   Any session, including a brand-new one, can act given only tool results.
 
@@ -20,6 +27,18 @@ agent-filed feedback. Nothing here is frozen.
 - **R1 — versions everywhere.** Every response that carries file content
   also carries that file's `version`: the first 16 hex chars of the BLAKE3
   hash of the file's bytes. Directory-level results don't need versions.
+
+  A version is a **pure content address, not a lease or a session handle**.
+  It is a fact about the bytes, computed on demand, held nowhere. So a
+  version never expires and stays valid across client restarts, server
+  restarts, transport reconnects, and token rotation — the only thing that
+  invalidates it is the file's content changing, which is exactly what it
+  is for. An agent resuming after a crash or a context compaction can edit
+  straight from a version it recorded long ago: it either succeeds or gets
+  a precise `version_conflict` with a delta. No defensive re-read, no
+  "refresh the handle first" step. (Verified live 2026-08-02: a version
+  taken before a client restart, a server reconnect, *and* a credential
+  rotation was still accepted as an edit base afterward.)
 - **R2 — mutations declare base versions; transactions are atomic.** Every
   mutating call names the version of each file it touches. All ops in a
   call apply, or none do. `dry_run` is available on every mutation.
@@ -27,13 +46,22 @@ agent-filed feedback. Nothing here is frozen.
   `truncated: true` plus enough information (`next_offset`, remaining
   count) to continue. Never silently truncate.
 - **R4 — structured errors.** Failures are `isError` results carrying
-  `{code, message, data}`. Codes: `not_found`, `outside_root`,
+  `{code, message, data}`. Codes: `not_found`, `outside_root`, `denied`,
   `version_conflict`, `ambiguous_anchor`, `anchor_not_found`,
   `invalid_input`, `too_large`, `is_binary`, `parse_unavailable`,
   `internal`. `data` makes the error actionable: `version_conflict`
   carries `{expected_version, actual_version, delta}` (a compact diff of
   what changed since the agent last looked); `ambiguous_anchor` carries the
-  candidate line numbers.
+  candidate line numbers; `denied` carries `{path, rule}`.
+- **R7 — the deny list is absolute, and never silent.** Some paths are
+  refused inside the roots: kaed's own config and journal directories
+  always, plus configured globs (`.ssh`, `.env`, `*.pem`, … by default).
+  Addressing one is `denied` — a permanent refusal, not a path to correct,
+  so it should never be retried. Enumeration (`list`, `search`) omits them
+  instead of failing, and reports `denied_hidden: N` so a filtered result
+  is never mistaken for the whole directory. The check is lexical, applied
+  identically to paths that exist and paths that don't, so a `denied` is
+  never evidence that a file is there.
 - **R5 — three addressing modes, one engine.** Content **anchor** (unique
   match, robust to line drift), **range@version** (line numbers valid only
   against a declared version), **node** (tree-sitter selector). Identical
@@ -67,8 +95,11 @@ List configured workspace roots.
 
 #### `list`
 - **In:** `{root, path?, glob?, depth? (default 1), max? }`
-- **Out:** `{entries: [{path, kind, size}], truncated, next_offset?}`
+- **Out:** `{entries: [{path, kind, size}], truncated, next_offset?,
+  denied_hidden?}`
 - Respects `.gitignore` by default (`ignored: true` to include).
+- `denied_hidden` counts entries the deny list removed (R7); a hidden
+  directory counts once, subtree included. Absent when zero.
 
 #### `read`
 - **In:** `{root, path, range?: {start, end}, window?: {line | anchor,
@@ -94,7 +125,7 @@ List configured workspace roots.
 - **In:** `{root, pattern, regex? (default true), glob?, path?,
   context? (default 2), max_results? (default 50)}`
 - **Out:** `{matches: [{path, version, line, col, text, before[],
-  after[]}], truncated, total?}`
+  after[]}], truncated, total?, denied_hidden?}`
 - Ripgrep-grade server-side search. Each match carries its file's
   `version`, so a hit is directly addressable: search → edit with no read
   in between, safely (a stale hit becomes `version_conflict`, not a wrong

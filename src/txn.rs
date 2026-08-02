@@ -113,6 +113,16 @@ pub struct FileTxnRecord<'a> {
     pub new_content: &'a str,
 }
 
+/// What the journal needs about an attempt that never applied.
+pub struct FailedTxnRecord<'a> {
+    pub author: &'a str,
+    pub intent: Option<&'a str>,
+    pub root: &'a ResolvedRoot,
+    /// Paths the ops targeted, in the order they were requested.
+    pub paths: Vec<&'a str>,
+    pub error: &'a KaedError,
+}
+
 /// Journal hook. `begin` is called after staging and before any rename —
 /// an interrupted transaction is thus always detectable; `complete` after
 /// every rename landed.
@@ -129,6 +139,9 @@ pub trait TxnRecorder: Sync {
     fn blob(&self, _version: &str) -> Option<String> {
         None
     }
+    /// An attempt that failed. Never carries content: a failed attempt has
+    /// no new bytes worth keeping, and the pre-image is the file on disk.
+    fn fail(&self, _record: &FailedTxnRecord<'_>) {}
 }
 
 /// Recorder for tests and journal-less operation.
@@ -160,7 +173,36 @@ struct FileBuf {
     touched: bool,
 }
 
+/// Apply a transaction, recording the attempt either way.
+///
+/// Sprint 001 journaled only successes, so the two most diagnostic events —
+/// a `version_conflict` and an atomicity rollback — left no trace at all
+/// (#910). Conflicts are exactly the signal you want when two agents
+/// contend over a file, or when one loops on a stale base, so every failed
+/// attempt is now recorded. Dry runs are not: nothing was attempted.
 pub fn apply(
+    root: &ResolvedRoot,
+    req: &EditRequest,
+    limits: &Limits,
+    author: &str,
+    recorder: &dyn TxnRecorder,
+) -> Result<EditOutcome> {
+    let outcome = apply_inner(root, req, limits, author, recorder);
+    if let Err(e) = &outcome
+        && !req.dry_run
+    {
+        recorder.fail(&FailedTxnRecord {
+            author,
+            intent: req.intent.as_deref(),
+            root,
+            paths: req.ops.iter().map(EditOp::path).collect(),
+            error: e,
+        });
+    }
+    outcome
+}
+
+fn apply_inner(
     root: &ResolvedRoot,
     req: &EditRequest,
     limits: &Limits,
@@ -432,11 +474,7 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, ResolvedRoot) {
         let dir = tempfile::tempdir().unwrap();
-        let root = ResolvedRoot {
-            name: "t".into(),
-            path: dir.path().canonicalize().unwrap(),
-            description: None,
-        };
+        let root = ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap());
         (dir, root)
     }
 
