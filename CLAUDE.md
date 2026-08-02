@@ -56,6 +56,11 @@ record the reasoning behind them.
 - Build/test: `just check` (`cargo fmt --check`, `clippy --all-targets
   -D warnings`, `cargo test`) — run and pass it before shipping.
 - Read first: `sprints/planning/{summary,overview,mcp-contract,architecture,roadmap}.md`
+- **The repo is going public** (sprint 003). `README.md`, `SECURITY.md` and
+  `docs/` are written for strangers, not for this homelab — keep them that
+  way. Machine names (cleo, kai, kubs0, kubsdb) are fine to publish; the
+  tailnet name is not, in files **or commit messages** — `git grep` and
+  `git log -S` both miss messages, which is how one nearly shipped.
 - Deploy state: `sprints/002-blast-radius-hardening/deploy.md` is current
   (roots, token file, rotation procedure); 001's is still the reference
   for tailscale serve and the rmcp `Host` gotcha. The tailnet hostname is

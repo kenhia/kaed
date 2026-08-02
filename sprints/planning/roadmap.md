@@ -14,6 +14,14 @@
 
 - **History tools:** `journal`, `diff`, `revert` — including a read path
   for the `txn_failures` 002 started writing.
+
+  > **Decide the secrets model first.** A redacted read surface is worth
+  > nothing if `journal.db` holds plaintext and these tools serve it. #909
+  > settled blob retention *without* secrets-aware editing in view, so that
+  > decision does not cover this. See
+  > [brainstorm-secrets-editing.md](brainstorm-secrets-editing.md) — take
+  > the call, then build these. Shipping the leak and the guard in the same
+  > quarter is the failure mode.
 - **Structure:** tree-sitter `outline` + `node_replace` + `check` parse
   diagnostics (rust, markdown, toml first).
 - **`feedback` tool** — then act on it: first contract revision driven by
@@ -30,6 +38,12 @@
 
 ## Later / Ideas
 
+- **Secrets-aware editing** — `.kaedignore`, redact-and-restore for
+  `.env`-shaped files, blind generate/rotate an agent never sees. Nothing
+  decided; the thinking is in
+  [brainstorm-secrets-editing.md](brainstorm-secrets-editing.md), which
+  also argues the honest frame: this is blast radius and ergonomics, not
+  access control. Blocks nothing except the history tools above.
 - `apply_patch` (unified-diff input) if dogfooding misses it.
 - Check hooks beyond parse: fmt/lint/`just check` integration in the edit
   response.

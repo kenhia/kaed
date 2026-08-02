@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kaed — an editor whose only user is a machine</title>
+<meta name="description" content="Why kaed exists and how it is put together: verified writes, atomic edit transactions, and a durable journal for agents editing files on remote hosts.">
+<style>
+/* ============================================================
+   kaed — visual explainer
+   Self-contained: no external fonts, scripts, or assets.
+   ============================================================ */
+
+:root {
+  /* type roles: a serif for argument, a humanist sans for prose,
+     a mono for anything the machine actually said */
+  --face-display: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+  --face-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --face-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --step--2: 0.6875rem;
+  --step--1: 0.8125rem;
+  --step-0:  1rem;
+  --step-1:  1.1875rem;
+  --step-2:  1.4375rem;
+  --step-3:  1.75rem;
+  --step-4:  2.125rem;
+
+  --measure: 63ch;
+  --gutter: clamp(1.25rem, 4vw, 3rem);
+  --rhythm: clamp(3.5rem, 8vw, 6rem);
+  --radius: 3px;
+
+  /* light: cool paper, blue-biased neutrals, signal amber */
+  --ground:    #F2F4F7;
+  --surface:   #FFFFFF;
+  --surface-2: #E7EBF1;
+  --ink:       #141B24;
+  --ink-2:     #4A5661;
+  --ink-3:     #6F7B87;
+  --rule:      #D2D9E1;
+  --rule-firm: #B4BEC9;
+  --accent:    #A85F0C;
+  --accent-2:  #C77A1E;
+  --accent-bg: #F7E9D5;
+  --ok:        #1C6A63;
+  --ok-bg:     #DCEDEA;
+  --warn:      #A2401A;
+  --warn-bg:   #F6E2DA;
+  --shadow: 0 1px 2px rgba(20, 27, 36, .06), 0 8px 24px -12px rgba(20, 27, 36, .18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground:    #0D131A;
+    --surface:   #141C25;
+    --surface-2: #1C2631;
+    --ink:       #E5EBF1;
+    --ink-2:     #A4B1BD;
+    --ink-3:     #76838F;
+    --rule:      #27323D;
+    --rule-firm: #3A4753;
+    --accent:    #EBA44C;
+    --accent-2:  #D08C33;
+    --accent-bg: #2E2314;
+    --ok:        #56B7AA;
+    --ok-bg:     #12312E;
+    --warn:      #DC7A5B;
+    --warn-bg:   #351C13;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+  }
+}
+
+/* the viewer's toggle must win over the media query, both directions */
+:root[data-theme="light"] {
+  --ground:#F2F4F7; --surface:#FFFFFF; --surface-2:#E7EBF1;
+  --ink:#141B24; --ink-2:#4A5661; --ink-3:#6F7B87;
+  --rule:#D2D9E1; --rule-firm:#B4BEC9;
+  --accent:#A85F0C; --accent-2:#C77A1E; --accent-bg:#F7E9D5;
+  --ok:#1C6A63; --ok-bg:#DCEDEA; --warn:#A2401A; --warn-bg:#F6E2DA;
+  --shadow: 0 1px 2px rgba(20,27,36,.06), 0 8px 24px -12px rgba(20,27,36,.18);
+}
+:root[data-theme="dark"] {
+  --ground:#0D131A; --surface:#141C25; --surface-2:#1C2631;
+  --ink:#E5EBF1; --ink-2:#A4B1BD; --ink-3:#76838F;
+  --rule:#27323D; --rule-firm:#3A4753;
+  --accent:#EBA44C; --accent-2:#D08C33; --accent-bg:#2E2314;
+  --ok:#56B7AA; --ok-bg:#12312E; --warn:#DC7A5B; --warn-bg:#351C13;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 30px -14px rgba(0,0,0,.7);
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--face-body);
+  font-size: var(--step-0);
+  line-height: 1.65;
+  overflow-x: hidden;
+  text-rendering: optimizeLegibility;
+}
+
+/* ---------------------------------------------------- structure */
+
+.band { padding: var(--rhythm) var(--gutter); }
+.band--alt { background: var(--surface); border-block: 1px solid var(--rule); }
+.wrap { max-width: 74rem; margin-inline: auto; }
+.prose { max-width: var(--measure); }
+
+.eyebrow {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .16em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 .9rem;
+  display: flex;
+  align-items: center;
+  gap: .7rem;
+}
+.eyebrow::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--rule-firm);
+}
+
+h1, h2, h3 {
+  font-family: var(--face-display);
+  font-weight: 600;
+  line-height: 1.15;
+  text-wrap: balance;
+  margin: 0 0 .6em;
+  letter-spacing: -0.012em;
+}
+h2 { font-size: var(--step-3); }
+h3 { font-size: var(--step-1); letter-spacing: 0; }
+
+p { margin: 0 0 1.1em; }
+p:last-child { margin-bottom: 0; }
+.lede { font-size: var(--step-1); color: var(--ink-2); line-height: 1.55; }
+.dim { color: var(--ink-2); }
+.small { font-size: var(--step--1); }
+
+code, kbd, samp, .mono { font-family: var(--face-mono); }
+code {
+  font-size: .875em;
+  background: var(--surface-2);
+  padding: .12em .38em;
+  border-radius: var(--radius);
+}
+.band--alt code { background: var(--ground); }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:focus-visible, .host:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+/* ---------------------------------------------------------- hero */
+
+.hero {
+  padding: clamp(3.5rem, 11vw, 7.5rem) var(--gutter) var(--rhythm);
+  border-bottom: 1px solid var(--rule);
+  background:
+    radial-gradient(120ch 46ch at 12% -8%, var(--accent-bg) 0%, transparent 62%),
+    var(--ground);
+}
+.hero h1 {
+  font-size: clamp(2.25rem, 6.2vw, 4rem);
+  max-width: 20ch;
+  margin-bottom: .45em;
+}
+.hero .lede { max-width: 54ch; }
+
+.wordmark {
+  font-family: var(--face-mono);
+  font-size: var(--step--1);
+  letter-spacing: .34em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 2.6rem;
+}
+.wordmark b { color: var(--ink); font-weight: 600; }
+
+/* the version hash: kaed's atom, used as the hero's one flourish */
+.atom {
+  margin-top: 2.75rem;
+  display: inline-grid;
+  gap: .55rem;
+  padding: 1rem 1.15rem;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  max-width: 100%;
+  overflow-x: auto;
+}
+.atom .k {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.atom .v {
+  font-family: var(--face-mono);
+  font-size: clamp(1rem, 3.4vw, 1.5rem);
+  letter-spacing: .06em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+.atom .v i { font-style: normal; color: var(--accent); }
+
+/* ------------------------------------------------------ failures */
+
+.split {
+  display: grid;
+  gap: 1.25rem;
+  grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+  margin-top: 2.25rem;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 1.4rem 1.5rem;
+}
+.band--alt .card { background: var(--ground); }
+.card h3 { margin-bottom: .4rem; }
+.card .tag {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--warn);
+  background: var(--warn-bg);
+  padding: .18rem .5rem;
+  border-radius: 2px;
+  display: inline-block;
+  margin-bottom: .9rem;
+}
+.card p { font-size: var(--step--1); color: var(--ink-2); margin-bottom: 0; }
+.card p + p { margin-top: .7em; }
+
+/* --------------------------------------------------- inversions */
+
+.inversions { margin-top: 2rem; display: grid; gap: 0; }
+.inv {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.15fr;
+  gap: 1.5rem;
+  padding: 1.05rem 0;
+  border-top: 1px solid var(--rule);
+  align-items: start;
+}
+.inv:last-child { border-bottom: 1px solid var(--rule); }
+.inv > div { font-size: var(--step--1); }
+.inv .was { color: var(--ink-3); }
+.inv .is { color: var(--ink-2); }
+.inv .ans { color: var(--ink); }
+.inv .ans strong { color: var(--accent); font-weight: 600; }
+.inv-head {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.15fr;
+  gap: 1.5rem;
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding-bottom: .5rem;
+}
+@media (max-width: 46rem) {
+  .inv, .inv-head { grid-template-columns: 1fr; gap: .3rem; }
+  .inv-head { display: none; }
+  .inv .was::before  { content: "human editor — "; color: var(--ink-3); font-family: var(--face-mono); font-size: .82em; letter-spacing: .06em; }
+  .inv .is::before   { content: "agent reality — "; color: var(--ink-3); font-family: var(--face-mono); font-size: .82em; letter-spacing: .06em; }
+  .inv .ans::before  { content: "kaed — ";          color: var(--accent); font-family: var(--face-mono); font-size: .82em; letter-spacing: .06em; }
+}
+
+/* -------------------------------------------------------- the loop */
+
+.loop {
+  margin-top: 2.25rem;
+  display: grid;
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+}
+.step {
+  background: var(--surface);
+  padding: 1.3rem 1.4rem 1.5rem;
+  display: grid;
+  gap: .5rem;
+  align-content: start;
+}
+.band--alt .step { background: var(--ground); }
+.step .n {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .14em;
+  color: var(--accent);
+}
+.step h3 { margin: 0; font-size: var(--step-0); font-family: var(--face-body); font-weight: 650; }
+.step p { font-size: var(--step--1); color: var(--ink-2); margin: 0; }
+.step .wire {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  color: var(--ink-3);
+  background: var(--surface-2);
+  padding: .45rem .6rem;
+  border-radius: 2px;
+  margin-top: .2rem;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.proof {
+  margin-top: 1.5rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+.band--alt .proof { background: var(--ground); }
+.proof-head {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: .6rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+.proof-head b { color: var(--ok); font-weight: 600; letter-spacing: .06em; }
+.diff {
+  margin: 0;
+  padding: .9rem 1rem;
+  font-family: var(--face-mono);
+  font-size: var(--step--1);
+  line-height: 1.7;
+  overflow-x: auto;
+}
+.diff .h { color: var(--ink-3); }
+.diff .m { color: var(--accent); }
+.diff .d { color: var(--warn); }
+.diff .a { color: var(--ok); }
+
+/* ------------------------------------------------------ diagrams */
+
+.figure {
+  margin-top: 2.25rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow: hidden;
+}
+.band--alt .figure { background: var(--ground); }
+.figure-body { overflow-x: auto; padding: 1.5rem; }
+.figure svg { display: block; min-width: 34rem; width: 100%; height: auto; }
+figcaption {
+  font-size: var(--step--1);
+  color: var(--ink-2);
+  padding: .85rem 1.5rem 1.1rem;
+  border-top: 1px solid var(--rule);
+  background: var(--surface-2);
+}
+
+/* svg theming through tokens */
+.svg-plate { fill: var(--surface-2); }
+.svg-box   { fill: var(--surface); stroke: var(--rule-firm); stroke-width: 1; }
+.band--alt .svg-box { fill: var(--ground); }
+.svg-box--accent { stroke: var(--accent); stroke-width: 1.5; }
+.svg-line  { stroke: var(--rule-firm); stroke-width: 1.25; fill: none; }
+.svg-line--accent { stroke: var(--accent); stroke-width: 1.5; fill: none; }
+.svg-t     { fill: var(--ink); font-family: var(--face-body); font-size: 13px; }
+.svg-t--sm { fill: var(--ink-2); font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .06em; }
+.svg-t--k  { fill: var(--ink); font-family: var(--face-mono); font-size: 12px; font-weight: 600; }
+.svg-t--a  { fill: var(--accent); font-family: var(--face-mono); font-size: 10.5px; letter-spacing: .08em; }
+.svg-arrow { fill: var(--rule-firm); }
+.svg-arrow--accent { fill: var(--accent); }
+
+/* ---------------------------------------------------- deny layers */
+
+.layers { margin-top: 2.25rem; display: grid; gap: .75rem; }
+.layer {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 1.1rem;
+  align-items: start;
+  padding: 1.1rem 1.3rem;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.band--alt .layer { background: var(--ground); }
+.layer .bar {
+  width: 4px;
+  align-self: stretch;
+  border-radius: 4px;
+  background: var(--accent);
+}
+.layer:nth-child(2) .bar { background: var(--accent-2); opacity: .75; }
+.layer:nth-child(3) .bar { background: var(--rule-firm); }
+.layer h3 { margin: 0 0 .25rem; font-size: var(--step-0); font-family: var(--face-body); font-weight: 650; }
+.layer p { margin: 0; font-size: var(--step--1); color: var(--ink-2); }
+.layer .hard {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--accent);
+  display: block;
+  margin-top: .4rem;
+}
+
+.callout {
+  margin-top: 1.75rem;
+  padding: 1.15rem 1.35rem;
+  border: 1px solid var(--rule-firm);
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius);
+  background: var(--warn-bg);
+}
+.callout p { margin: 0; font-size: var(--step--1); color: var(--ink); }
+.callout strong { color: var(--warn); }
+
+/* ----------------------------------------------------------- fleet */
+
+.fleet {
+  margin-top: 2.25rem;
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+}
+.host {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 1.15rem 1.25rem;
+  background: var(--surface);
+  display: grid;
+  gap: .35rem;
+  align-content: start;
+}
+.band--alt .host { background: var(--ground); }
+.host--live { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+.host .name {
+  font-family: var(--face-mono);
+  font-size: var(--step-1);
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.host .role { font-size: var(--step--1); color: var(--ink-2); }
+.host .state {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin-top: .45rem;
+}
+.host--live .state { color: var(--ok); }
+.host--planned .state { color: var(--ink-3); }
+.host--client .state { color: var(--accent); }
+
+/* ---------------------------------------------------------- status */
+
+.status { margin-top: 2.25rem; display: grid; gap: 0; }
+.row {
+  display: grid;
+  grid-template-columns: 7.5rem 1fr;
+  gap: 1.25rem;
+  padding: 1rem 0;
+  border-top: 1px solid var(--rule);
+  align-items: baseline;
+}
+.row:last-child { border-bottom: 1px solid var(--rule); }
+.row .when {
+  font-family: var(--face-mono);
+  font-size: var(--step--2);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.row .what { font-size: var(--step--1); color: var(--ink-2); }
+.row .what b { color: var(--ink); font-weight: 650; }
+.row--done .when { color: var(--ok); }
+.row--now .when { color: var(--accent); }
+@media (max-width: 34rem) {
+  .row { grid-template-columns: 1fr; gap: .2rem; }
+}
+
+/* ---------------------------------------------------------- footer */
+
+.foot {
+  padding: 2.5rem var(--gutter) 3.5rem;
+  border-top: 1px solid var(--rule);
+  background: var(--surface);
+  font-size: var(--step--1);
+  color: var(--ink-2);
+}
+.foot .wrap { display: flex; flex-wrap: wrap; gap: 1.5rem; justify-content: space-between; }
+.foot code { background: var(--ground); }
+
+/* ---------------------------------------------------------- motion */
+
+.reveal { opacity: 0; transform: translateY(10px); }
+.reveal.seen {
+  opacity: 1;
+  transform: none;
+  transition: opacity .5s ease, transform .5s cubic-bezier(.2,.7,.3,1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .reveal, .reveal.seen { opacity: 1; transform: none; transition: none; }
+  * { animation: none !important; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================================ hero -->
+<header class="hero">
+  <div class="wrap">
+    <p class="wordmark"><b>kaed</b> — ken's agent editor</p>
+    <h1>An editor whose only user is a machine.</h1>
+    <p class="lede">
+      Every feature of a normal editor — the viewport, the cursor, the undo
+      stack — exists to serve eyes and fingers. An agent has none of those.
+      kaed is what an editor looks like when you design for the client that
+      actually shows up: one that can't see the screen, whose copy of the file
+      is always slightly out of date, and that pays for every byte you hand
+      back.
+    </p>
+
+    <div class="atom">
+      <span class="k">version — blake3(file bytes)[..16]</span>
+      <span class="v"><i>7e6a34a0</i>6119ff41</span>
+    </div>
+  </div>
+</header>
+
+<!-- ========================================================= problem -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">The problem</p>
+    <div class="prose">
+      <h2>An agent on one machine, files on another</h2>
+      <p class="dim">
+        That's the whole problem, and it turns out to be badly served. The two
+        obvious approaches both fail — and they fail <em>quietly</em>, which is
+        the expensive part.
+      </p>
+    </div>
+
+    <div class="split reveal">
+      <div class="card">
+        <span class="tag">whole-file only</span>
+        <h3>Piping over ssh</h3>
+        <p>
+          Base64 makes it quote-safe, but it's whole-file replace — no surgical
+          edits. Every write needs a manual checksum round-trip to confirm it
+          landed.
+        </p>
+        <p>
+          Agents skip that verification. It costs a turn, and it usually
+          passes.
+        </p>
+      </div>
+      <div class="card">
+        <span class="tag">reports success</span>
+        <h3>Mounting the filesystem</h3>
+        <p>
+          Native tools work, which is the appeal. But edits strip the
+          executable bit, and a hard kill corrupts the cache — after which
+          <strong>writes fail while the editing tool still reports
+          success</strong>.
+        </p>
+        <p>
+          Changes made on the far side hide behind a directory cache. Silent
+          data loss here is a lived experience, not a hypothetical.
+        </p>
+      </div>
+    </div>
+
+    <div class="prose" style="margin-top:2rem">
+      <p class="dim">
+        Both are human file-access machinery pressed into agent service.
+        Neither was designed for a client that can't look at the result.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ====================================================== inversions -->
+<section class="band band--alt">
+  <div class="wrap">
+    <p class="eyebrow">The inversion</p>
+    <div class="prose">
+      <h2>Nearly every editor concept dissolves</h2>
+      <p class="dim">
+        Enumerate what a human editor does and why, then ask what each feature
+        becomes for a client with no eyes, no ambient state, and a context
+        window it pays rent on.
+      </p>
+    </div>
+
+    <div class="inversions reveal">
+      <div class="inv-head">
+        <div>Human editor</div><div>Agent reality</div><div>kaed's answer</div>
+      </div>
+      <div class="inv">
+        <div class="was">Viewport — you <em>look at</em> the file</div>
+        <div class="is">No eyes; a stale snapshot in a context window</div>
+        <div class="ans">Reads are <strong>queries</strong>, not glances — ranges, windows around an anchor, outlines</div>
+      </div>
+      <div class="inv">
+        <div class="was">Cursor — position is ambient state</div>
+        <div class="is">No ambient state; every call must say what it means</div>
+        <div class="ans">Explicit addressing every time: <strong>content anchors</strong>, ranges pinned to a version</div>
+      </div>
+      <div class="inv">
+        <div class="was">Keystrokes — thousands of tiny cheap edits</div>
+        <div class="is">Few, expensive, batched mutations per turn</div>
+        <div class="ans">Edits are <strong>transactions</strong> — multi-file, atomic, dry-runnable</div>
+      </div>
+      <div class="inv">
+        <div class="was">You <em>see</em> the edit land</div>
+        <div class="is">Can't see; must trust it, or re-read and pay tokens</div>
+        <div class="ans">The write response <strong>is</strong> the verification — it carries the diff that was applied</div>
+      </div>
+      <div class="inv">
+        <div class="was">Undo stack — private, per-session</div>
+        <div class="is">Sessions die, compact, resume; several agents interleave</div>
+        <div class="ans">A durable <strong>journal</strong> — transaction-grained, attributed, outliving everyone</div>
+      </div>
+      <div class="inv">
+        <div class="was">Syntax highlighting — colour for eyes</div>
+        <div class="is">Colour is meaningless; structure is not</div>
+        <div class="ans">Syntax <strong>addressing</strong> — outlines and node-targeted edits</div>
+      </div>
+      <div class="inv">
+        <div class="was">One user at one keyboard</div>
+        <div class="is">Several agents plus human tools on one tree</div>
+        <div class="ans"><strong>Optimistic concurrency</strong> — conflicts are structured data, never last-write-wins</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ loop -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">The core loop</p>
+    <div class="prose">
+      <h2>Verified writes</h2>
+      <p class="dim">
+        One round-trip instead of three. The agent never re-reads a file to
+        find out what its own edit did.
+      </p>
+    </div>
+
+    <div class="loop reveal">
+      <div class="step">
+        <span class="n">01</span>
+        <h3>Read or search</h3>
+        <p>Every response carrying file content also carries that file's version.</p>
+        <span class="wire">"version": "060ad669c1a1d257"</span>
+      </div>
+      <div class="step">
+        <span class="n">02</span>
+        <h3>Edit, declaring the base</h3>
+        <p>The mutation names the version each file was computed against. All ops land, or none do.</p>
+        <span class="wire">base: [{ path, version }]</span>
+      </div>
+      <div class="step">
+        <span class="n">03</span>
+        <h3>Take the diff as proof</h3>
+        <p>The response contains exactly what changed on disk, plus the new version. Nothing to verify.</p>
+        <span class="wire">"applied": true</span>
+      </div>
+    </div>
+
+    <div class="proof reveal">
+      <div class="proof-head">
+        <span>edit response — the proof</span>
+        <b>060ad669c1a1d257 → 7e6a34a06119ff41</b>
+      </div>
+      <pre class="diff"><span class="h">--- a/app/main.rs
++++ b/app/main.rs</span>
+<span class="m">@@ -1 +1 @@</span>
+<span class="d">-let pw = env("DB_PASSWORD");</span>
+<span class="a">+let secret = env("DB_PASSWORD");</span></pre>
+    </div>
+
+    <div class="prose" style="margin-top:2.25rem">
+      <h3>When the file moved on</h3>
+      <p class="dim">
+        If the declared version doesn't match what's on disk, the edit is
+        refused — and the error carries a diff of <em>what changed since you
+        looked</em>, so the agent can re-anchor and retry without re-reading.
+      </p>
+      <p class="dim">
+        A version is the hash of the bytes, computed on demand and stored
+        nowhere. That makes it a <strong>content address, not a session
+        handle</strong>: it never expires, and it survives client restarts,
+        server restarts, reconnects, and credential rotation. An agent
+        resuming after a crash can edit straight from a version it recorded an
+        hour ago.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ==================================================== architecture -->
+<section class="band band--alt">
+  <div class="wrap">
+    <p class="eyebrow">Architecture</p>
+    <div class="prose">
+      <h2>One daemon per host</h2>
+      <p class="dim">
+        kaed owns the mechanics of editing on the machine it runs on and
+        exposes them as MCP tools over HTTP. It binds loopback; a tunnel
+        handles transport and network access.
+      </p>
+    </div>
+
+    <figure class="figure reveal">
+      <div class="figure-body">
+        <svg viewBox="0 0 900 330" role="img" aria-label="Request path: an agent on cleo reaches the kaed daemon on kai over the tailnet; the daemon authenticates, resolves the path against roots and the deny list, then reads or writes files and records the transaction in a SQLite journal.">
+          <defs>
+            <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" class="svg-arrow"/>
+            </marker>
+            <marker id="ara" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" class="svg-arrow--accent"/>
+            </marker>
+          </defs>
+
+          <!-- client -->
+          <rect x="8" y="108" width="150" height="86" rx="3" class="svg-box"/>
+          <text x="26" y="138" class="svg-t--k">agent</text>
+          <text x="26" y="158" class="svg-t--sm">desktop claude</text>
+          <text x="26" y="175" class="svg-t--sm">on cleo</text>
+
+          <!-- transport -->
+          <path d="M162 151 H 246" class="svg-line--accent" marker-end="url(#ara)"/>
+          <text x="168" y="140" class="svg-t--a">HTTPS</text>
+          <text x="168" y="171" class="svg-t--sm">tailnet :4870</text>
+
+          <!-- host plate -->
+          <rect x="252" y="24" width="640" height="282" rx="4" class="svg-plate"/>
+          <text x="270" y="48" class="svg-t--sm">HOST — kai</text>
+
+          <!-- daemon -->
+          <rect x="272" y="64" width="176" height="220" rx="3" class="svg-box svg-box--accent"/>
+          <text x="290" y="92" class="svg-t--k">kaed serve</text>
+          <text x="290" y="112" class="svg-t--sm">127.0.0.1:4870</text>
+
+          <line x1="272" y1="128" x2="448" y2="128" class="svg-line"/>
+          <text x="290" y="150" class="svg-t">bearer auth</text>
+          <text x="290" y="167" class="svg-t--sm">→ author identity</text>
+
+          <line x1="272" y1="182" x2="448" y2="182" class="svg-line"/>
+          <text x="290" y="204" class="svg-t">path resolve</text>
+          <text x="290" y="221" class="svg-t--sm">jail + deny list</text>
+
+          <line x1="272" y1="236" x2="448" y2="236" class="svg-line"/>
+          <text x="290" y="258" class="svg-t">edit engine</text>
+          <text x="290" y="275" class="svg-t--sm">atomic, versioned</text>
+
+          <!-- roots -->
+          <path d="M452 132 H 560" class="svg-line" marker-end="url(#ar)"/>
+          <rect x="566" y="86" width="150" height="92" rx="3" class="svg-box"/>
+          <text x="584" y="114" class="svg-t--k">roots</text>
+          <text x="584" y="134" class="svg-t--sm">/home/ken/src</text>
+          <text x="584" y="151" class="svg-t--sm">/home/ken/scratch</text>
+          <text x="584" y="168" class="svg-t--a">nothing else</text>
+
+          <!-- denied -->
+          <path d="M642 182 V 214" class="svg-line"/>
+          <rect x="566" y="218" width="150" height="66" rx="3" class="svg-box"/>
+          <text x="584" y="244" class="svg-t--k">refused</text>
+          <text x="584" y="263" class="svg-t--sm">.ssh · .env · *.pem</text>
+          <text x="584" y="278" class="svg-t--sm">kaed's own config</text>
+
+          <!-- journal -->
+          <path d="M452 250 H 500 V 300 H 748 V 172" class="svg-line" marker-end="url(#ar)"/>
+          <rect x="734" y="86" width="146" height="86" rx="3" class="svg-box"/>
+          <text x="752" y="114" class="svg-t--k">journal.db</text>
+          <text x="752" y="134" class="svg-t--sm">who · what · when</text>
+          <text x="752" y="151" class="svg-t--sm">+ failed attempts</text>
+        </svg>
+      </div>
+      <figcaption>
+        Every request authenticates to a named identity before anything else
+        happens; every path is resolved against the configured roots and the
+        deny list before it touches disk; every applied transaction — and
+        every failed one — lands in the journal under the identity that made
+        it.
+      </figcaption>
+    </figure>
+  </div>
+</section>
+
+<!-- ===================================================== blast radius -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">Blast radius</p>
+    <div class="prose">
+      <h2>Three layers, deliberately unequal</h2>
+      <p class="dim">
+        The first deployment rooted at <code>$HOME</code>. Within a day, a
+        remote agent read the bearer token that gated the service — out of
+        kaed's own config directory, through kaed. This is what came of that.
+      </p>
+    </div>
+
+    <div class="layers reveal">
+      <div class="layer">
+        <span class="bar"></span>
+        <div>
+          <h3>kaed's own directories</h3>
+          <p>Its config and journal paths are refused before any configuration is consulted, so kaed can never serve or rewrite the credential that gates it.</p>
+          <span class="hard">not configurable — by design</span>
+        </div>
+      </div>
+      <div class="layer">
+        <span class="bar"></span>
+        <div>
+          <h3>Default deny globs</h3>
+          <p><code>.ssh</code>, <code>.gnupg</code>, <code>.aws</code>, <code>.env</code>, <code>*.pem</code>, <code>id_*</code> and friends — matched against a path and every one of its ancestors.</p>
+          <span class="hard">on unless you turn them off</span>
+        </div>
+      </div>
+      <div class="layer">
+        <span class="bar"></span>
+        <div>
+          <h3>Whatever else you name</h3>
+          <p>Project-specific globs from config. Additive only. A root that lands inside a denied area is refused at startup rather than silently serving nothing.</p>
+          <span class="hard">yours</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="prose" style="margin-top:2.25rem">
+      <h3>Refusal is never silent</h3>
+      <p class="dim">
+        Addressing a denied path returns <code>denied</code> — permanent, and
+        distinct from "you got the path wrong", because no correction makes it
+        work. Listings and searches <em>omit</em> denied entries instead of
+        failing, but report <code>denied_hidden: 2</code> alongside the
+        results. A filtered listing that doesn't say so reads as a complete
+        one.
+      </p>
+    </div>
+
+    <div class="callout reveal">
+      <p>
+        <strong>Stated plainly:</strong> this is blast-radius reduction, not
+        access control. Any agent with a shell can read what kaed refuses to
+        serve. What the deny list buys is that the ordinary, well-intentioned
+        path is safe — a grep doesn't hoover up credentials by accident, and a
+        careless edit can't rewrite your authorized_keys.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- =========================================================== fleet -->
+<section class="band band--alt">
+  <div class="wrap">
+    <p class="eyebrow">Deployment</p>
+    <div class="prose">
+      <h2>One instance per machine, no coordination</h2>
+      <p class="dim">
+        Each host runs its own daemon with its own roots, its own journal, and
+        its own tokens. Nothing is shared, so nothing has to agree.
+      </p>
+    </div>
+
+    <div class="fleet reveal">
+      <div class="host host--client">
+        <span class="name">cleo</span>
+        <span class="role">Workstation. Where the agent runs — and the one machine that doesn't need a daemon.</span>
+        <span class="state">client</span>
+      </div>
+      <div class="host host--live">
+        <span class="name">kai</span>
+        <span class="role">Primary homelab host. Two roots, one identity, dogfooded daily.</span>
+        <span class="state">live</span>
+      </div>
+      <div class="host host--planned">
+        <span class="name">kubs0</span>
+        <span class="role">Second host. Waiting on a repeatable install rather than a hand-built one.</span>
+        <span class="state">planned</span>
+      </div>
+      <div class="host host--planned">
+        <span class="name">kubsdb</span>
+        <span class="role">Database host. Same story, narrower roots.</span>
+        <span class="state">planned</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ========================================================== status -->
+<section class="band">
+  <div class="wrap">
+    <p class="eyebrow">Where it stands</p>
+    <div class="prose">
+      <h2>Early beta, and honest about it</h2>
+      <p class="dim">
+        Six tools — <code>roots</code>, <code>stat</code>, <code>list</code>,
+        <code>read</code>, <code>search</code>, <code>edit</code> — working
+        end to end from a remote agent, on one host, used every day by the
+        person who wrote it and essentially nobody else.
+      </p>
+    </div>
+
+    <div class="status reveal">
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>Walking skeleton.</b> The six tools, versioned reads, atomic apply, the journal, bearer auth over streamable HTTP. Deployed and verified from a remote agent.</span>
+      </div>
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>Blast-radius hardening.</b> Everything the first live test exposed: the deny list, self-describing 401s, failed transactions in the journal, real blob retention, non-breaking token rotation.</span>
+      </div>
+      <div class="row row--now">
+        <span class="when">next</span>
+        <span class="what"><b>Fleet deploy.</b> More than one host, and an install you can repeat.</span>
+      </div>
+      <div class="row row--now">
+        <span class="when">next</span>
+        <span class="what"><b>History tools.</b> <code>journal</code>, <code>diff</code>, <code>revert</code>. The data is already being written; nothing reads it yet.</span>
+      </div>
+      <div class="row row--now">
+        <span class="when">next</span>
+        <span class="what"><b>Structure.</b> Tree-sitter outlines, node-targeted edits, and parse diagnostics returned in the edit response — so "did I break the syntax?" is answered by the write, like everything else.</span>
+      </div>
+      <div class="row">
+        <span class="when">the test</span>
+        <span class="what"><b>The dogfood report.</b> A written comparison against ssh-piping and mounts on real tasks: round-trips, failures, token cost. Until that exists, "kaed is better" is a hypothesis.</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer class="foot">
+  <div class="wrap">
+    <div>
+      <strong>kaed</strong> — an editor whose only user is an AI agent.<br>
+      MIT licensed. Built in the open at <code>github.com/kenhia/kaed</code>.
+    </div>
+    <div>
+      Read next: <code>docs/overview.md</code> · <code>docs/setup.md</code> · <code>SECURITY.md</code>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var targets = document.querySelectorAll(".reveal");
+  if (reduce || !("IntersectionObserver" in window)) {
+    targets.forEach(function (el) { el.classList.add("seen"); });
+    return;
+  }
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { e.target.classList.add("seen"); io.unobserve(e.target); }
+    });
+  }, { rootMargin: "0px 0px -12% 0px", threshold: 0.08 });
+  targets.forEach(function (el) { io.observe(el); });
+})();
+</script>
+
+</body>
+</html>

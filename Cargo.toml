@@ -2,6 +2,16 @@
 name = "kaed"
 version = "0.1.0"
 edition = "2024"
+description = "An editor whose only user is an AI agent: an MCP server for verified, transactional, journaled file edits over HTTP."
+authors = ["Ken Hiatt"]
+license = "MIT"
+repository = "https://github.com/kenhia/kaed"
+readme = "README.md"
+keywords = ["mcp", "agent", "editor", "llm", "ai"]
+categories = ["development-tools", "text-editors"]
+# Not published to crates.io: kaed is a daemon you deploy, and its version
+# numbers track sprints rather than a public API.
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
