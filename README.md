@@ -82,7 +82,9 @@ is what lets the security story be stated in one paragraph. See
   token, systemd unit, remote access, client wiring, rotation. Includes a
   section you can hand to your own agent to do the install.
 - **[docs/kaed-explained.html](docs/kaed-explained.html)** — a single-page
-  visual explainer. Self-contained; open it straight from disk.
+  visual explainer
+  ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).
+  Self-contained; it renders offline straight from a checkout too.
 - **[SECURITY.md](SECURITY.md)** — threat model, stated honestly.
 - **[sprints/](sprints/)** — the development history: planning docs, the MCP
   contract, and one record per sprint.

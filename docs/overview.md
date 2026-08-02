@@ -1,7 +1,9 @@
 # kaed: what it is and why it exists
 
 > New here? [`kaed-explained.html`](kaed-explained.html) is the same story as
-> one visual page. This document is the prose version, with the reasoning.
+> one visual page
+> ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).
+> This document is the prose version, with the reasoning.
 
 ## The problem
 
