@@ -7,4 +7,5 @@ pub mod addr;
 pub mod config;
 pub mod errors;
 pub mod fsops;
+pub mod journal;
 pub mod txn;
