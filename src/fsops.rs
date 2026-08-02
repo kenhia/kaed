@@ -340,9 +340,20 @@ pub enum ReadMode<'a> {
     WindowAnchor { anchor: &'a str, context: usize },
 }
 
+/// A file loaded through the jail: resolved location, exact content, and
+/// the version of the bytes served.
+#[derive(Debug)]
+pub struct Loaded {
+    pub abs: PathBuf,
+    pub content: String,
+    pub version: String,
+    /// Unix permission bits, for mode preservation on edit.
+    pub mode: u32,
+}
+
 /// Load a file through the jail as UTF-8 text, enforcing size and binary
 /// rules. The version is over the raw bytes, usable as an edit base.
-pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<(String, String)> {
+pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Loaded> {
     let abs = resolve_existing(root, rel)?;
     let meta = std::fs::metadata(&abs)?;
     if meta.is_dir() {
@@ -362,7 +373,12 @@ pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<(Str
     let version = version_of(&bytes);
     let content = String::from_utf8(bytes)
         .map_err(|_| KaedError::is_binary(format!("{rel}: not valid UTF-8")))?;
-    Ok((content, version))
+    Ok(Loaded {
+        abs,
+        content,
+        version,
+        mode: meta.permissions().mode(),
+    })
 }
 
 pub fn read(
@@ -373,7 +389,9 @@ pub fn read(
     max_bytes: Option<usize>,
     limits: &Limits,
 ) -> Result<ReadResult> {
-    let (content, version) = load_text(root, rel, limits)?;
+    let Loaded {
+        content, version, ..
+    } = load_text(root, rel, limits)?;
     let budget = max_bytes
         .unwrap_or(limits.max_read_bytes)
         .min(limits.max_read_bytes);
