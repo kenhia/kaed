@@ -52,6 +52,18 @@ Implementation order and per-module decisions: [plan.md](plan.md).
   full loop through the ts.net URL. Details + the Host-validation gotcha
   in [deploy.md](deploy.md). k-homelab WI #907 records the machine
   change; klams carries the deployment knowledge.
+- 2026-08-02 — **Live test from cleo passed** — Desktop Claude (Opus 5)
+  drove kaed against a scratch clone with out-of-band ssh verification,
+  forced conflict, and an atomicity canary; wrote
+  [live-test-findings.md](live-test-findings.md) *through kaed itself*
+  (journal txn 4). Four findings filed as korg WIs #908–911. Actioned
+  immediately: bearer token rotated (the live value had landed in a cleo
+  transcript — #908's outstanding item) and the server `instructions`
+  now document `actual_version` on conflicts (#911). #908 structural
+  root-scoping, #909 blob/credential retention, #910 conflict logging
+  stay open for the next sprints. Tailnet hostname scrubbed from repo
+  and history (placeholder `<tailnet>`; branch was never pushed, so an
+  amend sufficed).
 
 ## Shipped
 
@@ -63,11 +75,15 @@ Implementation order and per-module decisions: [plan.md](plan.md).
 - Deployed and verified on kai: https://kai.<tailnet>.ts.net:4870/mcp
   (journal txn 1 = the dogfood edit, attributed and intent-tagged).
 
+- Live test from cleo: every check passed (see
+  [live-test-findings.md](live-test-findings.md)) — the sprint's exit
+  criterion (real edit round-trip from Desktop Claude on cleo) is met.
+
 ## Remaining for sprint close
 
-- Desktop Claude on cleo wired to kaed (needs Ken: cleo is his Windows
-  desktop; connector URL + token per deploy.md) and a real dogfood
-  session from there — the sprint's actual exit criterion.
+- Ken re-wires cleo's `.claude.json` with the **rotated** token (value
+  in `kai:~/.config/kaed/env`; the old one is dead).
+- `/sprint-ship`.
 
 ## Follow-ups
 

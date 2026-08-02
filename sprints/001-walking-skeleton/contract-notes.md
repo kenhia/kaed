@@ -64,6 +64,21 @@ agent should know at call time also belongs in tool descriptions.
   pagination but draft v0 gave no way to pass it back.
 - Ordering is lexicographic by root-relative path (stable pagination).
 
+## From the cleo live test (WIs #908–911)
+
+- The server `instructions` must document that `version_conflict.data`
+  carries `actual_version` (the retry base), not only `delta` — fixed in
+  code 2026-08-02; fold into the contract doc's error-model section.
+- Deliberate-decision item for the revision: journal blobs retain whole
+  pre/post images (that's what powers diff-proof and conflict deltas),
+  which snapshots any credential inside an edited file for
+  `retention_days` — and captures third-party pre-images kaed never
+  authored. Needs an explicit stance (denylist? shorter retention?
+  no-blob roots?).
+- Failed transactions (conflicts, rollbacks) are currently invisible in
+  the journal; conflict-rate-per-author is the first health metric worth
+  emitting.
+
 ## Journal
 
 - v0 records `begin` (after staging, before renames) and `complete`

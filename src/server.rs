@@ -389,10 +389,13 @@ impl ServerHandler for KaedServer {
             "kaed edits files on this host with verified writes. Loop: \
              search or read (both return a `version`) → edit declaring that \
              version in `base` → the response diff is your proof, no re-read \
-             needed. On version_conflict, inspect `data.delta` (what changed \
-             since you looked), re-anchor, retry. Prefer `window` reads and \
-             anchors over whole-file reads. Every edit is journaled under \
-             your identity; pass `intent` so successors understand it."
+             needed. On version_conflict the error data carries \
+             `actual_version` (the file's current version — use it as your \
+             next base) and `delta` (what changed since you looked): \
+             re-anchor from the delta and retry, no re-read needed. Prefer \
+             `window` reads and anchors over whole-file reads. Every edit is \
+             journaled under your identity; pass `intent` so successors \
+             understand it."
                 .into(),
         );
         info
