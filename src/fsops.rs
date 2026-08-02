@@ -13,7 +13,8 @@ use serde::Serialize;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Bytes sniffed for NUL when deciding text vs binary.
 const BINARY_SNIFF_LEN: usize = 8192;
@@ -52,10 +53,22 @@ fn clean_rel(rel: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Refuse a denied path. Called on the lexical join *before* the
+/// filesystem is touched, so a denied name answers the same whether or not
+/// it exists, and again on the resolved target, so a symlink cannot walk
+/// into a denied directory.
+pub fn check_denied(root: &ResolvedRoot, rel: &str, abs: &Path) -> Result<()> {
+    match root.deny.denied_by(abs) {
+        Some(rule) => Err(KaedError::denied(rel, &rule)),
+        None => Ok(()),
+    }
+}
+
 /// Resolve a path that must already exist. Canonicalizes (so symlinks
 /// resolve) and requires the result to stay inside the root.
 pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     let joined = root.path.join(clean_rel(rel)?);
+    check_denied(root, rel, &joined)?;
     let canonical = joined.canonicalize().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => KaedError::not_found(format!("{rel}: not found")),
         _ => KaedError::internal(format!("{rel}: {e}")),
@@ -66,6 +79,7 @@ pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
             root.name
         )));
     }
+    check_denied(root, rel, &canonical)?;
     Ok(canonical)
 }
 
@@ -107,6 +121,7 @@ pub fn resolve_creatable(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     for seg in suffix.iter().rev() {
         out.push(seg);
     }
+    check_denied(root, rel, &out)?;
     Ok(out)
 }
 
@@ -149,6 +164,9 @@ pub fn stat(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<StatResul
         let parent = resolve_existing(root, &parent_rel.to_string_lossy())?;
         parent.join(cleaned.file_name().expect("non-empty cleaned path"))
     };
+    // the leaf never went through resolve_existing (a symlink here is
+    // reported, not followed), so it needs the deny check of its own
+    check_denied(root, rel, &abs)?;
     let meta = std::fs::symlink_metadata(&abs).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => KaedError::not_found(format!("{rel}: not found")),
         _ => KaedError::internal(format!("{rel}: {e}")),
@@ -223,6 +241,15 @@ pub struct ListResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
+    /// Entries the deny list hid (a hidden directory counts once, with its
+    /// subtree). Omitted when zero — present so a filtered listing is never
+    /// mistaken for the whole directory.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub denied_hidden: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub struct ListParams<'a> {
@@ -254,17 +281,34 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
         None => None,
     };
 
+    // The deny check has to happen here as well as in the resolver: this
+    // walk never calls resolve_existing per entry, so a resolver-only check
+    // would still enumerate denied paths.
+    let denied_hidden = Arc::new(AtomicUsize::new(0));
     let mut entries = Vec::new();
-    let walker = ignore::WalkBuilder::new(&base)
-        .max_depth(Some(p.depth))
-        .hidden(false)
-        .git_ignore(!p.ignored)
-        .git_global(!p.ignored)
-        .git_exclude(!p.ignored)
-        .ignore(!p.ignored)
-        .parents(!p.ignored)
-        .filter_entry(|e| e.file_name() != ".git")
-        .build();
+    let walker = {
+        let deny = root.deny.clone();
+        let counter = denied_hidden.clone();
+        ignore::WalkBuilder::new(&base)
+            .max_depth(Some(p.depth))
+            .hidden(false)
+            .git_ignore(!p.ignored)
+            .git_global(!p.ignored)
+            .git_exclude(!p.ignored)
+            .ignore(!p.ignored)
+            .parents(!p.ignored)
+            .filter_entry(move |e| {
+                if e.file_name() == ".git" {
+                    return false;
+                }
+                if deny.is_denied(e.path()) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                true
+            })
+            .build()
+    };
     for entry in walker {
         let entry = entry.map_err(|e| KaedError::internal(e.to_string()))?;
         if entry.depth() == 0 {
@@ -310,6 +354,7 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
         next_offset: truncated.then_some(p.offset + page.len()),
         entries: page,
         truncated,
+        denied_hidden: denied_hidden.load(Ordering::Relaxed),
     })
 }
 
@@ -572,17 +617,27 @@ mod tests {
     use crate::errors::ErrorCode;
 
     fn test_root(dir: &Path) -> ResolvedRoot {
-        ResolvedRoot {
-            name: "t".into(),
-            path: dir.canonicalize().unwrap(),
-            description: None,
-        }
+        ResolvedRoot::unrestricted("t", dir.canonicalize().unwrap())
     }
 
     fn write(dir: &Path, rel: &str, content: &str) {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, content).unwrap();
+    }
+
+    /// A root whose deny list carries `globs`, as `Config::resolve` builds it.
+    fn denied_root(dir: &Path, globs: &[&str]) -> ResolvedRoot {
+        ResolvedRoot {
+            deny: Arc::new(
+                crate::deny::DenyList::new(
+                    Vec::new(),
+                    &globs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+            ),
+            ..test_root(dir)
+        }
     }
 
     #[test]
@@ -631,6 +686,99 @@ mod tests {
         assert!(p.starts_with(&root.path));
         assert!(resolve_creatable(&root, "../x").is_err());
         assert!(resolve_creatable(&root, "").is_err());
+    }
+
+    // ------------------------------------------------------- deny list
+    //
+    // The proposal for #908 called the path resolver "one choke point" for
+    // this. It isn't: `list` and `search` enumerate with their own walkers
+    // and never call the resolver per entry. These tests pin all three
+    // enforcement points, because a regression in the walkers would leak
+    // silently — the addressed-path tests would still pass.
+
+    #[test]
+    fn addressed_reads_of_a_denied_path_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".config/kaed/env", "KAED_TOKEN_CLAUDE=sekrit\n");
+        let root = denied_root(dir.path(), &["**/.config/kaed"]);
+
+        for err in [
+            stat(&root, ".config/kaed/env", &Limits::default()).unwrap_err(),
+            read(
+                &root,
+                ".config/kaed/env",
+                &ReadMode::Whole,
+                false,
+                None,
+                &Limits::default(),
+            )
+            .unwrap_err(),
+            load_text(&root, ".config/kaed/env", &Limits::default()).unwrap_err(),
+            resolve_existing(&root, ".config/kaed/env").unwrap_err(),
+            // the directory itself, and a write target inside it
+            stat(&root, ".config/kaed", &Limits::default()).unwrap_err(),
+            resolve_creatable(&root, ".config/kaed/newfile").unwrap_err(),
+        ] {
+            assert_eq!(err.code, ErrorCode::Denied, "{}", err.message);
+        }
+    }
+
+    #[test]
+    fn list_hides_denied_entries_and_says_how_many() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/main.rs", "fn main() {}\n");
+        write(dir.path(), ".ssh/id_ed25519", "PRIVATE KEY\n");
+        write(dir.path(), ".ssh/known_hosts", "\n");
+        write(dir.path(), ".env", "SECRET=1\n");
+        let root = denied_root(dir.path(), &["**/.ssh", "**/.env"]);
+
+        let out = list(
+            &root,
+            &ListParams {
+                path: "",
+                glob: None,
+                depth: 3,
+                max: 100,
+                offset: 0,
+                ignored: true,
+            },
+        )
+        .unwrap();
+        let paths: Vec<_> = out.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["src", "src/main.rs"]);
+        // .ssh is pruned as a subtree (one hidden entry), .env is a second
+        assert_eq!(out.denied_hidden, 2);
+    }
+
+    #[test]
+    fn a_symlink_cannot_walk_into_a_denied_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".ssh/id_ed25519", "PRIVATE KEY\n");
+        std::os::unix::fs::symlink(dir.path().join(".ssh"), dir.path().join("keys")).unwrap();
+        let root = denied_root(dir.path(), &["**/.ssh"]);
+        // the name `keys/id_ed25519` matches nothing; the resolved target does
+        let err = read(
+            &root,
+            "keys/id_ed25519",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+    }
+
+    #[test]
+    fn a_denied_path_is_not_an_existence_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "real.pem", "cert\n");
+        let root = denied_root(dir.path(), &["**/*.pem"]);
+        let present = stat(&root, "real.pem", &Limits::default()).unwrap_err();
+        let absent = stat(&root, "imaginary.pem", &Limits::default()).unwrap_err();
+        assert_eq!(present.code, ErrorCode::Denied);
+        // same code for a file that isn't there: the check never hit the disk
+        assert_eq!(absent.code, ErrorCode::Denied);
     }
 
     #[test]

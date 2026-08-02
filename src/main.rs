@@ -60,10 +60,14 @@ async fn main() -> anyhow::Result<()> {
                 resolved.limits.search_max_results
             );
             println!(
-                "journal: {} (retention {} days)",
+                "journal: {} (blob retention {} days)",
                 resolved.journal_path.display(),
                 resolved.journal_retention_days
             );
+            println!("denied paths:");
+            for rule in resolved.deny.describe() {
+                println!("  {rule}");
+            }
             Ok(())
         }
     }
@@ -71,5 +75,5 @@ async fn main() -> anyhow::Result<()> {
 
 fn load(path: Option<PathBuf>) -> anyhow::Result<config::Resolved> {
     let path = path.unwrap_or_else(Config::default_path);
-    Config::load(&path)?.resolve()
+    Config::load(&path)?.resolve(Some(&path))
 }

@@ -11,7 +11,7 @@
 //! rides the request extensions into tool handlers, so every journal
 //! entry is attributed. No anonymous mutation.
 
-use crate::config::{Identity, Limits, Resolved, ResolvedRoot};
+use crate::config::{self, AuthEntry, Identity, Limits, Resolved, ResolvedRoot};
 use crate::errors::KaedError;
 use crate::fsops::{self, ReadMode};
 use crate::journal::Journal;
@@ -29,7 +29,8 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 const DEFAULT_LIST_MAX: usize = 500;
 const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
@@ -392,10 +393,16 @@ impl ServerHandler for KaedServer {
              needed. On version_conflict the error data carries \
              `actual_version` (the file's current version — use it as your \
              next base) and `delta` (what changed since you looked): \
-             re-anchor from the delta and retry, no re-read needed. Prefer \
-             `window` reads and anchors over whole-file reads. Every edit is \
-             journaled under your identity; pass `intent` so successors \
-             understand it."
+             re-anchor from the delta and retry, no re-read needed. A \
+             `version` is a content address, not a session handle: it never \
+             expires and stays valid across your restarts, reconnects and \
+             token rotations, so a version you recorded long ago is still a \
+             usable base — no defensive re-read. Prefer `window` reads and \
+             anchors over whole-file reads. Some paths are refused by the \
+             server's deny list: `denied` is permanent, don't retry it, and \
+             `denied_hidden` on list/search counts what was filtered out. \
+             Every edit is journaled under your identity; pass `intent` so \
+             successors understand it."
                 .into(),
         );
         info
@@ -427,8 +434,29 @@ fn ok(value: serde_json::Value) -> Result<CallToolResult, ErrorData> {
 
 // ------------------------------------------------------------------- auth
 
-struct AuthState {
-    identities: Vec<Identity>,
+/// The live identity table. Swappable behind a lock so SIGHUP can install
+/// new tokens without restarting: the restart is what drops every live
+/// session, and it does so whether or not tokens are involved (#914).
+pub struct AuthState {
+    identities: RwLock<Vec<Identity>>,
+    /// Where the tokens live, so a reload can go back and re-read them.
+    spec: BTreeMap<String, AuthEntry>,
+}
+
+impl AuthState {
+    /// Re-read every token from its file. Env-var tokens come back
+    /// unchanged — a process cannot re-read its own `EnvironmentFile`, so
+    /// those still need a restart.
+    pub fn reload(&self) {
+        let fresh = config::resolve_identities(&self.spec);
+        if fresh.is_empty() {
+            tracing::error!("reload resolved no identities; keeping the current set");
+            return;
+        }
+        let authors: Vec<&str> = fresh.iter().map(|i| i.author.as_str()).collect();
+        tracing::info!(identities = ?authors, "reloaded auth tokens");
+        *self.identities.write().expect("auth lock never poisoned") = fresh;
+    }
 }
 
 /// Constant-time token comparison; length is the only thing an attacker
@@ -452,31 +480,77 @@ async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let author = bearer.and_then(|token| {
-        auth.identities
-            .iter()
-            .find(|id| token_eq(&id.token, token))
-            .map(|id| id.author.clone())
+        let identities = auth.identities.read().expect("auth lock never poisoned");
+        for id in identities.iter() {
+            if token_eq(&id.token, token) {
+                return Some(id.author.clone());
+            }
+            if id.prev_token.as_deref().is_some_and(|p| token_eq(p, token)) {
+                // The one signal that answers "is this rotation finished?" —
+                // 401s never reach the journal, so this is where it lives.
+                tracing::warn!(
+                    author = id.author,
+                    "authenticated with the PREVIOUS token; this client has not \
+                     picked up the new one yet"
+                );
+                return Some(id.author.clone());
+            }
+        }
+        None
     });
     match author {
         Some(author) => {
             req.extensions_mut().insert(Author(author));
             next.run(req).await
         }
-        None => (
-            http::StatusCode::UNAUTHORIZED,
-            [(http::header::WWW_AUTHENTICATE, "Bearer")],
-            "unauthorized",
-        )
-            .into_response(),
+        None => {
+            tracing::warn!(
+                presented = bearer.is_some(),
+                "401: no identity for the presented credential"
+            );
+            unauthorized(bearer.is_some())
+        }
     }
+}
+
+/// A 401 that says what is actually wrong (RFC 6750 §3). A bare 401 gets
+/// rendered with the client's own generic story — cleo's said "token
+/// expired", which sent the live test hunting for a TTL kaed has never
+/// had. The description goes in the header *and* the body, so a client
+/// that surfaces either one stops guessing.
+///
+/// Per §3.1 a request carrying no credential at all gets the challenge
+/// without an error code: there is no invalid token to describe, and the
+/// client may simply not have known auth was needed.
+fn unauthorized(had_token: bool) -> Response {
+    const NO_EXPIRY: &str = "token matches no configured identity; kaed tokens do not expire";
+    let (challenge, body) = if had_token {
+        (
+            format!(
+                "Bearer realm=\"kaed\", error=\"invalid_token\", error_description=\"{NO_EXPIRY}\""
+            ),
+            format!("unauthorized: {NO_EXPIRY}\n"),
+        )
+    } else {
+        (
+            "Bearer realm=\"kaed\"".to_string(),
+            "unauthorized: no bearer token presented\n".to_string(),
+        )
+    };
+    (
+        http::StatusCode::UNAUTHORIZED,
+        [(http::header::WWW_AUTHENTICATE, challenge)],
+        body,
+    )
+        .into_response()
 }
 
 // --------------------------------------------------------------- assembly
 
 /// Build the full HTTP app: auth middleware in front of the MCP service at
 /// `/mcp`. Separated from `serve` so tests can drive it on an ephemeral
-/// listener.
-pub fn build_app(resolved: Resolved) -> anyhow::Result<axum::Router> {
+/// listener. The returned `AuthState` is the reload handle.
+pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthState>)> {
     anyhow::ensure!(
         !resolved.roots.is_empty(),
         "no roots configured; nothing to serve"
@@ -486,7 +560,7 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<axum::Router> {
         "no auth identities resolved; set the token env vars from [auth]"
     );
 
-    let journal = Journal::open(&resolved.journal_path)?;
+    let journal = Journal::open(&resolved.journal_path, resolved.journal_retention_days)?;
     for torn in journal.scan_pending().map_err(|e| anyhow::anyhow!("{e}"))? {
         tracing::warn!(
             txn = torn.id,
@@ -503,7 +577,8 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<axum::Router> {
         journal,
     });
     let auth = Arc::new(AuthState {
-        identities: resolved.identities,
+        identities: RwLock::new(resolved.identities),
+        spec: resolved.auth,
     });
 
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
@@ -515,15 +590,33 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<axum::Router> {
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
-    Ok(axum::Router::new()
-        .nest_service("/mcp", mcp)
-        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware)))
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", mcp)
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                auth_middleware,
+            ));
+    Ok((router, auth))
 }
 
 pub async fn serve(resolved: Resolved) -> anyhow::Result<()> {
     let bind = resolved.bind;
-    let app = build_app(resolved)?;
+    let (app, auth) = build_app(resolved)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
+
+    // SIGHUP re-reads the token files in place. `systemctl --user reload
+    // kaed` maps onto this with one unit line, and live sessions survive —
+    // which is the whole point, since it is the restart, not the token,
+    // that breaks them.
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    tokio::spawn(async move {
+        while hup.recv().await.is_some() {
+            tracing::info!("SIGHUP: reloading auth tokens");
+            auth.reload();
+        }
+    });
+
     tracing::info!(%bind, "kaed serving MCP at /mcp");
     axum::serve(listener, app).await?;
     Ok(())

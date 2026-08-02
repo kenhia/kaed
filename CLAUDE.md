@@ -45,24 +45,30 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each homelab host (kai, kubs0, kubsdb).
 
-**Status: v0 walking skeleton shipped and live on kai** (sprint 001,
-2026-08-02): `roots`/`stat`/`list`/`read`/`search`/`edit` over streamable
-HTTP with bearer auth; journal writes recorded, history tools not yet.
-The design lives in `sprints/planning/` — read `summary.md` first, then
-`mcp-contract.md` before touching server code; where implementation and
-the draft contract diverge, `sprints/001-walking-skeleton/contract-notes.md`
-records the decisions and feeds the first contract revision.
+**Status: v0 live on kai, hardened** (sprints 001–002, 2026-08-02):
+`roots`/`stat`/`list`/`read`/`search`/`edit` over streamable HTTP with
+bearer auth; journal records successes *and* failures; history read tools
+not yet. The design lives in `sprints/planning/` — read `summary.md`
+first, then `mcp-contract.md` before touching server code. 002's changes
+are already applied to the contract; `sprints/00{1,2}-*/contract-notes.md`
+record the reasoning behind them.
 
 - Build/test: `just check` (`cargo fmt --check`, `clippy --all-targets
   -D warnings`, `cargo test`) — run and pass it before shipping.
 - Read first: `sprints/planning/{summary,overview,mcp-contract,architecture,roadmap}.md`
-- Deploy state (kai service, tailscale serve, 401 semantics, client
-  wiring): `sprints/001-walking-skeleton/deploy.md`. The tailnet hostname
-  is deliberately not committed — placeholder `<tailnet>`; real value in
+- Deploy state: `sprints/002-blast-radius-hardening/deploy.md` is current
+  (roots, token file, rotation procedure); 001's is still the reference
+  for tailscale serve and the rmcp `Host` gotcha. The tailnet hostname is
+  deliberately not committed — placeholder `<tailnet>`; real value in
   klams or `tailscale status`.
 - Core invariants (don't design tools that violate them): every content
   response carries a `version`; every mutation declares base versions and
   is atomic; truncation is explicit; errors are structured
   `{code, message, data}`.
+- **The deny list is enforced in three places, not one.**
+  `fsops::resolve_existing`/`resolve_creatable` cover *addressed* paths;
+  `list` and `search` walk directories themselves and each need their own
+  `filter_entry` check. Any new tool that enumerates rather than addresses
+  needs one too — see `src/deny.rs` and R7 in the contract.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.

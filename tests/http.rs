@@ -2,7 +2,7 @@
 //! an rmcp client — the worked example from the contract, conflict path
 //! included.
 
-use kaed::config::{Identity, Limits, Resolved, ResolvedRoot};
+use kaed::config::{AuthEntry, Identity, Limits, Resolved, ResolvedRoot};
 use kaed::fsops;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientInfo};
@@ -17,9 +17,26 @@ struct TestServer {
     _workdir: tempfile::TempDir,
     workdir_path: std::path::PathBuf,
     ct: tokio_util::sync::CancellationToken,
+    /// The reload handle SIGHUP drives in production.
+    auth: std::sync::Arc<kaed::server::AuthState>,
 }
 
 async fn start_server() -> anyhow::Result<TestServer> {
+    start_server_with(
+        std::collections::BTreeMap::new(),
+        vec![Identity {
+            author: "claude".into(),
+            token: TOKEN.into(),
+            prev_token: None,
+        }],
+    )
+    .await
+}
+
+async fn start_server_with(
+    auth_spec: std::collections::BTreeMap<String, AuthEntry>,
+    identities: Vec<Identity>,
+) -> anyhow::Result<TestServer> {
     let workdir = tempfile::tempdir()?;
     let workdir_path = workdir.path().canonicalize()?;
     std::fs::write(
@@ -30,19 +47,17 @@ async fn start_server() -> anyhow::Result<TestServer> {
         bind: "127.0.0.1:0".parse()?,
         allowed_hosts: vec![],
         roots: vec![ResolvedRoot {
-            name: "scratch".into(),
-            path: workdir_path.clone(),
             description: Some("test root".into()),
+            ..ResolvedRoot::unrestricted("scratch", workdir_path.clone())
         }],
-        identities: vec![Identity {
-            author: "claude".into(),
-            token: TOKEN.into(),
-        }],
+        identities,
         limits: Limits::default(),
         journal_path: workdir_path.join("journal.db"),
-        journal_retention_days: 30,
+        journal_retention_days: 7,
+        deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
+        auth: auth_spec,
     };
-    let app = kaed::server::build_app(resolved)?;
+    let (app, auth) = kaed::server::build_app(resolved)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let ct = tokio_util::sync::CancellationToken::new();
@@ -59,6 +74,7 @@ async fn start_server() -> anyhow::Result<TestServer> {
         _workdir: workdir,
         workdir_path,
         ct,
+        auth,
     })
 }
 
@@ -91,6 +107,11 @@ async fn rejects_missing_and_bad_tokens() -> anyhow::Result<()> {
 
     let no_auth = http.post(&url).body("{}").send().await?;
     assert_eq!(no_auth.status(), 401);
+    // RFC 6750 §3.1: no credential presented means no error code to report
+    let challenge = no_auth.headers()[reqwest::header::WWW_AUTHENTICATE]
+        .to_str()?
+        .to_string();
+    assert_eq!(challenge, "Bearer realm=\"kaed\"");
 
     let bad = http
         .post(&url)
@@ -99,6 +120,84 @@ async fn rejects_missing_and_bad_tokens() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(bad.status(), 401);
+    // a wrong token *is* self-describing, in the header and the body both —
+    // clients otherwise render a bare 401 as "token expired", and kaed has
+    // no expiry to go looking for
+    let challenge = bad.headers()[reqwest::header::WWW_AUTHENTICATE]
+        .to_str()?
+        .to_string();
+    assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
+    assert!(challenge.contains("do not expire"), "{challenge}");
+    assert!(bad.text().await?.contains("do not expire"));
+
+    server.ct.cancel();
+    Ok(())
+}
+
+/// #914: rotation should not be a hard cut. Reload is the load-bearing
+/// half — the process restart is what kills live sessions, independent of
+/// tokens — and the grace window is what makes the reload safe for clients
+/// that have not restarted yet.
+#[tokio::test]
+async fn rotation_reloads_in_place_with_a_grace_window() -> anyhow::Result<()> {
+    let secrets = tempfile::tempdir()?;
+    let current = secrets.path().join("claude.token");
+    let previous = secrets.path().join("claude.token.prev");
+    std::fs::write(&current, "token-v1\n")?;
+
+    let mut spec = std::collections::BTreeMap::new();
+    spec.insert(
+        "claude".to_string(),
+        AuthEntry {
+            token_env: None,
+            token_file: Some(current.display().to_string()),
+            prev_token_file: Some(previous.display().to_string()),
+        },
+    );
+    let server = start_server_with(
+        spec,
+        vec![Identity {
+            author: "claude".into(),
+            token: "token-v1".into(),
+            prev_token: None,
+        }],
+    )
+    .await?;
+
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/mcp", server.addr);
+    let probe = |token: &str| {
+        let (http, url, token) = (http.clone(), url.clone(), token.to_string());
+        async move {
+            http.post(&url)
+                .header("authorization", format!("Bearer {token}"))
+                .body("{}")
+                .send()
+                .await
+                .map(|r| r.status())
+        }
+    };
+    // v1 authenticates (400-something from the MCP layer, not 401)
+    assert_ne!(probe("token-v1").await?, 401);
+    assert_eq!(probe("token-v2").await?, 401);
+
+    // rotate: v2 becomes current, v1 moves to the grace slot. No restart.
+    std::fs::write(&current, "token-v2\n")?;
+    std::fs::write(&previous, "token-v1\n")?;
+    server.auth.reload();
+
+    assert_ne!(probe("token-v2").await?, 401, "the new token must work");
+    assert_ne!(
+        probe("token-v1").await?,
+        401,
+        "the grace window must still honour the old token"
+    );
+
+    // grace window closes: the old token dies, still with no restart
+    std::fs::remove_file(&previous)?;
+    server.auth.reload();
+    assert_ne!(probe("token-v2").await?, 401);
+    assert_eq!(probe("token-v1").await?, 401);
 
     server.ct.cancel();
     Ok(())

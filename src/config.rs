@@ -5,11 +5,13 @@
 //! the validation gate: it canonicalizes roots, rejects duplicates, and
 //! reads token env vars, producing the runtime view the server uses.
 
+use crate::deny::{DEFAULT_DENY, DenyList};
 use anyhow::{Context, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +27,35 @@ pub struct Config {
     pub limits: Limits,
     #[serde(default)]
     pub journal: JournalConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityConfig {
+    /// Extra deny globs, matched against absolute paths. A path is refused
+    /// if it or any ancestor matches, so `**/.ssh` covers the whole tree.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Apply `deny::DEFAULT_DENY` on top of `deny`. Turn off only to let
+    /// kaed edit dotfiles it would otherwise refuse; kaed's own config and
+    /// journal stay refused either way.
+    #[serde(default = "default_true")]
+    pub use_default_deny: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            deny: Vec::new(),
+            use_default_deny: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,10 +91,25 @@ pub struct RootConfig {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// Where one identity's bearer token lives. Exactly one of `token_env` or
+/// `token_file` must be set.
+///
+/// `token_file` is what makes rotation non-breaking (#914): a process
+/// cannot re-read its own systemd `EnvironmentFile` — those vars were
+/// injected at exec and are frozen for its life — so reload requires the
+/// token to be readable *at reload time*, which means from a file.
+/// `token_env` still works and still needs a restart; that limitation is
+/// inherent, not an oversight.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthEntry {
-    pub token_env: String,
+    pub token_env: Option<String>,
+    /// File whose trimmed contents are the token. Re-read on SIGHUP.
+    pub token_file: Option<String>,
+    /// The previous token, honoured alongside the current one during a
+    /// rotation. Lets clients pick up the new secret whenever they next
+    /// restart instead of all at once.
+    pub prev_token_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -102,6 +148,9 @@ fn default_search_max_results() -> usize {
 pub struct JournalConfig {
     /// Defaults to `$XDG_DATA_HOME/kaed/journal.db` (or `~/.local/share/…`).
     pub path: Option<String>,
+    /// Days of **blob content** kept. Transaction metadata is kept
+    /// indefinitely; only the file content ages out, because that content
+    /// is a copy of whatever the edited file held (#909).
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
 }
@@ -117,8 +166,11 @@ impl Default for JournalConfig {
     }
 }
 
+// A week, not the 30 days sprint 001 shipped: with GC now actually running
+// this is a real window of retained file content, and every conflict delta
+// that has ever mattered here was hours old, not weeks.
 fn default_retention_days() -> u32 {
-    30
+    7
 }
 
 impl Config {
@@ -135,7 +187,35 @@ impl Config {
     /// Validate and produce the runtime view. Fails on bad roots or
     /// duplicate names; a missing token env var is a warning (the identity
     /// is skipped), because one host rarely defines every agent's token.
-    pub fn resolve(&self) -> anyhow::Result<Resolved> {
+    ///
+    /// `config_path` is where this config was loaded from — its directory
+    /// is refused unconditionally, so kaed can never serve the token file
+    /// that sits beside it. Pass `None` only when there is no file (tests).
+    pub fn resolve(&self, config_path: Option<&Path>) -> anyhow::Result<Resolved> {
+        let journal_path = match &self.journal.path {
+            Some(p) => expand_home(p),
+            None => base_dir("XDG_DATA_HOME", ".local/share").join("kaed/journal.db"),
+        };
+
+        // Built-ins first: they must hold whatever the roots turn out to be.
+        let mut builtin = vec![(
+            config_path
+                .unwrap_or(&Config::default_path())
+                .parent()
+                .unwrap_or(Path::new("/"))
+                .to_path_buf(),
+            "kaed's own config directory",
+        )];
+        if let Some(dir) = journal_path.parent() {
+            builtin.push((dir.to_path_buf(), "kaed's journal directory"));
+        }
+        let mut globs = self.security.deny.clone();
+        if self.security.use_default_deny {
+            globs.extend(DEFAULT_DENY.iter().map(|s| (*s).to_string()));
+        }
+        let deny =
+            Arc::new(DenyList::new(builtin, &globs).context("building the security deny list")?);
+
         let mut roots = Vec::new();
         for r in &self.roots {
             if r.name.is_empty() || r.name.contains('/') {
@@ -155,32 +235,39 @@ impl Config {
                     canonical.display()
                 );
             }
+            // A root inside a denied area would be entirely unusable, and
+            // silently so — that is a config bug worth failing loudly on.
+            if let Some(rule) = deny.denied_by(&canonical) {
+                bail!(
+                    "root {:?}: {} is refused by the deny list (rule: {rule})",
+                    r.name,
+                    canonical.display()
+                );
+            }
             roots.push(ResolvedRoot {
                 name: r.name.clone(),
                 path: canonical,
                 description: r.description.clone(),
+                deny: deny.clone(),
             });
         }
 
-        let mut identities = Vec::new();
         for (author, entry) in &self.auth {
-            match std::env::var(&entry.token_env) {
-                Ok(token) if !token.is_empty() => identities.push(Identity {
-                    author: author.clone(),
-                    token,
-                }),
-                _ => tracing::warn!(
-                    author,
-                    env = entry.token_env,
-                    "token env var unset or empty; identity disabled"
-                ),
+            match (&entry.token_env, &entry.token_file) {
+                (Some(_), Some(_)) => {
+                    bail!("auth {author:?}: set token_env or token_file, not both")
+                }
+                (None, None) => bail!("auth {author:?}: needs token_env or token_file"),
+                _ => {}
+            }
+            if entry.prev_token_file.is_some() && entry.token_file.is_none() {
+                bail!(
+                    "auth {author:?}: prev_token_file needs token_file — a grace window \
+                     is only useful with reloadable tokens"
+                );
             }
         }
-
-        let journal_path = match &self.journal.path {
-            Some(p) => expand_home(p),
-            None => base_dir("XDG_DATA_HOME", ".local/share").join("kaed/journal.db"),
-        };
+        let identities = resolve_identities(&self.auth);
 
         Ok(Resolved {
             bind: self.server.bind,
@@ -190,8 +277,71 @@ impl Config {
             limits: self.limits,
             journal_path,
             journal_retention_days: self.journal.retention_days,
+            deny,
+            auth: self.auth.clone(),
         })
     }
+}
+
+/// Read every identity's current (and grace) token from wherever it lives.
+/// Called at startup and again on every SIGHUP — so this must stay pure
+/// I/O over the config spec, holding no state of its own.
+///
+/// A missing or empty token disables that identity with a warning rather
+/// than failing: one host rarely defines every agent's token, and a reload
+/// that killed the server over an unrelated identity would be worse than
+/// the problem it was fixing.
+pub fn resolve_identities(auth: &BTreeMap<String, AuthEntry>) -> Vec<Identity> {
+    let mut identities = Vec::new();
+    for (author, entry) in auth {
+        let Some(token) = entry.current_token() else {
+            tracing::warn!(author, "token unset or empty; identity disabled");
+            continue;
+        };
+        // An absent prev file is the normal state — it exists only while a
+        // rotation is in flight — so its absence is not worth a warning.
+        let prev_token = entry
+            .prev_token_file
+            .as_ref()
+            .and_then(|p| read_token_quiet(p));
+        identities.push(Identity {
+            author: author.clone(),
+            token,
+            prev_token,
+        });
+    }
+    identities
+}
+
+impl AuthEntry {
+    fn current_token(&self) -> Option<String> {
+        match (&self.token_file, &self.token_env) {
+            (Some(path), _) => read_token(path),
+            (None, Some(var)) => std::env::var(var).ok().filter(|t| !t.is_empty()),
+            (None, None) => None,
+        }
+    }
+}
+
+fn read_token(path: &str) -> Option<String> {
+    match std::fs::read_to_string(expand_home(path)) {
+        Ok(s) => Some(s.trim().to_string()).filter(|t| !t.is_empty()),
+        Err(e) => {
+            tracing::warn!(path, error = %e, "could not read token file");
+            None
+        }
+    }
+}
+
+/// Like `read_token`, but a missing file is expected rather than reported.
+/// Anything else that goes wrong still warns — an unreadable-but-present
+/// token file is a real problem.
+fn read_token_quiet(path: &str) -> Option<String> {
+    let expanded = expand_home(path);
+    if !expanded.exists() {
+        return None;
+    }
+    read_token(path)
 }
 
 /// The validated runtime view of the config.
@@ -204,6 +354,10 @@ pub struct Resolved {
     pub limits: Limits,
     pub journal_path: PathBuf,
     pub journal_retention_days: u32,
+    pub deny: Arc<DenyList>,
+    /// Where each identity's token lives, kept so SIGHUP can re-read them
+    /// without reparsing the config file.
+    pub auth: BTreeMap<String, AuthEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -212,12 +366,30 @@ pub struct ResolvedRoot {
     /// Canonicalized; the jail boundary for every path under this root.
     pub path: PathBuf,
     pub description: Option<String>,
+    /// Shared across every root: paths refused inside the jail, too.
+    pub deny: Arc<DenyList>,
+}
+
+impl ResolvedRoot {
+    /// A root that denies nothing — for tests and for callers that build a
+    /// root outside `Config::resolve`.
+    pub fn unrestricted(name: impl Into<String>, path: PathBuf) -> ResolvedRoot {
+        ResolvedRoot {
+            name: name.into(),
+            path,
+            description: None,
+            deny: Arc::new(DenyList::empty()),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub author: String,
     pub token: String,
+    /// Accepted alongside `token` during a rotation; its use is logged, so
+    /// "has every client picked up the new secret yet?" has an answer.
+    pub prev_token: Option<String>,
 }
 
 fn base_dir(xdg_var: &str, home_fallback: &str) -> PathBuf {
@@ -251,7 +423,7 @@ mod tests {
         assert_eq!(cfg.limits.max_read_bytes, 262_144);
         assert_eq!(cfg.limits.max_file_bytes, 8_388_608);
         assert_eq!(cfg.limits.search_max_results, 50);
-        assert_eq!(cfg.journal.retention_days, 30);
+        assert_eq!(cfg.journal.retention_days, 7);
         assert!(cfg.roots.is_empty());
     }
 
@@ -280,7 +452,10 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server.bind.port(), 4999);
         assert_eq!(cfg.roots[0].name, "home");
-        assert_eq!(cfg.auth["claude"].token_env, "KAED_TOKEN_CLAUDE");
+        assert_eq!(
+            cfg.auth["claude"].token_env.as_deref(),
+            Some("KAED_TOKEN_CLAUDE")
+        );
         assert_eq!(cfg.limits.max_read_bytes, 1024);
         // unspecified limits keep their defaults
         assert_eq!(cfg.limits.max_file_bytes, 8_388_608);
@@ -293,6 +468,121 @@ mod tests {
     }
 
     #[test]
+    fn tokens_come_from_a_file_and_re_reading_picks_up_a_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cur = dir.path().join("claude.token");
+        let prev = dir.path().join("claude.token.prev");
+        std::fs::write(&cur, "  v1\n").unwrap(); // trimmed on read
+        let cfg: Config = toml::from_str(&format!(
+            "[auth]\nclaude = {{ token_file = \"{}\", prev_token_file = \"{}\" }}\n",
+            cur.display(),
+            prev.display()
+        ))
+        .unwrap();
+
+        let first = cfg.resolve(None).unwrap().identities;
+        assert_eq!(first[0].token, "v1");
+        assert_eq!(first[0].prev_token, None); // no prev file yet
+
+        // rotate on disk, then re-resolve the way SIGHUP does
+        std::fs::write(&cur, "v2\n").unwrap();
+        std::fs::write(&prev, "v1\n").unwrap();
+        let after = resolve_identities(&cfg.auth);
+        assert_eq!(after[0].token, "v2");
+        assert_eq!(after[0].prev_token.as_deref(), Some("v1"));
+    }
+
+    #[test]
+    fn auth_entries_must_name_exactly_one_token_source() {
+        let both: Config =
+            toml::from_str("[auth]\nc = { token_env = \"E\", token_file = \"/f\" }\n").unwrap();
+        assert!(
+            both.resolve(None)
+                .unwrap_err()
+                .to_string()
+                .contains("not both")
+        );
+
+        let neither: Config = toml::from_str("[auth]\nc = {}\n").unwrap();
+        assert!(
+            neither
+                .resolve(None)
+                .unwrap_err()
+                .to_string()
+                .contains("needs token_env or token_file")
+        );
+
+        // a grace window with no reloadable token would never take effect
+        let dangling: Config =
+            toml::from_str("[auth]\nc = { token_env = \"E\", prev_token_file = \"/p\" }\n")
+                .unwrap();
+        assert!(
+            dangling
+                .resolve(None)
+                .unwrap_err()
+                .to_string()
+                .contains("prev_token_file needs token_file")
+        );
+    }
+
+    #[test]
+    fn resolve_denies_kaeds_own_config_and_journal_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("kaed-conf/config.toml");
+        let cfg: Config = toml::from_str(&format!(
+            "[journal]\npath = \"{}/state/journal.db\"\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let resolved = cfg.resolve(Some(&cfg_path)).unwrap();
+        assert!(resolved.deny.is_denied(&dir.path().join("kaed-conf/env")));
+        assert!(
+            resolved
+                .deny
+                .is_denied(&dir.path().join("state/journal.db"))
+        );
+        assert!(!resolved.deny.is_denied(&dir.path().join("src/main.rs")));
+    }
+
+    #[test]
+    fn resolve_applies_default_denies_unless_turned_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let on: Config = toml::from_str("").unwrap();
+        assert!(
+            on.resolve(None)
+                .unwrap()
+                .deny
+                .is_denied(&dir.path().join(".ssh/id_ed25519"))
+        );
+
+        let off: Config = toml::from_str("[security]\nuse_default_deny = false\n").unwrap();
+        assert!(
+            !off.resolve(None)
+                .unwrap()
+                .deny
+                .is_denied(&dir.path().join(".ssh/id_ed25519"))
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_a_root_inside_a_denied_area() {
+        // a root nobody could read from is a config bug, not a quiet no-op
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir(&ssh).unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[[roots]]\nname = \"k\"\npath = \"{}\"\n",
+            ssh.display()
+        ))
+        .unwrap();
+        let err = cfg.resolve(None).unwrap_err();
+        assert!(
+            err.to_string().contains("refused by the deny list"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn resolve_rejects_duplicate_root_names() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
@@ -300,7 +590,7 @@ mod tests {
             "[[roots]]\nname = \"a\"\npath = \"{p}\"\n[[roots]]\nname = \"a\"\npath = \"{p}\"\n"
         ))
         .unwrap();
-        let err = cfg.resolve().unwrap_err();
+        let err = cfg.resolve(None).unwrap_err();
         assert!(err.to_string().contains("duplicate root name"));
     }
 
@@ -308,7 +598,7 @@ mod tests {
     fn resolve_rejects_missing_root() {
         let cfg: Config =
             toml::from_str("[[roots]]\nname = \"a\"\npath = \"/nonexistent/kaed-test\"\n").unwrap();
-        assert!(cfg.resolve().is_err());
+        assert!(cfg.resolve(None).is_err());
     }
 
     #[test]
@@ -328,7 +618,7 @@ mod tests {
             "#
         ))
         .unwrap();
-        let resolved = cfg.resolve().unwrap();
+        let resolved = cfg.resolve(None).unwrap();
         assert!(resolved.roots[0].path.is_absolute());
         assert_eq!(resolved.identities.len(), 1);
         assert_eq!(resolved.identities[0].author, "claude");

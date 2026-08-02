@@ -14,6 +14,7 @@ use std::fmt;
 pub enum ErrorCode {
     NotFound,
     OutsideRoot,
+    Denied,
     VersionConflict,
     AmbiguousAnchor,
     AnchorNotFound,
@@ -70,6 +71,16 @@ impl KaedError {
 
     pub fn outside_root(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::OutsideRoot, message)
+    }
+
+    /// A path the deny list refuses. Distinct from `outside_root` because
+    /// the remedy differs: no path correction makes this one work.
+    pub fn denied(path: &str, rule: &str) -> Self {
+        Self::new(
+            ErrorCode::Denied,
+            format!("{path}: refused by the server's deny list (rule: {rule})"),
+        )
+        .with_data(serde_json::json!({ "path": path, "rule": rule }))
     }
 
     pub fn invalid_input(message: impl Into<String>) -> Self {
@@ -158,6 +169,7 @@ mod tests {
         for (code, wire) in [
             (ErrorCode::NotFound, "not_found"),
             (ErrorCode::OutsideRoot, "outside_root"),
+            (ErrorCode::Denied, "denied"),
             (ErrorCode::VersionConflict, "version_conflict"),
             (ErrorCode::AmbiguousAnchor, "ambiguous_anchor"),
             (ErrorCode::AnchorNotFound, "anchor_not_found"),

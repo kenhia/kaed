@@ -36,6 +36,15 @@ pub struct SearchMatch {
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
     pub truncated: bool,
+    /// Files the deny list kept out of the search entirely. Omitted when
+    /// zero — "no matches" and "no matches in what I was allowed to read"
+    /// are different answers.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub denied_hidden: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 pub struct SearchParams<'a> {
@@ -66,14 +75,31 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
     };
 
     let base = fsops::resolve_existing(root, p.path)?;
+    // As in `list`, this walk bypasses the resolver — and here a missed
+    // deny check would hand back the *contents* of a denied file, not just
+    // its name.
+    let denied_hidden = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     if base.is_file() {
         files.push(base);
     } else {
-        let walker = ignore::WalkBuilder::new(&base)
-            .hidden(false)
-            .filter_entry(|e| e.file_name() != ".git")
-            .build();
+        let walker = {
+            let deny = root.deny.clone();
+            let counter = denied_hidden.clone();
+            ignore::WalkBuilder::new(&base)
+                .hidden(false)
+                .filter_entry(move |e| {
+                    if e.file_name() == ".git" {
+                        return false;
+                    }
+                    if deny.is_denied(e.path()) {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return false;
+                    }
+                    true
+                })
+                .build()
+        };
         for entry in walker {
             let entry = entry.map_err(|e| KaedError::internal(e.to_string()))?;
             if entry.file_type().is_some_and(|t| t.is_file()) {
@@ -133,7 +159,11 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         }
     }
 
-    Ok(SearchResult { matches, truncated })
+    Ok(SearchResult {
+        matches,
+        truncated,
+        denied_hidden: denied_hidden.load(std::sync::atomic::Ordering::Relaxed),
+    })
 }
 
 struct CollectSink<'a> {
@@ -211,11 +241,7 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, ResolvedRoot) {
         let dir = tempfile::tempdir().unwrap();
-        let root = ResolvedRoot {
-            name: "t".into(),
-            path: dir.path().canonicalize().unwrap(),
-            description: None,
-        };
+        let root = ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap());
         (dir, root)
     }
 
@@ -234,6 +260,31 @@ mod tests {
             context: 2,
             max_results: 50,
         }
+    }
+
+    /// The #908 case that a resolver-only deny check would have missed:
+    /// `search` reads every file it walks and returns the matching lines,
+    /// so an unfiltered walk hands back the *contents* of a denied file.
+    #[test]
+    fn denied_files_are_searched_neither_by_name_nor_content() {
+        let (dir, _) = setup();
+        write(dir.path(), "src/app.rs", "let token = env(\"TOKEN\");\n");
+        write(dir.path(), ".config/kaed/env", "KAED_TOKEN_CLAUDE=sekrit\n");
+        let root = ResolvedRoot {
+            deny: std::sync::Arc::new(
+                crate::deny::DenyList::new(Vec::new(), &["**/.config/kaed".to_string()]).unwrap(),
+            ),
+            ..ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap())
+        };
+
+        let r = search(&root, &params("TOKEN"), &Limits::default()).unwrap();
+        assert_eq!(r.matches.len(), 1);
+        assert_eq!(r.matches[0].path, "src/app.rs");
+        assert!(
+            !r.matches.iter().any(|m| m.text.contains("sekrit")),
+            "denied file content leaked into search results"
+        );
+        assert_eq!(r.denied_hidden, 1);
     }
 
     #[test]
