@@ -189,11 +189,22 @@ brainstorm.
 
 ## Follow-ups
 
-- **Landing order.** 003 stacks on 002; neither is merged to main. Both need
-  to land before the repo flips to public — see below.
-- **A CI workflow** (`just check` on push) would be the natural next hygiene
-  step for a public repo. Not done here: it wants a decision about whether to
-  run the integration tests in CI, which bind a real port.
+- **A CI workflow** — `just check` on push and PR to main. Deferred, then
+  settled during the ship: the integration tests **should** run in CI. The
+  concern raised here originally ("they bind a real port") was wrong; they
+  bind `127.0.0.1:0`, so the OS assigns a free one and there is nothing to
+  collide with. Measured: 115 ms for the suite, 0 failures in 10 consecutive
+  runs, loopback and tempdirs only.
+
+  They are also the tests least worth losing. The 102 unit tests cover logic;
+  these six cover the wire contract. `rejects_missing_and_bad_tokens` is the
+  only thing that would catch an auth layer refactored into the wrong place
+  in `build_app` — a change every unit test would happily pass while leaving
+  the service open. Splitting the suite would also make `just check` stop
+  being *the* gate, which is worse than any CI cost being avoided.
+
+  Still to build: the workflow itself, with a cargo cache (bundled SQLite is
+  the only slow part of a cold build).
 - **`docs/kaed-explained.html` will drift.** It hardcodes "two shipped
   sprints" and the roadmap's shape. Worth a glance at the end of any sprint
   that changes the status section.
@@ -210,4 +221,8 @@ Everything below is verified in the final section of this sprint's work:
 - [x] README leads with the risk warning
 - [x] `docs/` deployable by a stranger
 - [x] `just check` green
-- [ ] **002 and 003 merged to main** — Ken's call, not done here
+- [x] 002 and 003 merged to main — shipped as separate PRs (#2, #3) so the
+      branch history tells the sprint story rather than collapsing into one
+
+Flipping repository visibility is the one remaining step, and it is Ken's to
+take.
