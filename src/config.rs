@@ -32,12 +32,17 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+    /// Extra `Host` header values to accept, on top of loopback — set this
+    /// to the tailnet hostname when fronted by `tailscale serve`.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            allowed_hosts: Vec::new(),
         }
     }
 }
@@ -179,6 +184,7 @@ impl Config {
 
         Ok(Resolved {
             bind: self.server.bind,
+            allowed_hosts: self.server.allowed_hosts.clone(),
             roots,
             identities,
             limits: self.limits,
@@ -192,6 +198,7 @@ impl Config {
 #[derive(Debug)]
 pub struct Resolved {
     pub bind: SocketAddr,
+    pub allowed_hosts: Vec<String>,
     pub roots: Vec<ResolvedRoot>,
     pub identities: Vec<Identity>,
     pub limits: Limits,

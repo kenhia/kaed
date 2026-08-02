@@ -1,0 +1,527 @@
+//! MCP wiring: tool registration, bearer auth, streamable HTTP.
+//!
+//! This layer stays thin — params in, one call into fsops/search/txn,
+//! result or `KaedError` out. Failures the agent should see are `isError`
+//! tool results carrying the R4 `{code, message, data}` object (as
+//! structured content, with a text fallback); protocol-level `Err` is
+//! reserved for infrastructure breakage.
+//!
+//! Auth is an axum middleware in front of the MCP service: a bearer token
+//! resolves to an author identity or the request dies 401. The author
+//! rides the request extensions into tool handlers, so every journal
+//! entry is attributed. No anonymous mutation.
+
+use crate::config::{Identity, Limits, Resolved, ResolvedRoot};
+use crate::errors::KaedError;
+use crate::fsops::{self, ReadMode};
+use crate::journal::Journal;
+use crate::search;
+use crate::txn::{self, BaseVersion, EditOp, EditRequest};
+use axum::extract::State;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+const DEFAULT_LIST_MAX: usize = 500;
+const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
+
+/// The authenticated author identity, set by the auth middleware and read
+/// by mutating tools for journal attribution.
+#[derive(Debug, Clone)]
+pub struct Author(pub String);
+
+pub struct AppState {
+    pub roots: Vec<ResolvedRoot>,
+    pub limits: Limits,
+    pub journal: Journal,
+}
+
+impl AppState {
+    fn root(&self, name: &str) -> Result<ResolvedRoot, KaedError> {
+        self.roots
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                KaedError::not_found(format!(
+                    "unknown root {name:?}; call `roots` for the configured list"
+                ))
+            })
+    }
+}
+
+#[derive(Clone)]
+pub struct KaedServer {
+    state: Arc<AppState>,
+    tool_router: ToolRouter<Self>,
+}
+
+impl KaedServer {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self {
+            state,
+            tool_router: Self::tool_router(),
+        }
+    }
+}
+
+// ------------------------------------------------------------ tool params
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StatParams {
+    /// Root name (see `roots`).
+    pub root: String,
+    /// Root-relative path; empty for the root itself.
+    #[serde(default)]
+    pub path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ListParams {
+    pub root: String,
+    /// Directory to list, root-relative; empty for the root itself.
+    #[serde(default)]
+    pub path: String,
+    /// Glob over root-relative paths, e.g. `**/*.rs`.
+    pub glob: Option<String>,
+    /// Recursion depth below `path` (default 1 = immediate children).
+    #[serde(default = "default_depth")]
+    pub depth: usize,
+    /// Max entries returned (default 500); continue via `offset`.
+    pub max: Option<usize>,
+    #[serde(default)]
+    pub offset: usize,
+    /// Include gitignored entries.
+    #[serde(default)]
+    pub ignored: bool,
+}
+
+fn default_depth() -> usize {
+    1
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RangeParam {
+    /// 1-based first line, inclusive.
+    pub start: usize,
+    /// Last line, inclusive; clamped to EOF.
+    pub end: usize,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WindowParam {
+    /// Center the window on this 1-based line…
+    pub line: Option<usize>,
+    /// …or on the unique occurrence of this text.
+    pub anchor: Option<String>,
+    /// Context lines on each side (default 10).
+    #[serde(default = "default_context")]
+    pub context: usize,
+}
+
+fn default_context() -> usize {
+    10
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadParams {
+    pub root: String,
+    pub path: String,
+    /// Explicit line range; mutually exclusive with `window`.
+    pub range: Option<RangeParam>,
+    /// N context lines around a line or unique anchor — the cheap
+    /// "show me where I'm about to edit" read.
+    pub window: Option<WindowParam>,
+    /// Prefix each line with `<n>\t` (absolute file line numbers).
+    #[serde(default)]
+    pub numbered: bool,
+    /// Response byte budget for this call (capped by the server limit).
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SearchParams {
+    pub root: String,
+    pub pattern: String,
+    /// `false` searches the pattern as a literal string (default true).
+    #[serde(default = "default_true")]
+    pub regex: bool,
+    /// Glob over root-relative paths, e.g. `**/*.rs`.
+    pub glob: Option<String>,
+    /// Subtree or single file to search; empty = whole root.
+    #[serde(default)]
+    pub path: String,
+    /// Context lines before/after each match (default 2).
+    #[serde(default = "default_search_context")]
+    pub context: usize,
+    /// Cap on returned matches (default from server config).
+    pub max_results: Option<usize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_search_context() -> usize {
+    2
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditParams {
+    pub root: String,
+    /// Version of every file the ops touch (except pure creates), from a
+    /// prior read/search/stat. Extra entries act as "assert unchanged".
+    #[serde(default)]
+    pub base: Vec<BaseVersion>,
+    /// Applied in order against evolving buffers; all land or none do.
+    pub ops: Vec<EditOp>,
+    /// Validate and return the diff without touching disk.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Include the unified diff (the proof of what changed; default true).
+    #[serde(default = "default_true")]
+    pub return_diff: bool,
+    /// Journaled note on why this edit was made.
+    pub intent: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct RootInfo {
+    name: String,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+// ------------------------------------------------------------------ tools
+
+#[tool_router]
+impl KaedServer {
+    #[tool(
+        description = "List the configured workspace roots. Every other tool takes a `root` name plus a root-relative `path`."
+    )]
+    async fn roots(&self) -> Result<CallToolResult, ErrorData> {
+        let roots: Vec<RootInfo> = self
+            .state
+            .roots
+            .iter()
+            .map(|r| RootInfo {
+                name: r.name.clone(),
+                path: r.path.display().to_string(),
+                description: r.description.clone(),
+            })
+            .collect();
+        ok(serde_json::json!({ "roots": roots }))
+    }
+
+    #[tool(
+        description = "Stat a file, directory, or symlink. For files returns the content `version` — the cheap staleness probe: compare against a version you hold to see if a re-read is needed."
+    )]
+    async fn stat(
+        &self,
+        Parameters(p): Parameters<StatParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            fsops::stat(&root, &p.path, &state.limits)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "List directory entries (gitignore-aware; `.git` always hidden). Budgeted: `truncated: true` + `next_offset` mean more entries exist — continue by passing `offset`."
+    )]
+    async fn list(
+        &self,
+        Parameters(p): Parameters<ListParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            fsops::list(
+                &root,
+                &fsops::ListParams {
+                    path: &p.path,
+                    glob: p.glob.as_deref(),
+                    depth: p.depth,
+                    max: p.max.unwrap_or(DEFAULT_LIST_MAX),
+                    offset: p.offset,
+                    ignored: p.ignored,
+                },
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Read a file: whole (capped), a line `range`, or a `window` of context around a line or unique anchor string. Always returns the whole file's `version` — usable directly as an edit base. Truncation is explicit (`truncated`, `next_offset`)."
+    )]
+    async fn read(
+        &self,
+        Parameters(p): Parameters<ReadParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let mode = match (&p.range, &p.window) {
+                (Some(_), Some(_)) => {
+                    return Err(KaedError::invalid_input(
+                        "pass `range` or `window`, not both",
+                    ));
+                }
+                (Some(r), None) => ReadMode::Range {
+                    start: r.start,
+                    end: r.end,
+                },
+                (None, Some(w)) => match (&w.line, &w.anchor) {
+                    (Some(line), None) => ReadMode::WindowLine {
+                        line: *line,
+                        context: w.context,
+                    },
+                    (None, Some(anchor)) => ReadMode::WindowAnchor {
+                        anchor,
+                        context: w.context,
+                    },
+                    _ => {
+                        return Err(KaedError::invalid_input(
+                            "window needs exactly one of `line` or `anchor`",
+                        ));
+                    }
+                },
+                (None, None) => ReadMode::Whole,
+            };
+            fsops::read(
+                &root,
+                &p.path,
+                &mode,
+                p.numbered,
+                p.max_bytes,
+                &state.limits,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Ripgrep-grade search. Each match carries its file's `version`, so search → edit is safe with no read in between (a stale hit becomes version_conflict, never a wrong edit)."
+    )]
+    async fn search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let max = p
+                .max_results
+                .unwrap_or(state.limits.search_max_results)
+                .min(SEARCH_MAX_RESULTS_CEILING);
+            search::search(
+                &root,
+                &search::SearchParams {
+                    pattern: &p.pattern,
+                    regex: p.regex,
+                    glob: p.glob.as_deref(),
+                    path: &p.path,
+                    context: p.context,
+                    max_results: max,
+                },
+                &state.limits,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Transactional edit: anchor_replace / range_replace / create ops, multi-file, atomic — all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Supports dry_run."
+    )]
+    async fn edit(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<EditParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = parts
+            .extensions
+            .get::<Author>()
+            .cloned()
+            .ok_or_else(|| ErrorData::internal_error("no author on request", None))?;
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let req = EditRequest {
+                base: p.base,
+                ops: p.ops,
+                dry_run: p.dry_run,
+                return_diff: p.return_diff,
+                intent: p.intent,
+            };
+            txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
+        })
+        .await
+    }
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for KaedServer {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.server_info = Implementation::new("kaed", env!("CARGO_PKG_VERSION"))
+            .with_title("kaed — agent editor");
+        info.instructions = Some(
+            "kaed edits files on this host with verified writes. Loop: \
+             search or read (both return a `version`) → edit declaring that \
+             version in `base` → the response diff is your proof, no re-read \
+             needed. On version_conflict, inspect `data.delta` (what changed \
+             since you looked), re-anchor, retry. Prefer `window` reads and \
+             anchors over whole-file reads. Every edit is journaled under \
+             your identity; pass `intent` so successors understand it."
+                .into(),
+        );
+        info
+    }
+}
+
+/// Run a blocking kaed operation and shape the outcome per R4: success and
+/// agent-visible failure are both tool results; `Err` is infrastructure only.
+async fn run<T: Serialize + Send + 'static>(
+    f: impl FnOnce() -> Result<T, KaedError> + Send + 'static,
+) -> Result<CallToolResult, ErrorData> {
+    let outcome = tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("task panicked: {e}"), None))?;
+    match outcome {
+        Ok(v) => ok(serde_json::to_value(v)
+            .map_err(|e| ErrorData::internal_error(format!("serializing result: {e}"), None))?),
+        Err(e) => Ok(CallToolResult::structured_error(
+            serde_json::to_value(&e).map_err(|se| {
+                ErrorData::internal_error(format!("serializing error: {se}"), None)
+            })?,
+        )),
+    }
+}
+
+fn ok(value: serde_json::Value) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::structured(value))
+}
+
+// ------------------------------------------------------------------- auth
+
+struct AuthState {
+    identities: Vec<Identity>,
+}
+
+/// Constant-time token comparison; length is the only thing an attacker
+/// can learn.
+fn token_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
+}
+
+async fn auth_middleware(
+    State(auth): State<Arc<AuthState>>,
+    mut req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let bearer = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let author = bearer.and_then(|token| {
+        auth.identities
+            .iter()
+            .find(|id| token_eq(&id.token, token))
+            .map(|id| id.author.clone())
+    });
+    match author {
+        Some(author) => {
+            req.extensions_mut().insert(Author(author));
+            next.run(req).await
+        }
+        None => (
+            http::StatusCode::UNAUTHORIZED,
+            [(http::header::WWW_AUTHENTICATE, "Bearer")],
+            "unauthorized",
+        )
+            .into_response(),
+    }
+}
+
+// --------------------------------------------------------------- assembly
+
+/// Build the full HTTP app: auth middleware in front of the MCP service at
+/// `/mcp`. Separated from `serve` so tests can drive it on an ephemeral
+/// listener.
+pub fn build_app(resolved: Resolved) -> anyhow::Result<axum::Router> {
+    anyhow::ensure!(
+        !resolved.roots.is_empty(),
+        "no roots configured; nothing to serve"
+    );
+    anyhow::ensure!(
+        !resolved.identities.is_empty(),
+        "no auth identities resolved; set the token env vars from [auth]"
+    );
+
+    let journal = Journal::open(&resolved.journal_path)?;
+    for torn in journal.scan_pending().map_err(|e| anyhow::anyhow!("{e}"))? {
+        tracing::warn!(
+            txn = torn.id,
+            author = %torn.author,
+            started = %torn.started_at,
+            files = ?torn.files,
+            "torn transaction: begun but never completed — files may need inspection"
+        );
+    }
+
+    let state = Arc::new(AppState {
+        roots: resolved.roots,
+        limits: resolved.limits,
+        journal,
+    });
+    let auth = Arc::new(AuthState {
+        identities: resolved.identities,
+    });
+
+    let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
+    allowed_hosts.extend(resolved.allowed_hosts);
+
+    let mcp = StreamableHttpService::new(
+        move || Ok(KaedServer::new(state.clone())),
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
+    );
+
+    Ok(axum::Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(axum::middleware::from_fn_with_state(auth, auth_middleware)))
+}
+
+pub async fn serve(resolved: Resolved) -> anyhow::Result<()> {
+    let bind = resolved.bind;
+    let app = build_app(resolved)?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    tracing::info!(%bind, "kaed serving MCP at /mcp");
+    axum::serve(listener, app).await?;
+    Ok(())
+}

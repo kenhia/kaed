@@ -28,7 +28,8 @@ enum Cmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -37,10 +38,7 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().cmd {
-        Cmd::Serve { config } => {
-            let _resolved = load(config)?;
-            anyhow::bail!("`kaed serve` is not wired up yet (sprint 001 in progress)");
-        }
+        Cmd::Serve { config } => kaed::server::serve(load(config)?).await,
         Cmd::CheckConfig { config } => {
             let path = config.unwrap_or_else(Config::default_path);
             println!("config: {}", path.display());

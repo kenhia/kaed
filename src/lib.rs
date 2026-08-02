@@ -9,4 +9,5 @@ pub mod errors;
 pub mod fsops;
 pub mod journal;
 pub mod search;
+pub mod server;
 pub mod txn;
