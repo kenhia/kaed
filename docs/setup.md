@@ -17,6 +17,28 @@ If you would rather have an agent do this, skip to
 
 ---
 
+## The short version
+
+```sh
+git clone https://github.com/kenhia/kaed
+cd kaed
+./deploy/install.sh          # binary, systemd user unit, starter config
+$EDITOR ~/.config/kaed/config.toml     # roots — the one thing to get right
+./deploy/new-token.sh        # mints a token; never prints it
+kaed check-config            # read the roots and deny rules it prints
+systemctl --user start kaed
+```
+
+`install.sh` is idempotent, and re-running it is how you upgrade. It never
+overwrites an existing config and never touches the token — the two things
+you cannot safely regenerate underneath a running host. `--dry-run` prints
+what it would do.
+
+The rest of this page is what those five commands do, and why each choice
+is the way it is. Read at least [Choosing roots](#choosing-roots--the-one-thing-to-get-right)
+and [the `Host` header gotcha](#5-expose-it-optional) before trusting a
+deploy.
+
 ## Prerequisites
 
 - **Rust** (edition 2024 — 1.85 or newer; developed on 1.96).
@@ -39,10 +61,23 @@ kaed --version
 
 Make sure `~/.local/bin` is on your `PATH`.
 
+`--version` reports the commit it was built from, e.g.
+`kaed 0.1.0 (966367c 2026-08-02)` — a `-dirty` suffix means the working tree
+had uncommitted changes. That string is what tells one host's binary from
+another's, and the MCP handshake reports the same one, so a connected agent
+and a shell on the box agree about which build is running. Building from a
+tarball with no `.git` gives `0.1.0 (unknown)` rather than failing.
+
 ## 2. Create the token
 
-One bearer token per agent identity. Generate a real one — this is the only
-thing standing between the network and your files:
+One bearer token per agent identity. This is the only thing standing between
+the network and your files:
+
+```sh
+./deploy/new-token.sh
+```
+
+which is this, with a refusal to overwrite an existing token bolted on:
 
 ```sh
 mkdir -p ~/.config/kaed
@@ -54,7 +89,16 @@ The file's trimmed contents are the token. Never commit it, and keep it out of
 any directory kaed serves — which kaed enforces for you, since its own config
 directory is refused unconditionally.
 
+**The script does not print the token, deliberately.** Read it with `cat`
+when you are ready to paste it into a client. This project's first token had
+to be rotated because it landed in a transcript.
+
 ## 3. Write the config
+
+`install.sh` drops [`deploy/config.example.toml`](../deploy/config.example.toml)
+at `~/.config/kaed/config.toml` if you have none. Its roots are placeholders,
+and kaed refuses to start on a root that does not exist — so a fresh install
+is enabled but deliberately not started until you have edited this file.
 
 `~/.config/kaed/config.toml`:
 
@@ -138,6 +182,10 @@ anything invalid. Read the deny list it prints — that is the real one, not the
 one you think you wrote.
 
 ## 4. Run it as a service
+
+`install.sh` installs [`deploy/kaed.service`](../deploy/kaed.service),
+`daemon-reload`s, enables it and turns on linger. For reference, or to do it
+by hand, that unit is:
 
 `~/.config/systemd/user/kaed.service`:
 
@@ -253,6 +301,18 @@ restart the client.
 kaed re-reads token files on `SIGHUP`, and can honour the previous token
 during a grace window. Together those make rotation non-breaking on the server
 side — no restart, so live sessions survive:
+
+```sh
+./deploy/new-token.sh --rotate    # new token live, old one still works
+# … update your clients; they pick it up when they next restart …
+./deploy/new-token.sh --close     # old token stops working
+```
+
+`--rotate` requires `prev_token_file` to be set for that identity, or the old
+token dies immediately and the window buys you nothing. The script says so;
+it cannot edit your config for you.
+
+Longhand, which is what those two commands do:
 
 ```sh
 cd ~/.config/kaed
