@@ -160,9 +160,47 @@ write was genuinely unavoidable here.)
 ## Still to do
 
 - **k-homelab #926** — the `kaed-service` recipe, per-host manifests and the
-  `tailscale_serve` entries (kai's has never been declared, #907). That is a
-  different repo; run `/start-sprint korg:928` from its checkout on kubs0.
-  Everything the recipe needs to assert now exists: a canonical installer to
-  point at, `kaed --version` for the freshness floor, and `check-config` as
-  a post-condition.
+  `tailscale_serve` entries (kai's has never been declared, #907). Different
+  repo; it has its own proposal now, **korg:932** — run `/start-sprint
+  korg:932` from the k-homelab checkout on kubs0. Everything the recipe needs
+  to assert now exists: a canonical installer to point at, `kaed --version`
+  for the freshness floor, and `check-config` as a post-condition.
 - **korg #929** — revisit kubsdb once kai and kubs0 have runtime.
+
+---
+
+## Deployed 2026-08-02 — merged `main`, commit `b08ce9f`
+
+Sprint 004 shipped as PR #4, squash-merged to `b08ce9f`, then redeployed to
+both hosts from merged `main` via `/sprint-ship` Phase 7 → the `deploy-fleet`
+skill. **This redeploy was the point of wiring Phase 7 at all:** both hosts
+had been running `19a8cb4`, a feature-branch commit that ceased to exist on
+`main` at the squash-merge, so they would have been reporting a SHA no audit
+could resolve — on the very sprint that added the stamp to prevent that.
+
+| Host | Commit | `kaed --version` | Unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `b08ce9f` | `0.1.0 (b08ce9f 2026-08-02)` | active | `0.1.0 (b08ce9f 2026-08-02)` |
+| kubs0 | `b08ce9f` | `0.1.0 (b08ce9f 2026-08-02)` | active | `0.1.0 (b08ce9f 2026-08-02)` |
+
+Neither build `-dirty`; the reported hash was asserted to be a real prefix of
+`HEAD` rather than eyeballed. Every host built from its own checkout of the
+same commit — nothing was copied host-to-host, which is what makes the stamp
+worth trusting.
+
+**Rollback target:** `~/.local/bin/kaed.prev` on each host (`mv -f` it back
+and `systemctl --user restart kaed`). Both currently hold the `19a8cb4`
+build. Roll back only the broken host — the two are independent, with no
+schema or protocol coupling.
+
+**Verified live beyond "it's up":**
+
+- The stamp reaches clients over MCP, not just the CLI — the handshake and
+  `kaed --version` agree on both hosts, which is what proves the binary on
+  disk and the server on the network are the same build.
+- The sprint's deny-glob fix, on the deployed build: `stat` on
+  `k-homelab/secrets` → `denied` naming rule `**/secrets`, and the root
+  listing shows `denied_hidden: 1` with `secrets` absent.
+- No schema or data migration in this sprint, but the journals survived the
+  restarts intact and still `0600`: kai 7 txns / 2 failures, kubs0 2 txns /
+  1 failure.

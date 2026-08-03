@@ -146,7 +146,8 @@ looks right.
   but `*.key` is the same class of thing as `*.pem`, which *is* a default.
   Promoting them touches README, SECURITY.md and the contract, so it belongs
   in a sprint looking at the contract.
-- **k-homelab #926** needs `/start-sprint korg:928` run again from that
-  repo's checkout on kubs0.
+- **k-homelab #926** — split out into its own proposal, **korg:932**, when
+  korg:928 was closed at ship time. Run `/start-sprint korg:932` from the
+  k-homelab checkout on kubs0.
 - **korg #929** — revisit kubsdb, with broad access as the shape to design,
   once kai and kubs0 have journal evidence to argue from.

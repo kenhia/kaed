@@ -6,8 +6,8 @@
 
 ## Now
 
-- **k-homelab `kaed-service` recipe** (k-homelab #926) — the other half of
-  004, in the other repo. Everything it needs to *assert* rather than
+- **k-homelab `kaed-service` recipe** (korg:932, covering k-homelab #926) —
+  the other half of 004, in the other repo. Everything it needs to *assert* rather than
   duplicate now exists: `deploy/install.sh` owns the binary and unit,
   `kaed --version` gives it a freshness floor, and `check-config` is a
   post-condition that proves kaed agrees about what it can reach. Closes
