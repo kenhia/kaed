@@ -162,10 +162,10 @@ whom, so a human's edits and several agents' edits stay mutually visible.
 ## Where it is now
 
 **Early beta.** Six tools — `roots`, `stat`, `list`, `read`, `search`, `edit`
-— live on one host, dogfooded daily, with the full verified-write loop working
-end to end from a remote agent.
+— running on a small fleet of hosts, dogfooded daily, with the full
+verified-write loop working end to end from a remote agent.
 
-Three sprints in:
+Four sprints in:
 
 - **001 — walking skeleton.** The six tools, the R1–R4 semantics, atomic
   apply, journal writes, bearer auth over streamable HTTP. Deployed and
@@ -174,14 +174,16 @@ Three sprints in:
   the deny list, RFC 6750 error attributes on 401s, failed transactions in the
   journal, real blob retention, and non-breaking token rotation.
 - **003 — public beta readiness.** These docs.
+- **004 — fleet deploy.** A repeatable install ([`deploy/`](../deploy/))
+  instead of a hand-typed one, a build stamp so `kaed --version` names the
+  commit it was built from, and a second host — which promptly showed that a
+  config reviewed on one host is not a config verified on the next.
 
 ## Where it is going
 
 Roughly in order, with the reasoning in
 [`sprints/planning/roadmap.md`](../sprints/planning/roadmap.md):
 
-- **Fleet deploy** — more than one host, and a repeatable install rather than
-  a hand-built one.
 - **History tools** — `journal`, `diff`, `revert`. The data is already being
   written; nothing reads it yet.
 - **Structure** — tree-sitter `outline`, node-targeted edits, and parse

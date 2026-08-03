@@ -22,8 +22,9 @@ on it without a verification round-trip.
 > kaed is a **network service that writes to your filesystem**, gated by a
 > bearer token. It is at an **early beta** level of maturity:
 >
-> - It is dogfooded daily by its author on one machine. It has been run by
->   essentially nobody else, and it has not been audited.
+> - It is dogfooded daily by its author, on a handful of machines on a
+>   private network. It has been run by essentially nobody else, and it has
+>   not been audited.
 > - **Expect breaking changes** — to the config format, the MCP tool contract,
 >   and the on-disk journal schema. Version numbers track sprints, not a
 >   stable API.
@@ -81,6 +82,10 @@ is what lets the security story be stated in one paragraph. See
 - **[docs/setup.md](docs/setup.md)** — deploying it yourself: build, config,
   token, systemd unit, remote access, client wiring, rotation. Includes a
   section you can hand to your own agent to do the install.
+- **[deploy/](deploy/)** — the install itself: an idempotent `install.sh`
+  (re-running it is the upgrade path), the systemd unit, a config template,
+  and token mint/rotate. It never overwrites a config and never touches a
+  token.
 - **[docs/kaed-explained.html](docs/kaed-explained.html)** — a single-page
   visual explainer
   ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).
