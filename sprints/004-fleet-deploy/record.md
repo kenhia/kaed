@@ -94,6 +94,31 @@ keeps every manual step as the explanation of what those commands do —
 including the longhand rotation, so the script and the prose cannot quietly
 diverge.
 
+**#927 — the fleet is live.** kai (re-installed through the new script, so
+the upgrade path got exercised somewhere verifiable) and kubs0, both on
+`19a8cb4`. cleo's Claude Code is wired to `kaed-kai` and `kaed-kubs0`, and
+both were verified end-to-end using cleo's own stored credentials rather
+than a hand-pasted token. The whole battery — auth, hairpin, deny list
+across all three enforcement points, the full edit → conflict loop, journal
+rows and file modes — is in [deploy.md](deploy.md).
+
+### The finding that made the deploy worth doing carefully
+
+`deny = ["**/secrets/**"]`, carried on kai since sprint 002 and copied into
+the new template, is **weaker than it reads**. It hides a secrets
+directory's *contents* but not the directory: `stat` on it succeeded and it
+appeared in a parent `list` with no `denied_hidden`. The glob needs a path
+component after `secrets`, so it never matches the directory node itself.
+
+The right pattern is the bare `**/secrets` — exactly the idiom `deny.rs`
+already documents for `**/.ssh`, where ancestor-walking covers everything
+beneath. Fixed on both hosts and in the template, which now explains the
+trap. Re-verified: `denied` on `stat`, absent from `list`, zero search hits.
+
+Two things this vindicates: `check-config` printing every rule in force, and
+exercising the deny list on each host instead of trusting a config that
+looks right.
+
 ## Follow-ups
 
 - **`**/secrets/**` and `**/*.key` are not in `DEFAULT_DENY`.** Both are in

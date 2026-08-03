@@ -74,8 +74,14 @@ retention_days = 7
 # These two are not built-in defaults but have earned their place on every
 # host this project runs on: a directory literally named `secrets`, and
 # private key material that does not happen to end in `.pem`.
+#
+# Write `**/secrets`, NOT `**/secrets/**`. A path is denied if it or any
+# ancestor matches, so the bare form covers the directory *and* everything
+# under it. The `/**` form matches only what is inside, leaving the
+# directory itself listable and stat-able — which was true on kai until
+# sprint 004 noticed.
 [security]
 deny = [
-    "**/secrets/**",
+    "**/secrets",
     "**/*.key",
 ]
