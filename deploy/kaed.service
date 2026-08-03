@@ -1,0 +1,24 @@
+# kaed as a systemd *user* service. Installed to
+# ~/.config/systemd/user/kaed.service by deploy/install.sh.
+#
+# A user unit, not a system one, on purpose: kaed edits your files as you,
+# and running it as root or a service account would mean either broader
+# access than the roots describe or a permissions mismatch on everything it
+# writes.
+
+[Unit]
+Description=kaed — agent editor MCP daemon
+Documentation=https://github.com/kenhia/kaed
+After=network.target
+
+[Service]
+ExecStart=%h/.local/bin/kaed serve
+# Token files are re-read on SIGHUP. Without this line, rotating a token
+# means a restart, and a restart drops every live agent session.
+ExecReload=/bin/kill -HUP $MAINPID
+Environment=RUST_LOG=kaed=info
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

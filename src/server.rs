@@ -384,8 +384,11 @@ impl ServerHandler for KaedServer {
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.server_info = Implementation::new("kaed", env!("CARGO_PKG_VERSION"))
-            .with_title("kaed — agent editor");
+        // The build stamp, not the crate version: an agent asking "which
+        // kaed am I talking to" needs the commit, and `0.1.0` has been the
+        // answer since sprint 001 (korg #924).
+        info.server_info =
+            Implementation::new("kaed", crate::version::FULL).with_title("kaed — agent editor");
         info.instructions = Some(
             "kaed edits files on this host with verified writes. Loop: \
              search or read (both return a `version`) → edit declaring that \

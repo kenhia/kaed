@@ -1,0 +1,87 @@
+# kaed configuration — copy to ~/.config/kaed/config.toml and edit.
+#
+# deploy/install.sh will place this file for you if none exists, but it will
+# never overwrite one. The roots below are placeholders and WILL NOT WORK
+# unchanged: kaed refuses to start on a root that does not exist.
+#
+# Validate whatever you write with `kaed check-config`, and read the deny
+# list it prints. That is the real one, not the one you think you wrote.
+
+[server]
+bind = "127.0.0.1:4870"
+
+# Host header values accepted beyond loopback. The MCP layer validates
+# `Host` as a DNS-rebinding guard, BEFORE auth runs — so behind a proxy an
+# unlisted hostname gives you a 4xx that looks nothing like an auth problem.
+# List the external name in BOTH forms, bare and with the port.
+allowed_hosts = [
+    # "myhost.example.ts.net",
+    # "myhost.example.ts.net:4870",
+]
+
+# ---------------------------------------------------------------- roots
+#
+# The only paths kaed can reach. This is the entire security boundary, and
+# the one thing to get right.
+#
+# DO NOT ROOT AT $HOME. kaed's first deployment did, and `read` on
+# ~/.config/kaed/env returned the very bearer token gating the service.
+# Name the directories holding work you actually want an agent editing.
+
+[[roots]]
+name = "src"
+path = "~/src"
+description = "code repos"
+
+[[roots]]
+name = "scratch"
+path = "~/scratch"
+description = "scratch space"
+
+# ----------------------------------------------------------------- auth
+#
+# One entry per agent identity; the name is recorded on every journal
+# entry. Use `token_file`, not `token_env`: a process cannot re-read its own
+# systemd EnvironmentFile, so an env token cannot be rotated without a
+# restart that kills live sessions.
+#
+# Generate the token with `deploy/new-token.sh` — never by hand, and never
+# somewhere it gets printed.
+
+[auth]
+claude = { token_file = "~/.config/kaed/token" }
+
+# During a rotation, `deploy/new-token.sh --rotate` writes the old value to
+# token.prev and it keeps working until you close the window. Uncomment to
+# enable the grace window:
+# claude = { token_file = "~/.config/kaed/token", prev_token_file = "~/.config/kaed/token.prev" }
+
+[limits]
+max_read_bytes = 262144       # per-response byte budget
+max_file_bytes = 8388608      # refuse to read/edit files larger than this
+search_max_results = 50       # default cap on search hits
+
+[journal]
+# Days of blob *content* retained. Transaction metadata is kept forever.
+retention_days = 7
+
+# ------------------------------------------------------------- security
+#
+# Extends the built-in defaults (.ssh, .gnupg, .aws, .env, *.pem, id_*, …),
+# which already cover kaed's own config and journal directories
+# unconditionally. A path is refused if it or any ancestor matches.
+#
+# These two are not built-in defaults but have earned their place on every
+# host this project runs on: a directory literally named `secrets`, and
+# private key material that does not happen to end in `.pem`.
+#
+# Write `**/secrets`, NOT `**/secrets/**`. A path is denied if it or any
+# ancestor matches, so the bare form covers the directory *and* everything
+# under it. The `/**` form matches only what is inside, leaving the
+# directory itself listable and stat-able — which was true on kai until
+# sprint 004 noticed.
+[security]
+deny = [
+    "**/secrets",
+    "**/*.key",
+]

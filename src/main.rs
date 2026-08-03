@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "kaed",
-    version,
+    version = kaed::version::FULL,
     about = "an editor whose only user is an AI agent"
 )]
 struct Cli {
@@ -41,6 +41,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { config } => kaed::server::serve(load(config)?).await,
         Cmd::CheckConfig { config } => {
             let path = config.unwrap_or_else(Config::default_path);
+            // First line, so one command answers both "is this host's
+            // config sane" and "which build is asserting that".
+            println!("kaed {}", kaed::version::FULL);
             println!("config: {}", path.display());
             let resolved = load(Some(path))?;
             println!("bind: {}", resolved.bind);

@@ -12,3 +12,4 @@ pub mod journal;
 pub mod search;
 pub mod server;
 pub mod txn;
+pub mod version;
