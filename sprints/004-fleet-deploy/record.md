@@ -102,6 +102,26 @@ than a hand-pasted token. The whole battery — auth, hairpin, deny list
 across all three enforcement points, the full edit → conflict loop, journal
 rows and file modes — is in [deploy.md](deploy.md).
 
+### The deploy broke cleo (korg #931)
+
+The client-wiring step wrote `~/.claude.json` from PowerShell with
+`Set-Content -Encoding UTF8` — UTF-8 **with BOM** on PS 5.1, plus CRLF.
+Claude Code could not parse it, set it aside and regenerated a default,
+taking **all four** MCP servers with it. klams and korg were working before
+the deploy and dead after it, and neither had anything to do with this
+sprint.
+
+Repaired and verified, and the recurrence guard
+(`deploy/check-client-config.ps1`) is demonstrated against the actual
+corrupted file rather than asserted. Full account in
+[deploy.md](deploy.md); the decision and what it says about scoping blast
+radius is D5 in [decisions.md](decisions.md).
+
+The uncomfortable detail worth carrying forward: I *did* verify the write,
+and the verification passed — because it re-read the file through
+PowerShell, which strips a BOM on the way in. **Verify in the format the
+consumer reads, not the one you wrote with.**
+
 ### The finding that made the deploy worth doing carefully
 
 `deny = ["**/secrets/**"]`, carried on kai since sprint 002 and copied into

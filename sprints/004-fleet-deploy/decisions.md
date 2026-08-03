@@ -205,6 +205,71 @@ between machines cannot produce a broken one.
 
 ---
 
+## D5 — the deploy's blast radius on the operator's machine (korg #931)
+
+### What happened
+
+Wiring cleo, this sprint rewrote `~/.claude.json` from PowerShell using
+`Set-Content -Encoding UTF8`. On Windows PowerShell 5.1 that is UTF-8
+**with BOM**, and it wrote CRLF endings. `JSON.parse` rejects a leading BOM,
+so Claude Code could not read its own config, moved it aside and regenerated
+a default — removing `klams`, `korg`, `kaed-kai` and `kaed-kubs0`, and two
+of three `projects` entries.
+
+**klams and korg were working before the deploy and dead after it.** The
+sprint had no business touching either.
+
+### Why the verification did not catch it
+
+I did re-read and re-parse the file after writing, and compared it against
+the backup: 31 keys intact, `klams` and `korg` byte-identical, all four
+servers present. Every one of those checks passed.
+
+They passed because they read the file **through PowerShell**, which strips
+a BOM transparently on the way in. The corruption was invisible to the
+reader that wrote it. I also saw the file grow from 42 KB to 101 KB and
+attributed it to pretty-printing, which was true but incomplete — it was
+also 1,213 CRLF pairs.
+
+The lesson is narrower and more useful than "verify your writes": **verify
+in the format the consumer will read, not the one you wrote with.** A
+byte-level check (`head` of the first three bytes) would have caught it
+instantly; a semantic check by the same tool could not.
+
+### Decision
+
+1. **Prefer the client's own tooling.** `claude mcp add` owns that file's
+   format and encoding. Hand-editing an application-owned config is the
+   root fault, and the encoding bug is just how it surfaced this time.
+   (It was tried first here — cleo has no `claude` CLI, so it was
+   unavailable, not skipped.)
+2. **If a direct write is unavoidable**, it must be UTF-8 without BOM, LF
+   endings, via `[IO.File]::WriteAllText` with an explicit
+   `UTF8Encoding($false)` — never `Set-Content`, whose PS 5.1 default is
+   ANSI and whose `-Encoding UTF8` is the BOM variant.
+3. **Followed by a byte-level assertion**, shipped as
+   `deploy/check-client-config.ps1` so it is runnable rather than a
+   paragraph. It is demonstrated against the real corrupted artifact, not
+   just against a hypothetical.
+4. **Recorded as a Windows-agent hazard** in cleo's `CLAUDE.md` and in
+   klams, alongside "bash on PATH is WSL" and MSIX config virtualization.
+   It will recur on any Windows client, for any tool, not just this one.
+
+### The part worth generalising
+
+Sprint 002 hardened what the kaed **server** may touch — roots, deny list,
+its own credential. Nothing constrained what a kaed **deploy** may touch on
+an operator's machine, and the deploy reached further than any server
+operation ever could: it damaged two unrelated services on a host that is
+not even part of the fleet.
+
+"Blast radius" was scoped to the daemon. It should have been scoped to the
+whole operation. A deploy step that edits a file owned by another
+application is doing something categorically riskier than anything the
+tool itself is permitted to do, and it deserved the same suspicion.
+
+---
+
 ## What this sprint is knowingly not deciding
 
 **`**/secrets/**` and `**/*.key` stay config-level, not `DEFAULT_DENY`.**

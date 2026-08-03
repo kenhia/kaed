@@ -274,6 +274,16 @@ Add kaed as a custom MCP server / connector:
   `http://127.0.0.1:4870/mcp` when the agent runs on the same box)
 - **Auth header:** `Authorization: Bearer <the token>`
 
+**Prefer the client's own tooling — `claude mcp add` for Claude Code.** It
+owns that file's format and encoding. Hand-editing it is where the accidents
+happen, and one of them cost this project every MCP server on a machine; see
+[the warning below](#name-every-entry-after-its-host).
+
+Name each entry after its host: `kaed-kai`, `kaed-kubs0` — never a bare
+`kaed`. With more than one instance, a bare name is the one an agent reaches
+for by default, and every wrong-machine edit still returns a
+successful-looking diff.
+
 For Claude Code, `.claude.json`:
 
 ```json
@@ -293,6 +303,49 @@ that is worth telling us about.
 
 **Clients load MCP config at session start.** After changing a token or URL,
 restart the client.
+
+### Name every entry after its host
+
+> #### ⚠️ Editing a client config from PowerShell will eat it
+>
+> Wiring a second host, this project rewrote `~/.claude.json` from PowerShell
+> with `Set-Content -Encoding UTF8`. On **Windows PowerShell 5.1 that means
+> UTF-8 *with* BOM**, and it wrote CRLF endings too. `JSON.parse` rejects a
+> leading BOM, so Claude Code could not read its own config, moved it aside
+> to `.claude.json.backup`, and regenerated a default.
+>
+> That silently removed **every** configured MCP server — including two that
+> had nothing to do with kaed and had been working fine. Nothing warned at
+> write time; the client just reported no MCP servers configured.
+>
+> If you must write such a file directly:
+>
+> ```powershell
+> $json = $obj | ConvertTo-Json -Depth 100
+> $json = $json -replace "`r`n", "`n"                      # LF, like the client writes
+> [IO.File]::WriteAllText($p, $json,
+>     (New-Object System.Text.UTF8Encoding $false))        # UTF-8, NO BOM
+> ```
+>
+> `WriteAllText` with an explicit `UTF8Encoding($false)` behaves the same on
+> PowerShell 5.1 and 7. `Set-Content` does not: on 5.1 its default is ANSI and
+> its `-Encoding UTF8` is the BOM variant.
+>
+> Then **verify by reading the file back and parsing it**, which is the step
+> that would have caught this before a restart made it visible:
+>
+> ```powershell
+> .\deploy\check-client-config.ps1 -Expect kaed-kai,kaed-kubs0
+> ```
+>
+> [`deploy/check-client-config.ps1`](../deploy/check-client-config.ps1) checks
+> for a BOM, CRLF, that the file parses, and that the servers you expect are
+> actually present. It exits non-zero otherwise. Note that a config PowerShell
+> mangles can still *look* fine to PowerShell — it parsed happily in every
+> check except the byte-level one.
+>
+> The same trap applies to `claude_desktop_config.json` and to any other
+> application-owned JSON you are tempted to edit from a script.
 
 ---
 

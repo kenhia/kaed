@@ -102,18 +102,60 @@ Per D3, the bare `kaed` entry was renamed and a second added:
 | `kaed` → kai | `kaed-kai` → kai |
 | — | `kaed-kubs0` → kubs0 |
 
-Verified end-to-end **using cleo's own stored credentials**, not a token
-pasted in by hand: both entries return `406`. The old file is backed up at
-`~/.claude.json.bak-004`; `klams` and `korg` entries are byte-identical
-across the rewrite and all 31 top-level keys survived. The file grew from
-42 KB to 101 KB purely because PowerShell's `ConvertTo-Json` pretty-prints —
-same data, and Claude Code rewrites it in its own format anyway.
+The kubs0 token went kubs0 → kai → cleo without ever being printed, and the
+staging copies on both ends were deleted.
 
 **Restart any Claude Code session on cleo** to pick this up; clients load
 MCP config only at session start.
 
-The kubs0 token went kubs0 → kai → cleo without ever being printed, and the
-staging copies on both ends were deleted.
+### This step broke cleo, and the fix is below (korg #931)
+
+The content of that edit was right. **The encoding was not, and it cost
+cleo every MCP server it had.** Written up as D5 in
+[decisions.md](decisions.md); the short version:
+
+The write used PowerShell's `Set-Content -Encoding UTF8`, which on Windows
+PowerShell 5.1 means UTF-8 **with BOM**, plus CRLF endings. `JSON.parse`
+rejects a leading BOM, so Claude Code could not read its own config, moved
+it aside to `.claude.json.backup` and regenerated a default — dropping
+`klams`, `korg`, `kaed-kai` and `kaed-kubs0` in one go, and two of three
+`projects` entries. klams and korg were working before the deploy and dead
+after it; the sprint had no business touching either.
+
+The failure was silent in both directions: nothing complained at write time,
+and the client presented the result as "no MCP servers configured" rather
+than as a broken file. What made it *look* fine at the time was that the
+sanity check I ran after writing re-read the file **through PowerShell**,
+which strips the BOM transparently — so it parsed, all 31 keys were there,
+and every server checked out. Only a byte-level look would have caught it.
+
+**Repaired 2026-08-03.** `.claude.json.backup` was the 17:55 write: correct
+content, wrong encoding. Stripping the BOM, normalising to LF and writing
+with an explicit `UTF8Encoding($false)` restored all four servers and all
+three projects; the one key Claude Code had added since
+(`hasResetAutoModeOptInForDefaultOffer`) was carried forward, and the
+regenerated file was kept as `.claude.json.pre-repair-*`. Verified at byte
+level (no BOM, no CRLF), parse level, and content level, then all four
+servers were sent a real MCP `initialize` **using cleo's own stored
+credentials** — four `200`s. kaed's reply also confirms the #924 stamp
+reaches clients:
+
+```
+serverInfo: {name: kaed, version: "0.1.0 (19a8cb4 2026-08-03)"}
+```
+
+**So it cannot recur:** [`deploy/check-client-config.ps1`](../../deploy/check-client-config.ps1)
+checks a client config for a BOM, CRLF, parseability and the servers you
+expect, and exits non-zero otherwise. Demonstrated rather than asserted —
+run against the actual corrupted artifact it exits 1 with
+`FAIL: UTF-8 BOM present`, against the regenerated default it exits 1 with
+`FAIL: no mcpServers key`, and against the repaired file it exits 0.
+`docs/setup.md` §7 now carries the trap and the correct write incantation,
+and says to prefer `claude mcp add` over hand-writing the file at all.
+
+(`claude mcp add` was the better fix and was tried first — cleo has no
+`claude` CLI on PATH, it runs the desktop/extension install, so a direct
+write was genuinely unavoidable here.)
 
 ## Still to do
 
