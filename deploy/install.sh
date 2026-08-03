@@ -100,6 +100,13 @@ run "install -d -m 0755 '$BIN_DST_DIR'"
 # Install to a temp name and mv into place: a running kaed holds the inode,
 # and replacing the file wholesale avoids ETXTBSY on the upgrade path.
 run "install -m 0755 '$BIN_SRC' '$BIN_DST.new'"
+# Keep the outgoing binary as the rollback target. A deploy that cannot be
+# undone without a rebuild is not a deploy you want to run at 2am, and the
+# build it replaced is the one thing guaranteed to have worked here.
+# `kaed --version` on the .prev tells you exactly which build it is.
+if [ -f "$BIN_DST" ]; then
+    run "mv -f '$BIN_DST' '$BIN_DST.prev'"
+fi
 run "mv -f '$BIN_DST.new' '$BIN_DST'"
 
 case ":$PATH:" in
@@ -162,4 +169,8 @@ EOF
 else
     printf '\n  kaed check-config     # confirm what this host can reach\n'
     printf '  systemctl --user status kaed\n'
+    if [ -f "$BIN_DST.prev" ]; then
+        printf '\n  rollback: mv -f %s.prev %s && systemctl --user restart kaed\n' \
+            "$BIN_DST" "$BIN_DST"
+    fi
 fi

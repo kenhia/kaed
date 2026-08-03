@@ -1,0 +1,6 @@
+# Declares that this repo deploys as part of /sprint-ship (Phase 7).
+# One skill name per line; sprint-ship invokes each in order after the merge
+# and local cleanup, so what ships is built from the merged main.
+#
+# See .claude/skills/deploy-fleet/SKILL.md
+deploy-fleet
