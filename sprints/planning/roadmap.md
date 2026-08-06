@@ -6,15 +6,15 @@
 
 ## Now
 
-- **k-homelab `kaed-service` recipe** (korg:932, covering k-homelab #926) —
-  the other half of 004, in the other repo. Everything it needs to *assert* rather than
-  duplicate now exists: `deploy/install.sh` owns the binary and unit,
-  `kaed --version` gives it a freshness floor, and `check-config` is a
-  post-condition that proves kaed agrees about what it can reach. Closes
-  k-homelab #907 (kai's serve entry was never declared) and #917. Since 005
-  it should also fix its own `min_build_date` advisory, which tells you to
-  `git pull` in a repo kubs0 does not have — the fix there is a store
-  install.
+- **k-homelab `kaed-service` advisories assume a checkout** (k-homelab
+  #1033) — the recipe itself shipped (korg:932 / #926, done): it asserts the
+  binary, the unit and the config keys without owning them, using
+  `kaed --version` as a freshness floor and `check-config` as a
+  post-condition. But every "fix:" hint in it still says `git pull &&
+  ./deploy/install.sh in the kaed repo`, and since 005 the fleet installs a
+  published bundle — kubs0 has no repo to pull. Nothing is firing today (both
+  hosts are above the floor); it misdirects whoever reads it the first time
+  one falls behind.
 - **kubsdb** (#929) — deferred by 004, and a "not yet" rather than a "no".
   Wants runtime on kai/kubs0 first, then a *broad*-access design: what
   counts as broad when `/datastore/postgresql` and `/datastore/korg/korg.env`
@@ -22,8 +22,10 @@
   copy whose source of truth is a repo elsewhere is kaed's problem at all.
 - **Fleet deployed-ness is not discoverable** (#930) — a deliberately
   deferred host looks exactly like a failed rollout, and an agent with ssh
-  concluded precisely that. Wants declared-vs-observed, not just declared;
-  interacts with #926, so probably sequenced after it.
+  concluded precisely that. Wants declared-vs-observed, not just declared.
+  Was sequenced behind #926, which has now closed, so it is unblocked — and
+  005 gave it a second observable: what the store's `latest` says, versus
+  what each host reports.
 
 ## Next
 

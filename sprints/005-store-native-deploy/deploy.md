@@ -119,8 +119,10 @@ error rather than as "your extraction is wrong". Fixed to `'"MagicDNSSuffix":
 
 - **k-homelab's kaed advisory text is now wrong for kubs0.** The
   `kaed-service` recipe's `min_build_date` advisory says *"fix: git pull &&
-  ./deploy/install.sh in the kaed repo"* — there is no repo on kubs0. Should
-  name the store install instead. Different repo; noted for korg:932.
+  ./deploy/install.sh in the kaed repo"* — there is no repo on kubs0. Four
+  advisories in `apply.sh` plus the README prose say some version of that;
+  all should name the store install. Different repo, filed as **k-homelab
+  #1033** (korg:932, the obvious host for it, had already closed).
 
 ---
 
