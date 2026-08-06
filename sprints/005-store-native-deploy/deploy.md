@@ -117,9 +117,58 @@ error rather than as "your extraction is wrong". Fixed to `'"MagicDNSSuffix":
 
 ## Still to do
 
-- **The real fleet rollout** — Phase 7, from merged `main`, per the rewritten
-  `deploy-fleet` skill. Both hosts move from `b08ce9f` to the merge commit.
 - **k-homelab's kaed advisory text is now wrong for kubs0.** The
   `kaed-service` recipe's `min_build_date` advisory says *"fix: git pull &&
   ./deploy/install.sh in the kaed repo"* — there is no repo on kubs0. Should
   name the store install instead. Different repo; noted for korg:932.
+
+---
+
+## Deployed 2026-08-06 — merged `main`, commit `136802a`
+
+Sprint 005 shipped as PR #5, squash-merged to `136802a`, then rolled out via
+`/sprint-ship` Phase 7 → the rewritten `deploy-fleet` skill. **This was the
+first deploy that never built on a target host.** `just publish` on kai
+produced `artifacts/kaed/0.1.0-136802a/` and moved `latest`; both hosts then
+installed *that artifact*.
+
+| Host | Installed | `kaed --version` | `check-config` | Unit | MCP `serverInfo.version` |
+|---|---|---|---|---|---|
+| kai | `0.1.0-136802a` | `0.1.0 (136802a 2026-08-05)` | exit 0 | active | `0.1.0 (136802a 2026-08-05)` |
+| kubs0 | `0.1.0-136802a` | `0.1.0 (136802a 2026-08-05)` | exit 0 | active | `0.1.0 (136802a 2026-08-05)` |
+
+Neither build `-dirty`. The version was **asserted**, not eyeballed: the
+published version is the stamp rearranged, so `0.1.0 (136802a …)` →
+`0.1.0-136802a` is an exact comparison — and the installer had already made
+the same comparison, from the other direction, before writing anything.
+
+kai has a checkout and still installed from the store, per the doctrine that
+*every* install pulls from the store, local ones included. kubs0 has no
+checkout and used the documented verified bootstrap. The two hosts are
+running the same bytes, which the old build-per-host model could only assume.
+
+> The build date reads `2026-08-05` on a deploy done on the 6th: the squash
+> commit landed at 05:21 UTC, which is the 5th locally, and `git log
+> --date=short` renders the commit's own timezone. Above k-homelab's
+> `min_build_date` floor of `2026-08-02` either way.
+
+**Rollback target:** `~/.local/bin/kaed.prev` on both hosts, each holding the
+`b08ce9f` build (`mv -f` it back and `systemctl --user restart kaed`). The
+store now also has two full bundles, so `--from-store --version <older>` is a
+real path for the first time — **verified live**: a dry-run install of
+`0.1.0-2c8af14` on kubs0 fetched and checksum-verified all four files and
+reported the right stamp, changing nothing.
+
+**Verified beyond "it's up":**
+
+- The stamp reaches clients over MCP, not just the CLI — the handshake and
+  `kaed --version` agree on both hosts, which is what proves the binary on
+  disk and the server on the network are the same build.
+- **`kaed-new-token` is live on kubs0**, the gap this sprint closed: a host
+  with no checkout could not rotate its token at all. Exercised
+  non-destructively — running it with a token already present exits 1 with
+  *"Refusing to overwrite a live credential — use `--rotate`"*.
+- Both hosts kept their existing config (`config exists, left untouched`) and
+  their tokens; the installer touched neither, on the deploy that replaced
+  the mechanism underneath them.
+- No schema or data migration in this sprint.
