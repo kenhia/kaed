@@ -11,7 +11,10 @@
   duplicate now exists: `deploy/install.sh` owns the binary and unit,
   `kaed --version` gives it a freshness floor, and `check-config` is a
   post-condition that proves kaed agrees about what it can reach. Closes
-  k-homelab #907 (kai's serve entry was never declared) and #917.
+  k-homelab #907 (kai's serve entry was never declared) and #917. Since 005
+  it should also fix its own `min_build_date` advisory, which tells you to
+  `git pull` in a repo kubs0 does not have — the fix there is a store
+  install.
 - **kubsdb** (#929) — deferred by 004, and a "not yet" rather than a "no".
   Wants runtime on kai/kubs0 first, then a *broad*-access design: what
   counts as broad when `/datastore/postgresql` and `/datastore/korg/korg.env`
@@ -70,6 +73,20 @@
 
 ## Done
 
+- **Sprint 005 — the fleet deploy goes store-native** (2026-08-06). `just
+  publish` ships a versioned *deploy bundle* to the homelab package store —
+  binary, `install.sh`, unit file, config template, `new-token.sh`, one
+  `SHA256SUMS` — and `install.sh --from-store` installs it: no clone, no
+  cargo, every file checksum-verified, and the binary must report the version
+  it was published under before anything is installed (#1015). Ends the
+  build-from-clone model 004 shipped with, which stopped being possible when
+  kubs0's checkout was deleted. `new-token.sh` now installs as
+  `kaed-new-token`, closing a live gap — kubs0's token could not be rotated
+  at all. Nine tests drive the real installer against a static store served
+  from the test process, so the failure paths are exercised without
+  publishing anything irreversible. Also fixed 004's tailnet extraction,
+  which silently returned an empty string. Record:
+  `sprints/005-store-native-deploy/`.
 - **Sprint 004 — fleet deploy** (2026-08-03). A canonical `deploy/` for
   k-homelab to point at — `install.sh` (idempotent, never overwrites a
   config, never touches a token, keeps a `.prev` for rollback), the unit as
