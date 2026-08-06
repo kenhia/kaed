@@ -6,10 +6,14 @@
 # because one landed in a transcript. Read it with `cat` yourself when you
 # are ready to paste it into a client, in a place you are happy to have it.
 #
+# install.sh puts this on PATH as `kaed-new-token`, because rotation is
+# ongoing operator work and a host installed from the package store has no
+# checkout to run it from.
+#
 # Usage:
-#   deploy/new-token.sh              mint the first token; REFUSES if one exists
-#   deploy/new-token.sh --rotate     rotate, opening a grace window
-#   deploy/new-token.sh --close      close the grace window
+#   kaed-new-token              mint the first token; REFUSES if one exists
+#   kaed-new-token --rotate     rotate, opening a grace window
+#   kaed-new-token --close      close the grace window
 #
 # Rotation is a three-step dance because clients load MCP config only at
 # session start. --rotate keeps the OLD token working alongside the new one
@@ -23,7 +27,8 @@ case "${1:-}" in
     "") ;;
     --rotate) MODE=rotate ;;
     --close) MODE=close ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    # Print the header block, so the help cannot drift from the file.
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "usage: $0 [--rotate|--close]" >&2; exit 2 ;;
 esac
 

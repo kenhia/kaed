@@ -65,13 +65,19 @@ behind them.
   `git log -S` both miss messages, which is how one nearly shipped.
 - **Deploying is `deploy/install.sh`, not hand-typed steps** — idempotent,
   re-running it is the upgrade path, and it never overwrites a config or
-  touches a token. `/sprint-ship` Phase 7 runs the `deploy-fleet` skill
-  (`.sprint-deploy`). Deploy state:
-  `sprints/004-fleet-deploy/deploy.md` is current (per-host table, the
-  verification battery); 002's covers rotation, 001's is still the
-  reference for tailscale serve and the rmcp `Host` gotcha. The tailnet
-  hostname is deliberately not committed — placeholder `<tailnet>`; real
-  value in klams or `tailscale status`.
+  touches a token. Since sprint 005 the fleet is **store-native**: `just
+  publish` puts a versioned deploy bundle in the homelab package store and
+  every host installs *that* with `install.sh --from-store` — no clone and
+  no cargo on the target (kubs0 has neither). Never deploy from a branch;
+  `/sprint-ship` Phase 7 runs the `deploy-fleet` skill (`.sprint-deploy`)
+  from merged `main`. Deploy state: `sprints/005-store-native-deploy/
+  deploy.md` is current, 004's has the per-host table and the verification
+  battery, 002's covers rotation, 001's is still the reference for
+  tailscale serve and the rmcp `Host` gotcha. The tailnet hostname is
+  deliberately not committed — placeholder `<tailnet>`; real value in klams
+  or `tailscale status` (whose `--json` pretty-prints: grep
+  `'"MagicDNSSuffix": *"'`, with the space, or you get an empty string
+  instead of an error).
 - **Never hand-write another application's config file**, especially from
   PowerShell on cleo: `Set-Content -Encoding UTF8` writes a BOM on PS 5.1,
   and that wiped every MCP server on cleo once (korg #931). Prefer the

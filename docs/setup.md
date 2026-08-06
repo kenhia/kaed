@@ -34,6 +34,13 @@ overwrites an existing config and never touches the token — the two things
 you cannot safely regenerate underneath a running host. `--dry-run` prints
 what it would do.
 
+It also installs `kaed-new-token` next to the binary, so minting and rotating
+tokens does not need the checkout later.
+
+If you keep published builds somewhere, the same script can install one
+instead of building — no clone and no Rust toolchain on the target host. See
+[Installing a published build](#installing-a-published-build-no-checkout-no-toolchain).
+
 The rest of this page is what those five commands do, and why each choice
 is the way it is. Read at least [Choosing roots](#choosing-roots--the-one-thing-to-get-right)
 and [the `Host` header gotcha](#5-expose-it-optional) before trusting a
@@ -68,13 +75,60 @@ another's, and the MCP handshake reports the same one, so a connected agent
 and a shell on the box agree about which build is running. Building from a
 tarball with no `.git` gives `0.1.0 (unknown)` rather than failing.
 
+### Installing a published build (no checkout, no toolchain)
+
+Building on every host you deploy to means every host needs a clone and a
+Rust toolchain, and "which one is stale?" becomes a question you have to keep
+answering. `install.sh --from-store` installs a **published** build instead:
+
+```sh
+export KAED_STORE_URL=https://your-store.example:4880
+./deploy/install.sh --from-store              # latest, or --version <ver>
+```
+
+It expects a plain static file tree — anything that serves files over HTTP
+will do:
+
+```
+artifacts/kaed/latest                        # text: the current version
+artifacts/kaed/<version>/kaed-x86_64-linux   # the binary, named for its arch
+artifacts/kaed/<version>/install.sh
+artifacts/kaed/<version>/kaed.service
+artifacts/kaed/<version>/config.example.toml
+artifacts/kaed/<version>/new-token.sh
+artifacts/kaed/<version>/SHA256SUMS
+```
+
+Every file is verified against `SHA256SUMS` before anything is installed, and
+the binary must report the version it was published under — a mislabelled
+build is refused rather than installed to lie about itself afterwards. Under
+`--dry-run` the fetch and both checks still run; only the install is skipped.
+
+**On a host with no checkout**, fetch the installer out of the bundle and
+check it before running it, rather than piping `curl` into `sh`:
+
+```sh
+base="$KAED_STORE_URL/artifacts/kaed"; v=$(curl -fsS "$base/latest")
+curl -fsS -O "$base/$v/install.sh"
+curl -fsS "$base/$v/SHA256SUMS" | grep ' install.sh$' | sha256sum -c -
+sh install.sh --from-store --version "$v"
+```
+
+There is no default store URL: pass `--store` or set `KAED_STORE_URL`, or the
+script stops and says so. Rolling back is `--version <older>` — which is why
+publishing is worth the trouble at all.
+
+`just publish` builds a release and pushes that layout to this project's own
+store; it refuses a dirty tree, and reads the version out of the binary it
+just built so the label cannot drift from the stamp.
+
 ## 2. Create the token
 
 One bearer token per agent identity. This is the only thing standing between
 the network and your files:
 
 ```sh
-./deploy/new-token.sh
+./deploy/new-token.sh        # or `kaed-new-token`, which install.sh puts on PATH
 ```
 
 which is this, with a refusal to overwrite an existing token bolted on:
@@ -356,10 +410,15 @@ during a grace window. Together those make rotation non-breaking on the server
 side — no restart, so live sessions survive:
 
 ```sh
-./deploy/new-token.sh --rotate    # new token live, old one still works
+kaed-new-token --rotate    # new token live, old one still works
 # … update your clients; they pick it up when they next restart …
-./deploy/new-token.sh --close     # old token stops working
+kaed-new-token --close     # old token stops working
 ```
+
+(`kaed-new-token` is `deploy/new-token.sh`, installed onto `PATH` by
+`install.sh` — rotation is ongoing operator work and shouldn't require the
+host to still have a checkout. From a checkout, `./deploy/new-token.sh` is
+the same script.)
 
 `--rotate` requires `prev_token_file` to be set for that identity, or the old
 token dies immediately and the window buys you nothing. The script says so;

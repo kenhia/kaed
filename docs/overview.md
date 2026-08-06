@@ -178,6 +178,10 @@ Four sprints in:
   instead of a hand-typed one, a build stamp so `kaed --version` names the
   commit it was built from, and a second host — which promptly showed that a
   config reviewed on one host is not a config verified on the next.
+- **005 — deploying a published build.** `install.sh --from-store` fetches a
+  checksum-verified release instead of building from a checkout, so a host
+  needs neither a clone nor a Rust toolchain — and the build verified on one
+  host is byte-for-byte the one the next host runs.
 
 ## Where it is going
 

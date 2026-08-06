@@ -83,9 +83,10 @@ is what lets the security story be stated in one paragraph. See
   token, systemd unit, remote access, client wiring, rotation. Includes a
   section you can hand to your own agent to do the install.
 - **[deploy/](deploy/)** — the install itself: an idempotent `install.sh`
-  (re-running it is the upgrade path), the systemd unit, a config template,
-  and token mint/rotate. It never overwrites a config and never touches a
-  token.
+  (re-running it is the upgrade path — building from the checkout, or
+  fetching a published, checksum-verified build with `--from-store`), the
+  systemd unit, a config template, and token mint/rotate. It never overwrites
+  a config and never touches a token.
 - **[docs/kaed-explained.html](docs/kaed-explained.html)** — a single-page
   visual explainer
   ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).
