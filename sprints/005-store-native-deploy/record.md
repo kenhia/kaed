@@ -125,10 +125,88 @@ suite must not need it.
 
 ---
 
+### D8 — `new-token.sh` installs as `kaed-new-token`
+
+Rotation is ongoing operator work — mint, `--rotate`, `--close` — and until
+now it required a checkout. kubs0 has not had one since sprint 020, which
+means **kubs0's token could not be rotated at all**. That is a live gap, not
+a hypothetical one, and it falls out of "the fleet must not need a clone".
+
+So `install.sh` now also installs `deploy/new-token.sh` onto `PATH` as
+`kaed-new-token`, in both modes. The script was already self-contained
+(`$KAED_CONFIG_DIR` or `$HOME`), so this is a copy, not a rewrite.
+
+---
+
 ## What shipped
 
-*(filled in as the work lands)*
+**`install.sh --from-store`.** One new mode, and the only thing it changes is
+where the assets come from: it resolves a version (the store's `latest`, or
+`--version`), fetches the bundle into a temp dir, verifies every file against
+the published `SHA256SUMS`, asserts the binary reports the version it was
+published under, and then runs the *existing* install unchanged. Everything
+downstream reads `$ASSET_DIR` instead of `$SCRIPT_DIR` — that one variable is
+what keeps the two modes from drifting.
+
+Fetch-then-verify-then-install, in that order and in separate passes: a
+checksum failure on the third file must not leave a new binary already
+swapped in. Confirmed against the real store — two different failures, and
+the host stayed on the build it was running.
+
+**`just publish` ships a bundle.** Binary + `install.sh` + `kaed.service` +
+`config.example.toml` + `new-token.sh`, one version, one `SHA256SUMS`. Plus
+the guards from D4/D5: version read out of the binary, dirty tree refused,
+`-dirty`/`unknown` stamps refused, and `--no-latest` when off `main`.
+
+**`tests/install_from_store.rs`.** Nine tests driving the real
+`deploy/install.sh` against a static store served out of the test process:
+the happy path, that store mode installs what it *fetched* rather than what
+is in `deploy/`, `--version` bypassing `latest`, and five failures —
+corrupted binary, file absent from `SHA256SUMS`, mislabelled binary,
+unpublished version, no store URL. Publishing to kubsdb is irreversible, so
+none of this needs the real store.
+
+**The `deploy-fleet` skill is now publish → install-published → verify**, and
+says why deploying from a branch is forbidden rather than merely discouraged.
+Rollback gained a second path: any published version, on any host, checkout
+or not.
+
+**Docs.** `docs/setup.md` gets *Installing a published build* — written for a
+stranger with their own file server, not for this homelab: the layout the
+installer expects, the verified bootstrap for a host with no checkout, and
+why there is no default store URL. Rotation now documents `kaed-new-token`.
+
+The whole path is exercised end to end in [deploy.md](deploy.md), including
+the clone-less bootstrap on kubs0, without either live daemon being touched.
+
+### The bug this sprint found in the last one
+
+Sprint 004's `deploy-fleet` skill extracted the tailnet name with
+`grep -o '"MagicDNSSuffix":"[^"]*"'`. `tailscale status --json` pretty-prints
+with a space after the colon, so on tailscale 1.98 that matches nothing —
+and the failure is not "your grep is wrong", it is a URL like
+`https://kubsdb.:4880` failing to resolve, three steps later. Fixed.
+
+Worth noting because it is the same shape as sprint 004's BOM incident:
+**a check that silently produces an empty result is worse than one that
+fails.** The store URL handling was written the other way round on purpose
+(D3) — no default, and a refusal that names the variable.
 
 ## Follow-ups
 
-*(filled in as the work lands)*
+- **Rollback to `0.1.0-b08ce9f` does not work through the store**, because
+  that version predates the bundle and holds only the binary. `--from-store`
+  fails on it cleanly (and correctly — mixing a new unit file with an old
+  binary would be worse), but until a second bundle exists, rolling back is
+  `kaed.prev` or `--bin`. Self-resolving: from this sprint's publish onward
+  every version is a full bundle.
+- **k-homelab's `kaed-service` advisory text is stale for a clone-less
+  host** — its `min_build_date` failure says *"fix: git pull &&
+  ./deploy/install.sh in the kaed repo"*, and kubs0 has no repo. Belongs to
+  korg:932 (the k-homelab recipe sprint), not here.
+- **The fleet table is still written in three places** (this repo's skill,
+  klams, `sprints/004-fleet-deploy/deploy.md`) — korg #930.
+- **No arch but `x86_64-linux` is published.** The installer asks for
+  `$(uname -m)-$(uname -s)` and gets an honest 404 elsewhere, which is the
+  right failure, but an aarch64 host in the fleet would need `just publish`
+  to grow cross-compilation. Not needed yet.

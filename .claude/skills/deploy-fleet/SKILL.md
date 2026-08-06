@@ -51,9 +51,13 @@ kaed is public; the tailnet name is deliberately uncommitted. Resolve it at
 run time and never write it into a file or a commit message:
 
 ```sh
-TN=$(tailscale status --json | grep -o '"MagicDNSSuffix":"[^"]*"' | head -1 | cut -d'"' -f4)
+TN=$(tailscale status --json | grep -o '"MagicDNSSuffix": *"[^"]*"' | head -1 | cut -d'"' -f4)
 STORE="https://kubsdb.${TN}:4880"
 ```
+
+(The `: *` matters — `tailscale status --json` pretty-prints with a space
+after the colon. The sprint-004 version of this snippet had no space and
+silently returned empty.)
 
 If `TN` comes back empty, get it from `tailscale status` output or klams —
 do **not** guess, and do not fall back to hardcoding it.

@@ -180,9 +180,14 @@ if [ "$FROM_STORE" -eq 1 ]; then
 
     # Fetch and verify everything before installing anything: a checksum
     # failure on the unit file must not leave a new binary already in place.
+    # A version published before the bundle existed (kaed 005) holds only the
+    # binary, and fails here on the first missing file. That is the right
+    # answer: mixing a new unit file with an old binary would be worse, and a
+    # clone-less host has nothing to fall back to. Roll back with `.prev` or
+    # `--bin` instead.
     for f in "kaed-$SUFFIX" kaed.service config.example.toml new-token.sh; do
         curl -fsS -o "$WORK/$f" "$VERSION_URL/$f" \
-            || fail "fetch failed: $VERSION_URL/$f (is $STORE_VERSION published for $SUFFIX?)"
+            || fail "fetch failed: $VERSION_URL/$f — is $STORE_VERSION published, for $SUFFIX, with a full deploy bundle?"
         line=$(printf '%s\n' "$SUMS" | grep -E "[[:space:]][*]?$f\$" | head -1)
         [ -n "$line" ] || fail "$f is not listed in $VERSION_URL/SHA256SUMS"
         ( cd "$WORK" && printf '%s\n' "$line" | sha256sum -c --status - ) \
