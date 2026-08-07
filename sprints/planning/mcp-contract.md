@@ -49,8 +49,9 @@ agent-filed feedback. Nothing here is frozen.
   `{code, message, data}`. Codes: `not_found`, `outside_root`, `denied`,
   `version_conflict`, `ambiguous_anchor`, `anchor_not_found`,
   `invalid_input`, `too_large`, `is_binary`, `parse_unavailable`,
-  `internal`, and `unsupported_capability` (reserved for peer mode:
-  a call against a root whose host lacks that capability).
+  `internal`, and `unsupported_capability` (live since peer mode, 010:
+  a call routed to a root whose host lacks that capability — the
+  union-of-capabilities rule paying off honestly at call time).
   `data` makes the error actionable: `version_conflict`
   carries `{expected_version, actual_version, delta}` (a compact diff of
   what changed since the agent last looked); `ambiguous_anchor` carries the
@@ -59,7 +60,8 @@ agent-filed feedback. Nothing here is frozen.
   `kaedignore` | `in_file_marker` | `classified_opaque` |
   `kaedignore_protected`) and `hint` says what to do instead, because a
   refusal with no alternative is how an agent routes around kaed via ssh
-  and the journal loses the edit too.
+  and the journal loses the edit too. (Peer-mode refusals ride the same
+  code with `no_peer_credential` / `peer_credential_rejected` — R10.)
 
   Errors that are plausibly **kaed's** fault also carry
   `data.feedback_invite` — a one-line ask, no round-trip, no standing
@@ -143,6 +145,34 @@ agent-filed feedback. Nothing here is frozen.
   tools mark such a transaction **historical** with a structured reason,
   and `revert` refuses it saying why. (Added sprint 007; see D-6 there.)
 
+- **R10 — any instance can be the fleet's gateway (010).** An instance
+  whose `[peers.<host>]` entries carry a `url` proxies calls addressing
+  that peer's roots — same tools, same signatures, no new addressing
+  vocabulary: the host prefix R8 introduced *is* the routing key. Rules
+  that hold on every proxied call:
+  - **Identity survives the hop.** The gateway holds per-author tokens per
+    backend (`[peers.<host>.tokens]`, PD-4) and proxies as the caller;
+    journal attribution on the target is identical to a direct call. No
+    token for the calling author → `denied` with
+    `reason: no_peer_credential` — never a borrowed identity. A token the
+    backend rejects → `denied` / `peer_credential_rejected`. Peer token
+    files reload on SIGHUP, like every other credential (#914).
+  - **Passthrough is verbatim.** Arguments are forwarded as received
+    (routing reads only `root`), results return untouched, and error
+    objects pass through whole plus a top-level `root` tag —
+    `version_conflict` deltas and `ambiguous_anchor` candidates survive
+    the hop by construction.
+  - **Reachability is data.** A declared peer that does not answer is
+    `not_found` / `host_unreachable` with an observed `since` on the call
+    path, and `status: "unreachable"` in `roots` — not a transport
+    failure. An in-flight call that times out is `internal` /
+    `peer_timeout`, which says the call *may have applied* and to check
+    that host's journal — deliberately distinct from a connect failure,
+    where the peer provably never saw it.
+  - **The failure domain is named.** Gateway down = fleet down through it;
+    every host's own URL keeps working, and direct connection is the
+    documented fallback, not an emergency improvisation.
+
 Paths are always relative to a configured **workspace root** (see `roots`).
 Absolute paths and `..`-escapes are `outside_root` errors. Line numbers are
 1-based, ranges inclusive. v0 assumes UTF-8 text files; binary files can be
@@ -193,9 +223,18 @@ What this instance serves, and which hosts are supposed to.
     **Not a broken deploy; do not install one to "fix" it.**
   - `unreachable` — should be serving, is not. Always carries `since`.
   - never-declared — simply absent from `hosts`.
-- `verified` separates **declared** from **observed**: only the instance
-  answering the call is verified. A config-declared peer reported as plain
-  `active` would assert something nobody checked.
+- `verified` separates **declared** from **observed**. Since 010 the
+  instance probes every routable peer in parallel, under the *caller's*
+  credential (PD-4): a peer that answers is `verified: true` with its
+  observed `version` and its root entries merged into `roots` verbatim
+  (per-root `capabilities` — the union, structurally); a probed peer that
+  does not answer is `verified: true, status: "unreachable"` with the
+  observed `since` — the check happened, that was its result — and its
+  *last-known* root entries stay listed, marked `unreachable`, so the
+  namespace survives the outage. `probe` says what happened on this call
+  (`ok` / `failed` / `skipped` with a detail such as no URL or no
+  credential for the calling author); a peer nothing could check keeps
+  `verified: false` and its declaration.
 - `declared: false` means the host has no `[peers]` declaration at all. Then
   `hosts` is this instance alone and an absence means *nothing* — it is not
   evidence of a deferral, and not evidence against one.
@@ -273,6 +312,23 @@ What this instance serves, and which hosts are supposed to.
   were distinguishable a scoping mistake was outcome-identical to a genuine
   no-match — the same class of world-model corruption R3 forbids for
   truncation and R7 for filtering. `denied_hidden` is its sibling.
+- **`root` also takes a pattern (010): fleet-wide search in one call.**
+  `*:*`, `*:src`, `kai:*` glob over full root names, expanded against this
+  instance's roots plus every reachable peer's (live probe, caller's
+  credential), each concrete root searched in parallel. The response shape
+  changes only for patterns: `fleet: true`, each match tagged with its
+  `root`, ONE `max_results` budget across the whole fan-out, and per-root
+  reporting in `fanout[]` — each root's own `files_searched` / `truncated`
+  / `denied_hidden` / `classified_hidden` / `reason`, plus `merge_dropped`
+  for what the *merge* discarded over budget (top-level `truncated` goes
+  true either way). Hosts that could not be searched are named in
+  `hosts_unavailable[]` (`unreachable` + `since`, `no_credential`,
+  `no_url`, `deferred` + `ref`) — a fleet search is never silently
+  narrower than the fleet. A pattern matching no known root gets
+  `reason: root_pattern_matched_no_roots` with the known names (#1066's
+  rule, fleet edition). Patterns are `invalid_input` on every other tool:
+  search is read-only and merge-safe; a pattern `edit` has no honest
+  atomicity story.
 - `reason: {code, hint}` when the emptiness is more likely the caller's than
   the tree's. `hint` is built from the call's own `glob` and `path`, so it
   names the fix rather than restating the rule:
@@ -389,7 +445,13 @@ One tool, transactional, all addressing modes.
   narrows it; the default is all three.
 - **`root` is an optional filter, not an address.** The journal is
   host-wide, and history legitimately names roots that no longer resolve,
-  so an unresolvable value filters rather than fails.
+  so an unresolvable value filters rather than fails. One exception since
+  010, because the records physically live elsewhere: a filter naming a
+  *routable peer's* root proxies the whole query to that peer — a proxied
+  edit journals only on its target, so that is where the answer is. If
+  that peer is not answering, the result is `host_unreachable`, not an
+  empty page: an empty result would claim "no matching records" about a
+  store that was never consulted.
 - **`coverage` states what this history cannot see** — always, not only
   when something is missing. `notes[0]` says reads are not journaled at
   all: only write transactions, failed write *attempts* and feedback reach

@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(peers) => {
                     println!("fleet:");
                     println!("  {:<20} {:<12} (this host)", resolved.host, "active");
+                    let peer_tokens = config::resolve_peer_tokens(peers);
                     for p in peers {
                         let why = p
                             .reference
@@ -70,8 +71,25 @@ async fn main() -> anyhow::Result<()> {
                             .or(p.since.as_deref())
                             .map(|s| format!("({s}) "))
                             .unwrap_or_default();
+                        // Routable = proxyable from here; which authors can
+                        // be proxied is per-credential (PD-4).
+                        let routing = match (&p.url, p.tokens.is_empty()) {
+                            (None, _) => "no url — declaration only".to_string(),
+                            (Some(url), true) => format!("url {url}, no peer tokens"),
+                            (Some(url), false) => {
+                                let authors: Vec<&str> = p
+                                    .tokens
+                                    .keys()
+                                    .filter(|a| {
+                                        peer_tokens.contains_key(&(p.host.clone(), (*a).clone()))
+                                    })
+                                    .map(String::as_str)
+                                    .collect();
+                                format!("url {url}, proxies for {authors:?}")
+                            }
+                        };
                         println!(
-                            "  {:<20} {:<12} declared, unverified {why}{}",
+                            "  {:<20} {:<12} declared {why}{} — {routing}",
                             p.host,
                             p.status.as_str(),
                             p.note.as_deref().unwrap_or("")

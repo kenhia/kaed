@@ -260,9 +260,42 @@ Leave `[peers]` out and kaed reports `fleet.declared: false` — honest about
 claiming nothing, so a host's absence proves nothing either way. Write it,
 and absence starts to mean something.
 
-kaed does **not** probe peers: every entry but this host's own is reported
-`verified: false`. A declaration is not an observation, and reporting one as
-the other is the bug this feature exists to prevent.
+### Gateway mode: routing to peers
+
+A peer entry with a `url` is more than a declaration — the instance will
+**proxy** calls addressing that peer's roots, so a client wired to one host
+can edit files on all of them. What makes this safe to audit is identity:
+the gateway proxies as *the caller*, using a per-author token you configure
+per peer, and refuses (naming the fix) when it has none for the calling
+identity. It never borrows another identity's credential — an edit on the
+target is journaled under the same author as a direct call.
+
+```toml
+[peers.buildbox]
+status = "active"
+url    = "https://buildbox.example.ts.net:4870/mcp"
+
+[peers.buildbox.tokens]
+claude = { token_file = "/home/you/.config/kaed/peer-tokens/buildbox-claude" }
+```
+
+The token value is the same bearer token that identity uses when talking to
+`buildbox` directly. Token files re-read on `SIGHUP`, like every other
+credential; `token_env` works but needs a restart. With routing configured,
+`roots` **probes** peers live (under the caller's credential): an answering
+peer shows up `verified: true` with its version and its roots merged in; one
+that stopped answering becomes `status: "unreachable"` with the observed
+`since`, its last-known roots still listed and labelled. `search` accepts a
+root pattern (`*:*`, `*:src`) for a fleet-wide search in one call.
+
+Peers without a `url` stay what they were in the previous section: reported
+declarations, `verified: false`. A declaration is not an observation, and
+reporting one as the other is the bug this feature exists to prevent.
+
+One failure domain to name: if every client points at one gateway, that
+gateway going down takes the fleet with it. Each host's own URL keeps
+working — keep the direct wiring documented (and occasionally used) as the
+fallback.
 
 ### Config reference
 
@@ -272,7 +305,8 @@ the other is the bug this feature exists to prevent.
 | `server.allowed_hosts` | Extra `Host` header values accepted beyond loopback. **Required when proxied.** |
 | `server.host` | This instance's fleet name and the prefix on every root name. Defaults to the short system hostname; startup fails if neither yields one. |
 | `roots[]` | `name` (local, no `:` or `/`), `path`, optional `description`. `path` may use `~/`. Canonicalized at startup; duplicates and denied roots are refused. |
-| `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. Omit the whole table to declare nothing. |
+| `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. With a `url`, calls addressing that host's roots are proxied there. Omit the whole table to declare nothing. |
+| `peers.<host>.tokens.<identity>` | That identity's bearer token *for this peer* (`token_file` re-reads on `SIGHUP`; `token_env` needs a restart). The gateway proxies as the caller — an identity with no entry is refused, never impersonated. |
 | `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. |
 | `auth.<identity>.token_env` | Alternative: an env var. Works, but **cannot be reloaded** — see [rotation](#rotating-a-token). |
 | `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. |

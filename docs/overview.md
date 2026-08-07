@@ -166,7 +166,11 @@ whom, so a human's edits and several agents' edits stay mutually visible.
 dogfooded daily, with the full verified-write loop working end to end from a
 remote agent. Roots are host-qualified (`kai:src`), and `roots` also reports
 the **declared fleet**: which hosts should run kaed, including the ones
-deliberately without an instance.
+deliberately without an instance. An instance with configured peers is also
+the fleet's **gateway**: calls addressing another host's roots are proxied
+there under the caller's own identity, a host that stops answering becomes
+data (`status: "unreachable", since: …`) rather than a connection failure,
+and a root pattern (`*:*`) searches the whole fleet in one call.
 
 The sprints so far:
 
@@ -201,6 +205,11 @@ The sprints so far:
 - **009 — history tools and the feedback channel.** The journal became
   readable through the contract, and kaed learned to ask for a friction
   report at the moment it causes friction.
+- **010 — gateway peer mode.** Routing turned on: any instance can proxy
+  calls to its declared peers, with the caller's identity carried across the
+  hop (per-author tokens per backend — journal attribution on the target is
+  identical to a direct call), errors passed through verbatim, and
+  fleet-wide search under one budget with per-root truncation reporting.
 
 ## Where it is going
 
@@ -222,11 +231,12 @@ Roughly in order, with the reasoning in
   cost. The evidence for whether the bet paid off. Until that exists, "kaed is
   better" is a hypothesis.
 
-Further out, and genuinely uncertain: secrets-aware editing (there is a
-[brainstorm](../sprints/planning/brainstorm-secrets-editing.md), nothing
-decided), per-region versioning so two agents can edit disjoint parts of one
-file, and kaed as a *local* tool alongside an agent's built-in editing — the
-"if we got this right" bet, which needs the dogfood report first.
+Further out, and genuinely uncertain: the rest of the secrets lifecycle
+(blind generate/rotate, where kaed writes a secret an agent never sees, and
+cross-host secret handoff riding the gateway), per-region versioning so two
+agents can edit disjoint parts of one file, and kaed as a *local* tool
+alongside an agent's built-in editing — the "if we got this right" bet,
+which needs the dogfood report first.
 
 ## Reading further
 

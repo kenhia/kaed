@@ -64,6 +64,14 @@ Nothing in kaed is designed on the assumption that it is.
   put it on a public interface.
 - **A hostile local user.** Anyone who can read `~/.config/kaed/token` is
   kaed, as far as kaed is concerned.
+- **A compromised gateway host.** An instance configured to proxy to peers
+  (`[peers.<host>.tokens]`) holds bearer tokens **valid on those peers**, so
+  compromising the gateway machine yields credentials for every backend it
+  routes to — one machine's compromise is the fleet's, for the identities
+  configured there. That is a deliberate trade (the alternative was a shared
+  gateway identity, which destroys journal attribution). If that radius is
+  unacceptable, don't configure peer tokens: every host remains directly
+  reachable with per-host credentials, and routing simply refuses.
 - **Your journal.** `journal.db` stores the content of files kaed has
   edited, so it is as sensitive as the most sensitive file kaed is allowed
   to touch. It is created `0600` and its blob content ages out on a
@@ -82,7 +90,9 @@ Nothing in kaed is designed on the assumption that it is.
 2. Use narrow, explicit roots. Do not root at `$HOME` — that is how kaed
    ended up serving its own token during its first live test, and it is why
    the deny list exists at all.
-3. Keep the token file `0600`, and never commit it.
+3. Keep the token file `0600`, and never commit it. The same goes for any
+   peer token files a gateway holds — and give them the same weight as the
+   backends they unlock, not the machine they sit on.
 4. Assume `journal.db` is sensitive; back it up accordingly or not at all.
 
 ## Reporting a vulnerability

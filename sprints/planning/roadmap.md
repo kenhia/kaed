@@ -25,15 +25,14 @@
   counts as broad when `/datastore/postgresql` and `/datastore/korg/korg.env`
   sit side by side under a lexical deny matcher, and whether editing a host
   copy whose source of truth is a repo elsewhere is kaed's problem at all.
-- **Fleet deployed-ness is not discoverable** (#930) — **mostly closed by
-  007, deliberately left open.** Root names are host-qualified, the fleet is
-  declared in `config.toml [peers]` (PD-5), and `roots` plus the root-lookup
-  errors both name a `deferred` host and its reasoning. What remains is the
-  *observed* half: kaed declares but does not probe, so every peer entry
-  reports `verified: false`. Probing arrives with peer mode (#1050); until
-  then this is declared-vs-nothing, not declared-vs-observed. 005 gave it a
-  second observable worth folding in — what the store's `latest` says versus
-  what each host reports.
+- **Fleet deployed-ness is not discoverable** (#930) — **closed by 007 +
+  010 except one observable.** Root names are host-qualified, the fleet is
+  declared in `config.toml [peers]` (PD-5), the root-lookup errors name a
+  `deferred` host and its reasoning, and since 010 `roots` *probes*
+  routable peers live: declared-vs-observed is real (`verified`, `probe`,
+  observed `since`, per-peer version). What remains is 005's second
+  observable — what the store's `latest` says versus what each host
+  reports — which no probe of the host alone can answer.
 
 ## Next
 
@@ -83,6 +82,26 @@
 
 ## Done
 
+- **Sprint 010 — gateway peer mode** (2026-08-07). Peer routing turned on:
+  a `[peers.<host>]` entry with a `url` and per-author tokens makes any
+  instance a gateway — calls addressing that peer's roots are proxied
+  **as the caller** (PD-4: journal attribution survives the hop; no
+  credential → refused, never impersonated), with arguments and results
+  passing through verbatim (routing reads only `root`; a
+  `version_conflict` delta crosses the hop intact, plus one `root` tag on
+  errors). `roots` probes routable peers in parallel under the caller's
+  credential: an answering peer is `verified: true` with its observed
+  version and its roots merged in; one that stops answering becomes
+  `status: "unreachable"` with the observed `since`, last-known roots
+  still listed — unreachable-host-as-data, the brainstorm's win #1.
+  `search` gained root patterns (`*:*`) for fleet-wide search under one
+  budget with per-root truncation reporting and `hosts_unavailable` named
+  rather than skipped. `journal` proxies when its root filter names a
+  routable peer (the rows live there — the gateway journals no proxied
+  calls, D-7). Peer tokens reload on SIGHUP (#914 extended); contract
+  gained R10 and the live `unsupported_capability` code. New
+  `tests/gateway.rs` drives two real instances over HTTP. Record:
+  `sprints/010-gateway-peer-mode/`.
 - **Sprint 009 — history tools and the friction-triggered feedback
   channel** (2026-08-07). R6's promise stopped being redeemable only by
   ssh: `journal` merges applied transactions, failed attempts and friction

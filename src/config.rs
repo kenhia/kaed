@@ -60,10 +60,30 @@ pub struct PeerConfig {
     pub note: Option<String>,
     /// When this host was last known good. Required for `unreachable`.
     pub since: Option<String>,
-    /// Base URL of the peer's MCP endpoint. Unused until peer mode
-    /// (korg:1050) — declared now so the fleet table is complete when it
-    /// lands, and so a host's absence from it is a real signal.
+    /// Base URL of the peer's MCP endpoint, e.g.
+    /// `https://kubs0.<tailnet>:4870/mcp`. With peer mode (010) this is
+    /// what makes an `active` peer *routable*: calls addressing its roots
+    /// are proxied there. Without it the peer is declaration only.
     pub url: Option<String>,
+    /// Author → where that author's bearer token *for this peer* lives.
+    /// The gateway proxies with the caller's own identity (PD-4): a call
+    /// from `claude` rides the `claude` token configured here, and an
+    /// author with no entry is refused (`no_peer_credential`) rather than
+    /// ever borrowing another identity's credential.
+    #[serde(default)]
+    pub tokens: BTreeMap<String, PeerTokenEntry>,
+}
+
+/// Where one author's token for one peer lives. Exactly one source, same
+/// rules as [`AuthEntry`] — except no grace slot: a grace window is a
+/// *server-side* affordance, and this is the client half of the exchange.
+/// `token_file` re-reads on SIGHUP (#914, extended to peer credentials in
+/// 010); `token_env` is frozen at exec and needs a restart, same as always.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerTokenEntry {
+    pub token_env: Option<String>,
+    pub token_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -460,6 +480,42 @@ impl Config {
                 ),
                 _ => {}
             }
+            for (author, entry) in &p.tokens {
+                match (&entry.token_env, &entry.token_file) {
+                    (Some(_), Some(_)) => bail!(
+                        "peer {name:?} token for {author:?}: set token_env or \
+                         token_file, not both"
+                    ),
+                    (None, None) => bail!(
+                        "peer {name:?} token for {author:?}: needs token_env or \
+                         token_file"
+                    ),
+                    _ => {}
+                }
+                if !self.auth.contains_key(author) {
+                    tracing::warn!(
+                        peer = name,
+                        author,
+                        "peer token for an author this host's [auth] does not know — \
+                         nobody can authenticate here as that identity, so the token \
+                         is unusable (typo?)"
+                    );
+                }
+            }
+            if !p.tokens.is_empty() && p.status == PeerStatus::Deferred {
+                tracing::warn!(
+                    peer = name,
+                    "tokens configured for a deferred peer: it deliberately runs no \
+                     kaed, so these credentials route nowhere"
+                );
+            }
+            if !p.tokens.is_empty() && p.url.is_none() {
+                tracing::warn!(
+                    peer = name,
+                    "peer tokens without a `url`: nothing can be proxied there until \
+                     one is declared"
+                );
+            }
             peers.push(Peer {
                 host: name.clone(),
                 status: p.status,
@@ -467,6 +523,7 @@ impl Config {
                 note: p.note.clone(),
                 since: p.since.clone(),
                 url: p.url.clone(),
+                tokens: p.tokens.clone(),
             });
         }
         Ok(Some(peers))
@@ -534,9 +591,10 @@ fn read_token_quiet(path: &str) -> Option<String> {
     read_token(path)
 }
 
-/// One validated fleet member. The declaration only — whether the host is
-/// *actually* serving is a separate question this instance cannot answer
-/// until peer mode (korg:1050), and conflating the two would rebuild #930.
+/// One validated fleet member. Still the *declaration*: whether the host
+/// is actually serving is observed at call time by `fleet::Peers` (010)
+/// and reported per-call, never written back here — conflating the two
+/// would rebuild #930.
 #[derive(Debug, Clone)]
 pub struct Peer {
     pub host: String,
@@ -545,6 +603,57 @@ pub struct Peer {
     pub note: Option<String>,
     pub since: Option<String>,
     pub url: Option<String>,
+    /// Author → token source for proxying to this peer (PD-4). The spec,
+    /// not the secret: values are resolved by [`resolve_peer_tokens`] at
+    /// startup and on every SIGHUP.
+    pub tokens: BTreeMap<String, PeerTokenEntry>,
+}
+
+impl Peer {
+    /// Declaration-only peer with no credentials — the 007 shape, used by
+    /// tests that exercise the fleet table without routing anywhere.
+    pub fn declared(host: impl Into<String>, status: PeerStatus) -> Peer {
+        Peer {
+            host: host.into(),
+            status,
+            reference: None,
+            note: None,
+            since: None,
+            url: None,
+            tokens: BTreeMap::new(),
+        }
+    }
+}
+
+/// Read every peer token from wherever it lives: `(peer host, author)` →
+/// bearer token. Pure I/O over the config spec, like [`resolve_identities`]
+/// — called at startup and again on every SIGHUP, so a rotated peer token
+/// file takes effect without a restart (#914 extended, 010 D-2). A missing
+/// or empty token just leaves that (peer, author) pair unroutable, with a
+/// warning; refusing to serve over it would let one stale file take down
+/// every local tool.
+pub fn resolve_peer_tokens(peers: &[Peer]) -> BTreeMap<(String, String), String> {
+    let mut tokens = BTreeMap::new();
+    for peer in peers {
+        for (author, entry) in &peer.tokens {
+            let token = match (&entry.token_file, &entry.token_env) {
+                (Some(path), _) => read_token(path),
+                (None, Some(var)) => std::env::var(var).ok().filter(|t| !t.is_empty()),
+                (None, None) => None,
+            };
+            match token {
+                Some(t) => {
+                    tokens.insert((peer.host.clone(), author.clone()), t);
+                }
+                None => tracing::warn!(
+                    peer = peer.host,
+                    author,
+                    "peer token unset or empty; this identity cannot be proxied there"
+                ),
+            }
+        }
+    }
+    tokens
 }
 
 /// The validated runtime view of the config.
@@ -950,6 +1059,62 @@ mod tests {
         )
         .unwrap();
         assert!(ok.resolve(None).is_ok());
+    }
+
+    /// D-2 (010): peer credentials resolve from files and re-resolve the
+    /// way SIGHUP does, so a rotation needs no restart — #914's promise,
+    /// extended to the outbound direction.
+    #[test]
+    fn peer_tokens_parse_resolve_and_rotate() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("kubs0-claude.token");
+        std::fs::write(&tok, "  peer-v1\n").unwrap(); // trimmed on read
+        let cfg: Config = toml::from_str(&format!(
+            r#"
+            [server]
+            host = "kai"
+            [peers.kubs0]
+            status = "active"
+            url = "https://kubs0.example:4870/mcp"
+            [peers.kubs0.tokens]
+            claude = {{ token_file = "{}" }}
+            "#,
+            tok.display()
+        ))
+        .unwrap();
+        let peers = cfg.resolve(None).unwrap().peers.unwrap();
+        assert_eq!(peers[0].tokens.len(), 1);
+
+        let key = ("kubs0".to_string(), "claude".to_string());
+        let first = resolve_peer_tokens(&peers);
+        assert_eq!(first[&key], "peer-v1");
+
+        std::fs::write(&tok, "peer-v2\n").unwrap();
+        let after = resolve_peer_tokens(&peers);
+        assert_eq!(after[&key], "peer-v2");
+
+        // an unreadable token disables that pair, it does not fail the host
+        std::fs::remove_file(&tok).unwrap();
+        assert!(!resolve_peer_tokens(&peers).contains_key(&key));
+    }
+
+    #[test]
+    fn a_peer_token_needs_exactly_one_source() {
+        for (spec, msg) in [
+            (
+                "claude = { token_env = \"E\", token_file = \"/f\" }",
+                "not both",
+            ),
+            ("claude = { }", "needs token_env or token_file"),
+        ] {
+            let cfg: Config = toml::from_str(&format!(
+                "[server]\nhost = \"kai\"\n[peers.kubs0]\nstatus = \"active\"\n\
+                 [peers.kubs0.tokens]\n{spec}\n"
+            ))
+            .unwrap();
+            let err = cfg.resolve(None).unwrap_err();
+            assert!(err.to_string().contains(msg), "{err}");
+        }
     }
 
     #[test]
