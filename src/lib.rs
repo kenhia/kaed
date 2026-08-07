@@ -9,6 +9,7 @@ pub mod deny;
 pub mod dotenv;
 pub mod errors;
 pub mod fsops;
+pub mod history;
 pub mod journal;
 pub mod policy;
 pub mod search;

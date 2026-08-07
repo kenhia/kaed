@@ -42,7 +42,7 @@ on it without a verification round-trip.
 
 ## What works today
 
-Six tools over streamable HTTP with per-agent bearer auth:
+Ten tools over streamable HTTP with per-agent bearer auth:
 
 | tool | what it does |
 |---|---|
@@ -52,6 +52,10 @@ Six tools over streamable HTTP with per-agent bearer auth:
 | `read` | whole file, a line range, or a window around a line or unique anchor |
 | `search` | ripgrep-grade, every hit carrying its file's version |
 | `edit` | anchor/range replace + create + typed dotenv ops; multi-file, atomic, `dry_run` |
+| `journal` | what happened here: applied writes, failed attempts and friction reports, merged |
+| `diff` | any two states of a file — a version, a transaction, or the working tree |
+| `revert` | undo a transaction as a new transaction; never history rewriting |
+| `feedback` | tell kaed it got in your way; one required field |
 
 The bet underneath them is **verified writes**:
 
@@ -68,7 +72,13 @@ agent resuming after a crash or a context compaction can edit straight from a
 version it recorded an hour ago and either succeed or get a precise conflict.
 
 Every applied transaction — and every *failed* attempt — is journaled with the
-identity that made it and an optional `intent` note.
+identity that made it and an optional `intent` note, and that history is
+readable **through the same contract**: `journal` merges writes, failures and
+friction reports into one stream, `diff` reconstructs any version still
+retained, and `revert` undoes a transaction as a new transaction (running
+through the same version checks, so it conflicts rather than forces). Each
+`journal` response also states what the history cannot see — reads are not
+journaled — because a partial answer that looks whole is worse than no answer.
 
 Secret-bearing files (`.env` and friends) are **classified, not denied**:
 `read` serves them redacted — each value becomes a sealed

@@ -60,6 +60,14 @@ agent-filed feedback. Nothing here is frozen.
   `kaedignore_protected`) and `hint` says what to do instead, because a
   refusal with no alternative is how an agent routes around kaed via ssh
   and the journal loses the edit too.
+
+  Errors that are plausibly **kaed's** fault also carry
+  `data.feedback_invite` — a one-line ask, no round-trip, no standing
+  invitation to ignore (see `feedback`). Narrow on purpose: `denied`,
+  `too_large`, `internal`, and `version_conflict` only when there was no
+  delta to give. A malformed-input error whose message already names the
+  valid fields is not friction worth interrupting for, and prompting on
+  everything is how a feedback channel dies.
 - **R7 — the deny list is absolute, and never silent.** Some paths are
   refused inside the roots: kaed's own config and journal directories
   always, plus configured globs (credential *stores*: `.ssh`, `.aws`, … by
@@ -105,7 +113,19 @@ agent-filed feedback. Nothing here is frozen.
 - **R6 — durable, attributed history.** Every applied transaction gets a
   journal entry: id, author (from token), timestamp, files + diffstat,
   optional agent-supplied `intent` string, git HEAD of the enclosing repo
-  if any.
+  if any. Every *failed* attempt gets one too — failures are the
+  interesting record — and so does every `feedback` report.
+
+  The history is **readable through the contract** (`journal`, `diff`,
+  `revert`), not only by opening SQLite on the host: a promise redeemable
+  by one human is not a promise kept to agents.
+
+  What it does **not** cover, deliberately and disclosed in every
+  `journal` response: **reads are not journaled**. Only writes, failed
+  write attempts and feedback reach the store. A refused read, a
+  truncated one, or an agent quietly giving up leaves no row, so an
+  absence of read-side friction in the journal is not evidence of its
+  absence in the world.
 
 - **R8 — root names are host-qualified.** A root is named `host:root` —
   `kai:src`, never `src`. `root` was always the indirection every tool
@@ -142,7 +162,8 @@ What this instance serves, and which hosts are supposed to.
     "roots": [
       {"name": "kai:src", "host": "kai", "path": "/home/ken/src",
        "description": "code repos", "status": "active",
-       "capabilities": ["stat", "list", "read", "search", "edit"]}
+       "capabilities": ["stat", "list", "read", "search", "edit",
+                        "secrets", "history", "feedback"]}
     ],
     "fleet": {
       "declared": true,
@@ -333,36 +354,122 @@ One tool, transactional, all addressing modes.
 ### History
 
 #### `journal`
-- **In:** `{root, path?, author?, since?, max? (default 20)}`
-- **Out:** `{entries: [{txn_id, author, time, intent?, files: [{path,
-  old_version, new_version}], diffstat, git_head?}], truncated}`
+- **In:** `{root?, path?, author?, since?, kind?: ["txn"|"failure"|
+  "feedback"], max? (default 20, capped at 200)}`
+- **Out:**
+  ```jsonc
+  {
+    "entries": [
+      {"kind": "txn", "txn_id": 42, "author": "claude", "time": "…",
+       "status": "applied" | "torn", "root": "kai:src", "intent": "…",
+       "files": [{"path", "old_version", "new_version",
+                  "lines_added", "lines_removed"}],
+       "diffstat": [6, 2], "git_head": "…",
+       "historical": {"reason": "…", "note": "…"}},
+      {"kind": "failure", "failure_id": 7, "author": "claude", "time": "…",
+       "root": "kai:src", "paths": ["src/txn.rs"], "code": "version_conflict",
+       "message": "…", "expected_version": "…", "actual_version": "…"},
+      {"kind": "feedback", "feedback_id": 3, "author": "claude", "time": "…",
+       "category": "friction", "summary": "…", "detail": "…", "context": "…"}
+    ],
+    "truncated": false,
+    "records_scanned": 3,
+    "coverage": {"txns_from": "…", "failures_from": "…", "feedback_from": "…",
+                 "blob_retention_days": 7, "notes": ["…"]},
+    "reason": {"code": "…", "hint": "…"}
+  }
+  ```
 - The cross-session, cross-agent memory: "what happened here recently and
   who did it." A resuming session reads the journal instead of re-deriving
   the world.
+- **One merged stream, three record kinds**, newest first. Successes,
+  failed attempts and friction reports interleave because the questions
+  worth asking span them — "did my last edit fail, and why", "what did
+  agents complain about and what were they doing when they did". `kind`
+  narrows it; the default is all three.
+- **`root` is an optional filter, not an address.** The journal is
+  host-wide, and history legitimately names roots that no longer resolve,
+  so an unresolvable value filters rather than fails.
+- **`coverage` states what this history cannot see** — always, not only
+  when something is missing. `notes[0]` says reads are not journaled at
+  all: only write transactions, failed write *attempts* and feedback reach
+  the store, so silence about read-side friction is not evidence.
+  `failures_from` is later than `txns_from` on any host that ran kaed
+  before failures were recorded, and a window reaching back past it earns
+  a second note. Same rule as `files_searched` (R3/#1066) and
+  `denied_hidden` (R7), applied to time instead of to files.
+- `historical` labels a row whose `root` this host no longer serves (R8's
+  corollary), with `reason` `root_no_longer_served` or
+  `unqualified_pre_007`. The row is never rewritten and the name is never
+  aliased back into existence.
+- `reason` explains an empty result whose emptiness is more likely the
+  caller's than the store's: `unknown_root_filter`, `no_matching_records`.
+- Agent-supplied `intent` and error messages are served through the R9
+  redactor: free text reaches the audit trail, and a token pasted into an
+  `intent` must not become readable just because history became readable.
 
 #### `diff`
-- **In:** `{root, path, from: <version|txn_id>, to?: <version|txn_id|"current">}`
-- **Out:** `{diff, from_version, to_version}`
-- Works for any version the journal still knows (journal retains content
-  needed to reconstruct; retention window configurable).
+- **In:** `{root, path, from: <version|txn_id|"current">,
+  to?: <same, default "current">}`
+- **Out:** `{diff, path, from_version, to_version, redacted?,
+  from_source, to_source}`
+- A **version** is 16 hex chars (R1), which is what makes the selector
+  unambiguous with no type tag. A **txn id** names the state that
+  transaction *produced* for this path; to see what one transaction did,
+  `journal` gives you that file's `old_version` and `new_version`.
+- Works for any version the journal still **retains**. Metadata is kept
+  forever and content is not (#909), so an old version can be named and
+  not rendered: that is a `not_found` carrying
+  `reason: blob_expired_or_absent` and the retention window, never a
+  silent empty diff.
+- `from_source` / `to_source` are `journal_blob` or `working_tree`.
+- **Redaction is enforced at the store boundary, not per tool** (R9): a
+  blob flagged redacted is served as the rendering it is; a blob *not*
+  flagged whose path is classified **today** is redacted on read (pre-008
+  journals hold plaintext under paths only classified later); content with
+  no redacted rendering is withheld with a marker. The in-file `kaedignore`
+  marker (R7) is checked on the journalled content too, so a file that
+  opted out and was later deleted has no readable history either.
 
 #### `revert`
-- **In:** `{root, txn_id, dry_run?}`
+- **In:** `{root, txn_id, dry_run?, intent?}`
 - **Out:** same shape as `edit` (a revert **is** a new journaled
-  transaction, never history rewriting).
-- Fails with `version_conflict` if later transactions touched the same
-  regions; the agent resolves via `diff` + a fresh `edit`.
+  transaction, never history rewriting) — and it is itself revertible.
+- Runs through the same engine and the same versioning contract: `base` is
+  the version that transaction produced, so a file touched since fails
+  with `version_conflict` and a delta. Never a force-overwrite — a revert
+  that bypassed R2 would be a hole in it. The agent resolves via `diff` +
+  a fresh `edit`.
+- Refuses, with `data.reason`, where kaed cannot honestly undo:
+  `root_no_longer_served` / `unqualified_pre_007` (R8's corollary),
+  `no_plaintext_history` (the file is classified, so what the journal
+  retains is a *rendering*; restoring it would write placeholders into the
+  file as literals), `revert_of_create_needs_delete` (undoing a create is
+  a delete, and `delete` is not shipped yet), `blob_expired_or_absent`,
+  `wrong_root`.
 
 ### Meta
 
 #### `feedback`
-- **In:** `{category: "friction"|"bug"|"wish"|"praise", summary,
-  detail?, context?}`
-- **Out:** `{id}`
+- **In:** `{summary, category? (default "friction"), detail?, context?}`
+- **Out:** `{id, recorded, note}`
 - The evolution loop, in-band: an agent that just fought the contract
   files the report *through* the contract, attributed and timestamped.
-  Stored server-side; review/promotion to korg work items is a human/agent
-  chore for now (open question in overview.md).
+  Stored beside the transactions and failures it is about, and read back
+  with `journal` (`kind: ["feedback"]`); promotion to korg work items is a
+  human/agent chore for now (open question in overview.md).
+- **One required field.** Anything that costs an agent a thinking step
+  loses to finishing the task, so `summary` is the whole obligation and
+  `category` defaults.
+- **The invitation rides the failure.** Errors that are plausibly kaed's
+  fault carry `data.feedback_invite` (R4) rather than relying on an agent
+  remembering a tool exists — the report worth having comes from the
+  session that hit a wall, which is the session least likely to volunteer
+  one. It is still callable unprompted, and should be: the worst incident
+  on record was a *successful* call that answered wrong, and no
+  error-triggered channel can see that class.
+- Free text is redacted (R9) before storage. The likeliest thing pasted
+  into a friction report is the error that caused it.
 
 ## Worked example — the core loop
 

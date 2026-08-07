@@ -240,13 +240,19 @@ async fn rotation_reloads_in_place_with_a_grace_window() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn lists_the_walking_skeleton_tools() -> anyhow::Result<()> {
+async fn lists_the_tool_surface() -> anyhow::Result<()> {
     let server = start_server().await?;
     let client = connect(&server).await?;
     let tools = client.list_all_tools().await?;
     let mut names: Vec<_> = tools.iter().map(|t| t.name.as_ref()).collect();
     names.sort_unstable();
-    assert_eq!(names, ["edit", "list", "read", "roots", "search", "stat"]);
+    assert_eq!(
+        names,
+        [
+            "diff", "edit", "feedback", "journal", "list", "read", "revert", "roots", "search",
+            "stat"
+        ]
+    );
     let _ = client.cancel().await;
     server.ct.cancel();
     Ok(())
@@ -668,6 +674,161 @@ async fn dry_run_multi_file_create() -> anyhow::Result<()> {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o755);
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The loop sprint 009 exists for: edit, then read your own history back
+/// through the contract instead of over ssh, then undo it.
+#[tokio::test]
+async fn history_loop_journal_diff_revert() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+    let original = std::fs::read_to_string(server.workdir_path.join("hello.txt"))?;
+
+    let edit = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": "hello.txt", "version": fsops::version_of(original.as_bytes())}],
+                "ops": [{"op": "anchor_replace", "path": "hello.txt",
+                         "old_text": "old_name", "new_text": "new_name"}],
+                "intent": "rename for clarity"
+            }))),
+        )
+        .await?;
+    let e = structured(&edit);
+    let txn_id = e["txn_id"].as_i64().expect("a txn id");
+
+    // journal: the transaction is there, attributed, with its intent
+    let hist = client
+        .call_tool(CallToolRequestParams::new("journal").with_arguments(args(json!({}))))
+        .await?;
+    let h = structured(&hist);
+    let entry = &h["entries"][0];
+    assert_eq!(entry["kind"], "txn");
+    assert_eq!(entry["txn_id"], txn_id);
+    assert_eq!(entry["author"], "claude");
+    assert_eq!(entry["status"], "applied");
+    assert_eq!(entry["intent"], "rename for clarity");
+    assert_eq!(entry["root"], ROOT);
+    assert!(
+        entry["historical"].is_null(),
+        "a live root is not historical"
+    );
+    // the gap is stated in the response, not left to be discovered (D-2)
+    assert!(
+        h["coverage"]["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("reads are not journaled"),
+        "{:?}",
+        h["coverage"]
+    );
+
+    // diff: what that transaction left, against what is there now
+    let diff = client
+        .call_tool(
+            CallToolRequestParams::new("diff").with_arguments(args(json!({
+                "root": ROOT, "path": "hello.txt",
+                "from": e["files"][0]["old_version"], "to": "current"
+            }))),
+        )
+        .await?;
+    let d = structured(&diff);
+    assert!(d["diff"].as_str().unwrap().contains("-fn old_name()"));
+    assert!(d["diff"].as_str().unwrap().contains("+fn new_name()"));
+    assert_eq!(d["from_source"], "journal_blob");
+    assert_eq!(d["to_source"], "working_tree");
+
+    // revert: a new transaction, not a rewrite
+    let rev = client
+        .call_tool(
+            CallToolRequestParams::new("revert")
+                .with_arguments(args(json!({"root": ROOT, "txn_id": txn_id}))),
+        )
+        .await?;
+    let r = structured(&rev);
+    assert_eq!(r["applied"], true);
+    assert_ne!(r["txn_id"], json!(txn_id));
+    assert_eq!(
+        std::fs::read_to_string(server.workdir_path.join("hello.txt"))?,
+        original
+    );
+
+    // …and the revert is itself in the history, naming what it undid
+    let hist = client
+        .call_tool(CallToolRequestParams::new("journal").with_arguments(args(json!({"max": 1}))))
+        .await?;
+    assert!(
+        structured(&hist)["entries"][0]["intent"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("revert of txn {txn_id}")),
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// #1046's re-shaping: the invitation rides the failure, and the report
+/// lands in the same store as the events it is about.
+#[tokio::test]
+async fn a_refusal_invites_feedback_and_the_report_lands_in_the_journal() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+    std::fs::write(
+        server.workdir_path.join("secret.pem"),
+        "-----BEGIN PRIVATE KEY-----\nxyz\n-----END PRIVATE KEY-----\n",
+    )?;
+
+    // a refusal an agent might route around kaed over
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("read")
+                .with_arguments(args(json!({"root": ROOT, "path": "secret.pem"}))),
+        )
+        .await?;
+    assert_eq!(refused.is_error, Some(true));
+    let r = structured(&refused);
+    assert_eq!(r["code"], "denied");
+    assert_eq!(r["data"]["reason"], "classified_opaque");
+    assert!(r["data"]["hint"].is_string(), "the hint still survives");
+    let invite = &r["data"]["feedback_invite"];
+    assert_eq!(invite["tool"], "feedback");
+    assert_eq!(invite["required"], json!(["summary"]));
+
+    // taking it up costs one call and one field
+    let filed = client
+        .call_tool(
+            CallToolRequestParams::new("feedback").with_arguments(args(json!({
+                "summary": "no way to read a pem, so I used ssh",
+                "context": "read secret.pem -> denied/classified_opaque"
+            }))),
+        )
+        .await?;
+    assert_eq!(structured(&filed)["recorded"], true);
+
+    // and it reads back beside the transactions it is about
+    let hist = client
+        .call_tool(
+            CallToolRequestParams::new("journal")
+                .with_arguments(args(json!({"kind": ["feedback"]}))),
+        )
+        .await?;
+    let h = structured(&hist);
+    assert_eq!(h["entries"][0]["kind"], "feedback");
+    assert_eq!(h["entries"][0]["category"], "friction");
+    assert_eq!(h["entries"][0]["author"], "claude");
+    assert!(
+        h["entries"][0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("used ssh")
+    );
 
     let _ = client.cancel().await;
     server.ct.cancel();
