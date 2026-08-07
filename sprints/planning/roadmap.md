@@ -2,7 +2,12 @@
 
 > The general plan for this project. Keep it current; detail lives in the
 > sprint records. Design docs: [summary](summary.md) · [overview](overview.md)
-> · [mcp-contract](mcp-contract.md) · [architecture](architecture.md).
+> · [mcp-contract](mcp-contract.md) · [architecture](architecture.md) ·
+> [decisions](decisions.md).
+>
+> **Sequencing for the next nine slices is settled** — korg program 1063,
+> reasoned out in [decisions.md](decisions.md) PD-1. The `Now` and `Next`
+> items below are covered by it; `Later / Ideas` is not.
 
 ## Now
 
