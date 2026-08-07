@@ -65,5 +65,34 @@ The kubsdb entry stays exactly as PD-5 wrote it: `deferred`, `ref
 
 ## What was actually done
 
-(to be filled in at deploy time by `/sprint-ship` Phase 7 — the
-`deploy-fleet` skill deploys from merged main)
+**Deployed 2026-08-07** (`/sprint-ship` Phase 7, from merged main).
+
+- Published `0.1.0-e086181` (`0.1.0 (e086181 2026-08-07)`, the squash
+  commit of PR #10) to the package store; `latest` moved to it.
+- Installed from the store on kai, then kubs0. All four verification
+  checks passed on both hosts: exact version match, `check-config` clean,
+  unit active, and an authenticated MCP round trip over each host's real
+  tailnet URL returning the same build stamp. Rollback target on both
+  hosts: `kaed.prev` = the 009 build; the store's history is the general
+  path.
+- **Gateway config on kai** (the post-deploy step this file exists for):
+  k-homelab #1072 was confirmed landed first (its sprint 023, PR #37 —
+  `kaedconf.py` preserves `[peers.<host>.tokens]`). kubs0's `claude`
+  token copied over ssh directly into
+  `~/.config/kaed/peer-tokens/kubs0-claude` (0600, value never surfaced),
+  `[peers.kubs0.tokens]` added to kai's `config.toml`, daemon restarted.
+  `check-config`: `kubs0 … proxies for ["claude"]`.
+- **Gateway verified live through kai's real URL**: `roots` shows kubs0
+  `verified: true` at `0.1.0 (e086181 2026-08-07)` with `kubs0:src` and
+  `kubs0:k-homelab` aggregated; `stat {root: "kubs0:src"}` proxied and
+  answered; fleet search `*:*` fanned out over all four roots on both
+  hosts (755 files searched, per-root `fanout`, kubsdb listed
+  `deferred`/korg:929 in `hosts_unavailable`); `journal {root:
+  "kubs0:src"}` proxied to kubs0 and answered with its `coverage` block.
+- `bin/audit kai kaed-service` → `ok` with the tokens table in place —
+  #1072's preservation holding against the live config.
+- **Fallback exercised**: the deploy verification's direct MCP round trip
+  to kubs0's own URL (with kubs0's token, from kubs0) is the documented
+  gateway-down path, and it worked.
+- kubs0 deliberately got **no** peer tokens (plain backend, per plan);
+  kubsdb untouched (deferred, korg:929).

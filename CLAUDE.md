@@ -45,13 +45,27 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai and kubs0).
 
-**Status: v0 live on kai + kubs0** (sprints 001–009, 2026-08-07):
+**Status: v0 live on kai + kubs0** (sprints 001–010, 2026-08-07):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
 auth. **kubsdb deliberately has no instance** (korg #929) — if you find
 none there, that is correct, not a broken rollout. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
+
+**kai is the fleet's gateway since 010** (R10 in the contract;
+`sprints/010-gateway-peer-mode/decisions.md`): calls to kai addressing
+`kubs0:*` roots are proxied *as the caller* — per-author peer tokens in
+`[peers.kubs0.tokens]` on kai (an author without one is refused with
+`no_peer_credential`, never impersonated; PD-4), results and errors pass
+through verbatim plus a `root` tag on errors, `roots` probes peers live
+(an outage is `status: "unreachable"` + `since`, data not failure), and
+`search` takes root patterns (`*:*`) for fleet-wide search with per-root
+`fanout` reporting. The tokens table is host-local: k-homelab's
+kaed-service recipe *preserves* it but never writes it (its sprint 023),
+so it is configured by hand per gateway host. Direct per-host URLs remain
+the documented fallback — the gateway journals no proxied calls (D-7), so
+each host's journal is still the only record of its own edits.
 
 **Root names are host-qualified since 007** — `kai:src`, never `src`, and
 the unqualified form is refused rather than aliased. `roots` also returns
