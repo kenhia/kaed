@@ -107,6 +107,10 @@ flip from `denied` to redacted-readable on kai and kubs0. That is the
 sprint's purpose, not a regression; existing configs need no edit
 (classify defaults are on).
 
+Shipped as PR #8 (squash `a9b8ea0`), deployed 2026-08-07 as
+`0.1.0-a9b8ea0` — see [deploy.md](deploy.md) for the per-host table, the
+live redacted-read smoke test, and the journal migration evidence.
+
 ## Follow-ups
 
 - History tools (#1049) must treat `blobs.redacted = 0` rows that belong to
