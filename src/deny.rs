@@ -23,8 +23,12 @@
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::path::{Path, PathBuf};
 
-/// Globs applied unless `use_default_deny = false`. Credentials and key
-/// material an agent has no business reading through an editor.
+/// Globs applied unless `use_default_deny = false`. Credential *stores* an
+/// agent has no business near through an editor. Since sprint 008 the
+/// secret-bearing *file* heuristics (`.env*`, `*.pem`, `id_*`, …) live in
+/// `policy::DEFAULT_CLASSIFY` instead: heuristics classify → redact,
+/// only explicit configuration denies (D-1). A heuristic hard-deny is a
+/// confusing dead end; redaction degrades gracefully.
 pub const DEFAULT_DENY: &[&str] = &[
     "**/.ssh",
     "**/.gnupg",
@@ -32,13 +36,6 @@ pub const DEFAULT_DENY: &[&str] = &[
     "**/.netrc",
     "**/.git-credentials",
     "**/.config/gh",
-    "**/.env",
-    "**/.env.*",
-    "**/*.pem",
-    "**/*.p12",
-    "**/id_rsa",
-    "**/id_ecdsa",
-    "**/id_ed25519",
 ];
 
 #[derive(Debug)]
@@ -171,14 +168,17 @@ mod tests {
                 .collect::<Vec<_>>(),
         )
         .unwrap();
+        for p in ["/home/ken/.ssh/id_ed25519", "/home/ken/.aws/credentials"] {
+            assert!(d.is_denied(Path::new(p)), "{p} should be denied");
+        }
+        // since 008 these *classify* (→ redacted or classified_opaque)
+        // rather than deny — the deny-vs-classify split, D-1
         for p in [
-            "/home/ken/.ssh/id_ed25519",
-            "/home/ken/.aws/credentials",
             "/home/ken/src/app/.env",
             "/home/ken/src/app/.env.production",
             "/home/ken/certs/server.pem",
         ] {
-            assert!(d.is_denied(Path::new(p)), "{p} should be denied");
+            assert!(!d.is_denied(Path::new(p)), "{p} classifies, not denies");
         }
         assert!(!d.is_denied(Path::new("/home/ken/src/app/src/main.rs")));
         // a file merely *named* like a doc about ssh is fine

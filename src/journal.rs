@@ -41,10 +41,15 @@ CREATE TABLE IF NOT EXISTS txn_files (
   lines_removed INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS txn_files_by_path ON txn_files(path);
+-- `redacted` (008): the content is a redacted rendering, not the file's
+-- raw bytes. A row with redacted = 0 whose path is *now* classified is a
+-- legacy plaintext blob — history tools must redact it on read, never
+-- serve it (D-11 corollary, flagged for #1049).
 CREATE TABLE IF NOT EXISTS blobs (
   version    TEXT PRIMARY KEY,
   content    BLOB NOT NULL,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  redacted   INTEGER NOT NULL DEFAULT 0
 );
 -- Attempts that never applied. No blobs by design (#909): a failed attempt
 -- produced no new content, and its pre-image is still the file on disk.
@@ -103,6 +108,7 @@ impl Journal {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         // This file holds the content of everything kaed has edited, so it
         // is as sensitive as the most sensitive file under any root. Set
         // the mode outright rather than inheriting whatever umask gave us.
@@ -215,17 +221,31 @@ impl Journal {
     }
 }
 
+/// Columns added after a table shipped. `CREATE TABLE IF NOT EXISTS` never
+/// alters an existing table, so kai's and kubs0's live journals need the
+/// explicit ALTER on upgrade.
+fn migrate(conn: &Connection) -> anyhow::Result<()> {
+    let has_redacted = conn
+        .prepare("SELECT 1 FROM pragma_table_info('blobs') WHERE name = 'redacted'")?
+        .exists([])?;
+    if !has_redacted {
+        conn.execute_batch("ALTER TABLE blobs ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0")?;
+        tracing::info!("journal migrated: blobs.redacted added (sprint 008)");
+    }
+    Ok(())
+}
+
 impl TxnRecorder for Journal {
     fn begin(
         &self,
         author: &str,
         intent: Option<&str>,
         root: &ResolvedRoot,
-        files: &[FileTxnRecord<'_>],
+        files: &[FileTxnRecord],
     ) -> Result<i64> {
         let git_head = files
             .first()
-            .map(|f| root.path.join(f.path))
+            .map(|f| root.path.join(&f.path))
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .and_then(|dir| git_head_for(&dir));
         let mut conn = self.lock();
@@ -238,28 +258,39 @@ impl TxnRecorder for Journal {
         .map_err(db_err)?;
         let txn_id = tx.last_insert_rowid();
         for f in files {
-            let (added, removed) = diffstat(f.old_content.unwrap_or(""), f.new_content);
             tx.execute(
                 "INSERT INTO txn_files
                    (txn_id, path, old_version, new_version, lines_added, lines_removed)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![txn_id, f.path, f.old_version, f.new_version, added, removed],
+                rusqlite::params![
+                    txn_id,
+                    f.path,
+                    f.old_version,
+                    f.new_version,
+                    f.lines_added,
+                    f.lines_removed
+                ],
             )
             .map_err(db_err)?;
-            if let (Some(old_version), Some(old_content)) = (f.old_version, f.old_content) {
+            // Blob content arrives already redacted for classified files,
+            // and is absent (withheld) for content kaed cannot redact —
+            // the audit row above stays either way (D-11).
+            if let (Some(old_version), Some(blob)) = (&f.old_version, &f.blob_old) {
                 tx.execute(
-                    "INSERT OR IGNORE INTO blobs (version, content, created_at)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![old_version, old_content.as_bytes(), now()],
+                    "INSERT OR IGNORE INTO blobs (version, content, created_at, redacted)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![old_version, blob.as_bytes(), now(), f.redacted],
                 )
                 .map_err(db_err)?;
             }
-            tx.execute(
-                "INSERT OR IGNORE INTO blobs (version, content, created_at)
-                 VALUES (?1, ?2, ?3)",
-                rusqlite::params![f.new_version, f.new_content.as_bytes(), now()],
-            )
-            .map_err(db_err)?;
+            if let Some(blob) = &f.blob_new {
+                tx.execute(
+                    "INSERT OR IGNORE INTO blobs (version, content, created_at, redacted)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![f.new_version, blob.as_bytes(), now(), f.redacted],
+                )
+                .map_err(db_err)?;
+            }
         }
         tx.commit().map_err(db_err)?;
         Ok(txn_id)
@@ -276,15 +307,15 @@ impl TxnRecorder for Journal {
         Ok(())
     }
 
-    fn blob(&self, version: &str) -> Option<String> {
+    fn blob(&self, version: &str) -> Option<(String, bool)> {
         self.lock()
             .query_row(
-                "SELECT content FROM blobs WHERE version = ?1",
+                "SELECT content, redacted FROM blobs WHERE version = ?1",
                 [version],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
             )
             .ok()
-            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|(bytes, redacted)| Some((String::from_utf8(bytes).ok()?, redacted)))
     }
 
     fn fail(&self, r: &FailedTxnRecord<'_>) {
@@ -339,20 +370,6 @@ fn db_err(e: impl std::fmt::Display) -> KaedError {
     KaedError::internal(format!("journal: {e}"))
 }
 
-fn diffstat(old: &str, new: &str) -> (i64, i64) {
-    let diff = similar::TextDiff::from_lines(old, new);
-    let mut added = 0;
-    let mut removed = 0;
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Insert => added += 1,
-            similar::ChangeTag::Delete => removed += 1,
-            similar::ChangeTag::Equal => {}
-        }
-    }
-    (added, removed)
-}
-
 /// HEAD of the git repo enclosing `dir`, if any. Best-effort — kaed works
 /// the same outside repos; the head is correlation data, not truth.
 fn git_head_for(dir: &Path) -> Option<String> {
@@ -377,20 +394,30 @@ mod tests {
     use crate::fsops;
     use crate::txn::{self, BaseVersion, EditOp, EditRequest};
 
-    fn record<'a>(
-        path: &'a str,
-        old: Option<&'a str>,
-        new: &'a str,
-        old_v: Option<&'a str>,
-        new_v: &'a str,
-    ) -> FileTxnRecord<'a> {
+    fn record(
+        path: &str,
+        old: Option<&str>,
+        new: &str,
+        old_v: Option<&str>,
+        new_v: &str,
+    ) -> FileTxnRecord {
+        let (added, removed) = txn::diffstat(old.unwrap_or(""), new);
         FileTxnRecord {
-            path,
-            old_version: old_v,
-            new_version: new_v,
-            old_content: old,
-            new_content: new,
+            path: path.to_owned(),
+            old_version: old_v.map(str::to_owned),
+            new_version: new_v.to_owned(),
+            lines_added: added,
+            lines_removed: removed,
+            blob_old: old.map(str::to_owned),
+            blob_new: Some(new.to_owned()),
+            redacted: false,
         }
+    }
+
+    /// The blob's content alone, for assertions that don't care about the
+    /// redacted flag.
+    fn blob_content(j: &Journal, version: &str) -> Option<String> {
+        TxnRecorder::blob(j, version).map(|(c, _)| c)
     }
 
     fn scratch_root() -> (tempfile::TempDir, ResolvedRoot) {
@@ -421,9 +448,15 @@ mod tests {
         j.complete(id).unwrap();
         assert!(j.scan_pending().unwrap().is_empty());
 
-        assert_eq!(j.blob("oldver1234567890").as_deref(), Some("a\nb\n"));
-        assert_eq!(j.blob("newver1234567890").as_deref(), Some("a\nc\nd\n"));
-        assert_eq!(j.blob("nope"), None);
+        assert_eq!(
+            blob_content(&j, "oldver1234567890").as_deref(),
+            Some("a\nb\n")
+        );
+        assert_eq!(
+            blob_content(&j, "newver1234567890").as_deref(),
+            Some("a\nc\nd\n")
+        );
+        assert_eq!(blob_content(&j, "nope"), None);
 
         let conn = j.lock();
         let (added, removed): (i64, i64) = conn
@@ -511,14 +544,17 @@ mod tests {
             )
             .unwrap();
         j.complete(id).unwrap();
-        assert_eq!(j.blob("oldver1234567890").as_deref(), Some("secret\n"));
+        assert_eq!(
+            blob_content(&j, "oldver1234567890").as_deref(),
+            Some("secret\n")
+        );
 
         // age both blobs past the window
         j.lock()
             .execute("UPDATE blobs SET created_at = '2020-01-01T00:00:00Z'", [])
             .unwrap();
         assert_eq!(j.gc_blobs().unwrap(), 2);
-        assert_eq!(j.blob("oldver1234567890"), None);
+        assert_eq!(blob_content(&j, "oldver1234567890"), None);
 
         let conn = j.lock();
         let txns: i64 = conn
@@ -548,7 +584,10 @@ mod tests {
             .unwrap();
         j.complete(id).unwrap();
         assert_eq!(j.gc_blobs().unwrap(), 0);
-        assert_eq!(j.blob("v000000000000000").as_deref(), Some("fresh\n"));
+        assert_eq!(
+            blob_content(&j, "v000000000000000").as_deref(),
+            Some("fresh\n")
+        );
     }
 
     #[test]
@@ -603,6 +642,7 @@ mod tests {
             dry_run: false,
             return_diff: true,
             intent: Some("retry from a stale base".into()),
+            drop_keys: Vec::new(),
         };
         let err = txn::apply(&root, &stale, &Limits::default(), "claude", &j).unwrap_err();
         assert_eq!(err.code, ErrorCode::VersionConflict);
@@ -672,6 +712,7 @@ mod tests {
             dry_run: false,
             return_diff: false,
             intent: None,
+            drop_keys: Vec::new(),
         };
         // one success, then two attempts still holding the pre-edit version
         txn::apply(&root, &edit(&good, "second"), &Limits::default(), "a", &j).unwrap();
@@ -713,6 +754,7 @@ mod tests {
             dry_run: true,
             return_diff: true,
             intent: None,
+            drop_keys: Vec::new(),
         };
         assert!(txn::apply(&root, &req, &Limits::default(), "claude", &j).is_err());
         let n: i64 = j
@@ -750,6 +792,101 @@ mod tests {
         assert_eq!(head.len(), 40);
     }
 
+    // ------------------------------------------------ secrets model (008)
+
+    /// End to end through the real engine and the real journal: editing a
+    /// classified dotenv file leaves only redacted renderings in the blob
+    /// store. A redacted read with a plaintext journal would be theatre —
+    /// #909's retention decision was made without this feature in view and
+    /// deliberately does not cover it (D-11).
+    #[test]
+    fn classified_edits_journal_redacted_blobs_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ResolvedRoot::with_default_classify("t", dir.path().canonicalize().unwrap());
+        let j = Journal::open_in_memory().unwrap();
+        const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+        let content = format!("KLAMS_TOKEN={VALUE}\n");
+        std::fs::write(dir.path().join(".env"), &content).unwrap();
+        let v = fsops::version_of(content.as_bytes());
+
+        let out = txn::apply(
+            &root,
+            &EditRequest {
+                base: vec![BaseVersion {
+                    path: ".env".into(),
+                    version: v.clone(),
+                }],
+                ops: vec![EditOp::EnvSet {
+                    path: ".env".into(),
+                    key: "NEW_FLAG".into(),
+                    value: Some("on".into()),
+                    comment: None,
+                }],
+                dry_run: false,
+                return_diff: false,
+                intent: None,
+                drop_keys: Vec::new(),
+            },
+            &Limits::default(),
+            "claude",
+            &j,
+        )
+        .unwrap();
+
+        // both blobs exist, both are redacted renderings, flagged as such
+        let new_v = &out.files[0].new_version;
+        for version in [&v, new_v] {
+            let (blob, redacted) = TxnRecorder::blob(&j, version).expect("blob retained");
+            assert!(redacted, "blob for {version} not flagged redacted");
+            assert!(!blob.contains(VALUE), "journal leaked plaintext: {blob}");
+            assert!(blob.contains("⟨kaed:KLAMS_TOKEN@"), "{blob}");
+        }
+        // …and the real value is on disk, untouched
+        assert!(
+            std::fs::read_to_string(dir.path().join(".env"))
+                .unwrap()
+                .contains(VALUE)
+        );
+
+        // the audit numbers survived redaction (diffstat is over raw text)
+        let (added, _removed): (i64, i64) = j
+            .lock()
+            .query_row(
+                "SELECT lines_added, lines_removed FROM txn_files",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(added, 1);
+    }
+
+    /// kai's and kubs0's live journals predate `blobs.redacted`; opening
+    /// one must migrate it, not fail on it.
+    #[test]
+    fn opening_a_pre_008_database_migrates_the_blobs_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE blobs (
+                   version    TEXT PRIMARY KEY,
+                   content    BLOB NOT NULL,
+                   created_at TEXT NOT NULL
+                 );
+                 INSERT INTO blobs VALUES ('legacyver1234567', x'73656372657400', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let j = Journal::open(&path, 3650).unwrap();
+        // the legacy row reads back as unredacted — exactly the signal
+        // history tools must key redact-on-read from
+        let (content, redacted) =
+            TxnRecorder::blob(&j, "legacyver1234567").expect("legacy blob readable");
+        assert!(!redacted);
+        assert_eq!(content.as_bytes(), b"secret\0");
+    }
+
     #[test]
     fn full_loop_conflict_delta_from_real_journal() {
         // edit through the engine with a real journal, then retry with the
@@ -774,6 +911,7 @@ mod tests {
             dry_run: false,
             return_diff: true,
             intent: None,
+            drop_keys: Vec::new(),
         };
 
         let out = txn::apply(

@@ -54,16 +54,50 @@ agent-filed feedback. Nothing here is frozen.
   `data` makes the error actionable: `version_conflict`
   carries `{expected_version, actual_version, delta}` (a compact diff of
   what changed since the agent last looked); `ambiguous_anchor` carries the
-  candidate line numbers; `denied` carries `{path, rule}`.
+  candidate line numbers; `denied` carries `{path, rule, reason, hint}` —
+  `reason` names the refusing policy layer (`server_denylist` |
+  `kaedignore` | `in_file_marker` | `classified_opaque` |
+  `kaedignore_protected`) and `hint` says what to do instead, because a
+  refusal with no alternative is how an agent routes around kaed via ssh
+  and the journal loses the edit too.
 - **R7 — the deny list is absolute, and never silent.** Some paths are
   refused inside the roots: kaed's own config and journal directories
-  always, plus configured globs (`.ssh`, `.env`, `*.pem`, … by default).
-  Addressing one is `denied` — a permanent refusal, not a path to correct,
-  so it should never be retried. Enumeration (`list`, `search`) omits them
-  instead of failing, and reports `denied_hidden: N` so a filtered result
-  is never mistaken for the whole directory. The check is lexical, applied
-  identically to paths that exist and paths that don't, so a `denied` is
-  never evidence that a file is there.
+  always, plus configured globs (credential *stores*: `.ssh`, `.aws`, … by
+  default), plus any in-repo `.kaedignore` (gitignore-shaped; each file's
+  `!` negation can un-deny only what that same file denied — policy layers
+  only ever add restriction, and `.kaedignore` itself is readable but
+  never writable through kaed), plus an in-file marker: the bare token
+  `kaedignore` on a comment line in the first 5 lines. Addressing a denied
+  path is `denied` — a permanent refusal, not a path to correct, so it
+  should never be retried; `data.reason` says which layer (R4).
+  Enumeration (`list`, `search`) omits denied paths instead of failing,
+  and reports `denied_hidden: N` so a filtered result is never mistaken
+  for the whole directory. Path checks are lexical, applied identically to
+  paths that exist and paths that don't, so a `denied` is never evidence
+  that a file is there (the in-file marker is necessarily content-level:
+  it is checked wherever content is opened — read, edit, search — and is
+  invisible to `list`, which opens nothing).
+- **R9 — heuristics classify; only explicit config denies.**
+  Secret-bearing *file* heuristics (`.env*`, `*.env`, `*.pem`, `id_*`,
+  `credentials*`, `*.kdbx`, plus `[security] classify` globs) mark a path
+  **classified** rather than denying it. A classified file that parses as
+  strict dotenv (every line blank, `#` comment, or `KEY=value`) is served
+  **redacted**: values become sealed placeholders
+  `⟨kaed:KEY@digest⟩` — digest = truncated BLAKE3 of the value, the same
+  primitive and truncation as `version` (PD-2) — with the digest withheld
+  below an entropy floor (`⟨kaed:DEBUG⟩`), and secret-shaped tokens in
+  comments redacted too. The redacted rendering is **line-for-line** with
+  the raw file, so ranges, windows, anchors and search hits keep their
+  meaning; the `version` returned is always the *raw* file's (R1) and is a
+  valid edit base. A classified file that is not dotenv-shaped refuses
+  with `reason: classified_opaque`. Every derived surface is redacted or
+  withheld — the returned diff, the `version_conflict` delta, search hit
+  text, and journal blobs — and a write that would destroy a value
+  (delete, or overwrite by a new literal) refuses unless the key is named
+  in the edit's `drop_keys`: the value may never have been seen and kaed
+  keeps no recoverable shadow. There is deliberately no `reveal` yet
+  (measure the pressure first); to *use* a value, source the file in a
+  shell (`set -a; . .env; set +a`).
 - **R5 — three addressing modes, one engine.** Content **anchor** (unique
   match, robust to line drift), **range@version** (line numbers valid only
   against a declared version), **node** (tree-sitter selector). Identical
@@ -156,9 +190,10 @@ What this instance serves, and which hosts are supposed to.
 #### `stat`
 - **In:** `{root, path}`
 - **Out:** `{kind: "file"|"dir"|"symlink", size, version?, line_count?,
-  language?, executable, modified, binary}`
+  language?, executable, modified, binary, classified?}`
 - Cheap staleness probe: one `stat` tells an agent whether its held copy
-  (by `version`) is still current.
+  (by `version`) is still current. `classified: true` (omitted when false)
+  says a `read` will be redacted or refused (R9) before anything is opened.
 
 #### `list`
 - **In:** `{root, path?, glob?, depth? (default 1), max? }`
@@ -176,12 +211,17 @@ What this instance serves, and which hosts are supposed to.
 - **In:** `{root, path, range?: {start, end}, window?: {line | anchor,
   context (default 10)}, numbered? (default false), max_bytes?}`
 - **Out:** `{content, version, range: {start, end}, total_lines,
-  truncated, next_offset?}`
+  truncated, next_offset?, redacted?, dotenv?, usage_hint?, warnings?}`
 - Modes: whole file (capped), explicit line `range`, or `window` — N
   context lines around a line number or around a unique anchor string.
   `window` + anchor is the cheap "show me where I'm about to edit" read.
 - Whatever the mode, `version` is the whole file's version — immediately
   usable as an edit base.
+- Classified dotenv files (R9): `redacted: true`, `content` is the
+  line-preserving redacted rendering, and a whole-file read also carries
+  `dotenv: [{key, placeholder?, comment?, meta: {len, shape}}]` — the
+  typed view — plus `usage_hint` (the shell-source convention). `warnings`
+  carries e.g. "classified but not gitignored".
 
 #### `outline`
 - **In:** `{root, path, depth?}`
@@ -196,11 +236,17 @@ What this instance serves, and which hosts are supposed to.
 - **In:** `{root, pattern, regex? (default true), glob?, path?,
   context? (default 2), max_results? (default 50)}`
 - **Out:** `{matches: [{path, version, line, col, text, before[],
-  after[]}], truncated, total?, files_searched, reason?, denied_hidden?}`
+  after[]}], truncated, total?, files_searched, reason?, denied_hidden?,
+  classified_hidden?}`
 - Ripgrep-grade server-side search. Each match carries its file's
   `version`, so a hit is directly addressable: search → edit with no read
   in between, safely (a stale hit becomes `version_conflict`, not a wrong
   edit).
+- Classified dotenv files are searched over their **redacted rendering**
+  (R9): keys, comments and placeholders match; a probe for a secret's
+  value matches nothing, by construction. Opaque-classified files are
+  skipped whole and counted in `classified_hidden` (sibling of
+  `denied_hidden`). Hit `version` stays the raw file's.
 - **`files_searched` is always present, including zero.** `0 matches in 41
   files` and `0 matches in 0 files` are different answers, and until they
   were distinguishable a scoping mistake was outcome-identical to a genuine
@@ -239,16 +285,24 @@ One tool, transactional, all addressing modes.
       {"op": "create", "path": "src/new.rs", "content": "…",
        "executable?": false, "overwrite?": false},
       {"op": "delete", "path": "src/old.rs"},
-      {"op": "rename", "from": "src/a.rs", "to": "src/b.rs"}
+      {"op": "rename", "from": "src/a.rs", "to": "src/b.rs"},
+      // dotenv ops (R9) — for strict-dotenv files, classified or not:
+      {"op": "env_set", "path": ".env", "key": "KLAMS_TOKEN",
+       "value?": "literal or ⟨kaed:KEY@digest⟩ placeholder",
+       "comment?": "replaces the attached comment block"},
+      {"op": "env_rename", "path": ".env", "from": "OLD", "to": "NEW"},
+      {"op": "env_delete", "path": ".env", "key": "OLD_TOKEN"},
+      {"op": "env_reorder", "path": ".env", "keys": ["A", "B", "C"]}
     ],
     "dry_run?": false,
     "return_diff?": true,     // default true
     "check?": false,          // parse-check touched files post-edit
-    "intent?": "extract rollback into its own fn"   // journaled
+    "intent?": "extract rollback into its own fn",  // journaled
+    "drop_keys?": ["OLD_TOKEN"]  // values this edit may destroy (R9)
   }
   ```
 - **Out:** `{txn_id, files: [{path, old_version, new_version}], diff,
-  diagnostics?, applied: true|false /* false = dry run */}`
+  diagnostics?, applied: true|false /* false = dry run */, warnings?}`
 - **Semantics:**
   - Every path referenced by a non-`create` op must appear in `base` with
     its version; mismatch at apply time → `version_conflict`, nothing
@@ -266,6 +320,15 @@ One tool, transactional, all addressing modes.
   - `check: true` re-parses touched files (tree-sitter) and returns
     syntax diagnostics in the same response — the edit still applies;
     the agent decides whether to revert. (Hookable to fmt/lint Later.)
+  - **Classified dotenv files take only env ops** — text ops over
+    redacted content are refused with a hint, because their failure modes
+    (an anchor landing mid-placeholder, a truncated placeholder written
+    back as a literal) are exactly what the typed ops make
+    unrepresentable. A `value` that is exactly a placeholder is
+    substituted with the real value it seals (same key keeps it, another
+    key's placeholder copies it); a stale digest fails loudly rather than
+    silently resolving to the current value. A write that makes a value
+    vanish refuses unless its key is in `drop_keys` (R9).
 
 ### History
 
@@ -347,6 +410,7 @@ And the zero that used to lie (R8's sibling, korg #1066):
 | Excluded | Why | Where it lands |
 |---|---|---|
 | `exec` / shell | Agents have ssh; mutation surface stays file-only | never |
+| `secret_reveal` | ship redaction first, measure the real pressure for plaintext; per-tool permissioning is the point of a separate tool | Next (#1051), evidence permitting |
 | git operations | git-over-ssh works; journal records `git_head` for correlation | never (correlation only) |
 | `apply_patch` (unified-diff input) | overlaps `edit` ops; wait for demand | Next, if dogfooding misses it |
 | LSP semantics (rename-symbol, references) | heavy lifecycle; tree-sitter first | Later |

@@ -53,7 +53,8 @@ async fn start_server_with(
         host: HOST.into(),
         roots: vec![ResolvedRoot {
             description: Some("test root".into()),
-            ..ResolvedRoot::unrestricted(ROOT, workdir_path.clone())
+            // default classification on, as Config::resolve would build it
+            ..ResolvedRoot::with_default_classify(ROOT, workdir_path.clone())
         }],
         // A fleet with one of each declared status, so the three states
         // korg #930 turns on are exercised end to end and not just in unit
@@ -89,6 +90,7 @@ async fn start_server_with(
         journal_path: workdir_path.join("journal.db"),
         journal_retention_days: 7,
         deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
+        classify: std::sync::Arc::new(kaed::policy::Classifier::empty()),
         auth: auth_spec,
     };
     let (app, auth) = kaed::server::build_app(resolved)?;
@@ -336,6 +338,99 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let delta = err["data"]["delta"].as_str().unwrap();
     assert!(delta.contains("-fn old_name() {"), "delta: {delta}");
     assert!(delta.contains("+fn new_name() {"), "delta: {delta}");
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// Sprint 008's loop over the wire: a classified dotenv file reads
+/// redacted with the typed view; a placeholder from that read is a sealed
+/// handle an env op can pass back as a value; and the vanish guard's
+/// refusal arrives as a structured error the client can act on — all in
+/// the JSON shapes a real MCP client sends and receives.
+#[tokio::test]
+async fn secrets_loop_redacted_read_env_edit_and_drop_keys() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    std::fs::write(
+        server.workdir_path.join(".env"),
+        format!("KLAMS_TOKEN={VALUE}\nDEBUG=true\n"),
+    )?;
+    let client = connect(&server).await?;
+
+    // 1. read — redacted rendering, typed view, RAW version
+    let read = client
+        .call_tool(
+            CallToolRequestParams::new("read")
+                .with_arguments(args(json!({"root": ROOT, "path": ".env"}))),
+        )
+        .await?;
+    let r = structured(&read);
+    assert_eq!(r["redacted"], true);
+    let content = r["content"].as_str().unwrap();
+    assert!(!content.contains(VALUE), "redacted read leaked: {content}");
+    assert!(content.contains("⟨kaed:KLAMS_TOKEN@"), "{content}");
+    assert_eq!(r["dotenv"][0]["key"], "KLAMS_TOKEN");
+    assert_eq!(r["dotenv"][0]["meta"]["shape"], "hex");
+    assert_eq!(r["dotenv"][0]["meta"]["len"], 32);
+    let placeholder = r["dotenv"][0]["placeholder"].as_str().unwrap().to_string();
+    let version = r["version"].as_str().unwrap().to_string();
+
+    // 2. env_set passing the placeholder through: the real value lands on
+    // disk, the returned diff shows only placeholders
+    let edit = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": ".env", "version": version}],
+                "ops": [{"op": "env_set", "path": ".env",
+                         "key": "KLAMS_TOKEN_COPY", "value": placeholder}],
+                "intent": "copy the token by its sealed handle"
+            }))),
+        )
+        .await?;
+    assert_ne!(edit.is_error, Some(true));
+    let e = structured(&edit);
+    assert_eq!(e["applied"], true);
+    let diff = e["diff"].as_str().unwrap();
+    assert!(!diff.contains(VALUE), "diff leaked the value: {diff}");
+    assert!(diff.contains("⟨kaed:KLAMS_TOKEN_COPY@"), "{diff}");
+    assert!(
+        std::fs::read_to_string(server.workdir_path.join(".env"))?
+            .contains(&format!("KLAMS_TOKEN_COPY={VALUE}")),
+        "the real value must land on disk"
+    );
+    let v2 = e["files"][0]["new_version"].as_str().unwrap().to_string();
+
+    // 3. destroying a value undeclared refuses, structured; declared, lands
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": ".env", "version": v2}],
+                "ops": [{"op": "env_delete", "path": ".env", "key": "DEBUG"}]
+            }))),
+        )
+        .await?;
+    assert_eq!(refused.is_error, Some(true));
+    let err = structured(&refused);
+    assert_eq!(err["code"], "invalid_input");
+    assert_eq!(err["data"]["reason"], "secret_would_vanish");
+    assert_eq!(err["data"]["keys"], json!(["DEBUG"]));
+
+    let confirmed = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": ".env", "version": v2}],
+                "ops": [{"op": "env_delete", "path": ".env", "key": "DEBUG"}],
+                "drop_keys": ["DEBUG"]
+            }))),
+        )
+        .await?;
+    assert_ne!(confirmed.is_error, Some(true));
+    assert!(!std::fs::read_to_string(server.workdir_path.join(".env"))?.contains("DEBUG"));
 
     let _ = client.cancel().await;
     server.ct.cancel();
