@@ -106,6 +106,41 @@ failure mode #930 was filed about.
 | #1045 addressing | New wrinkle: kai's journal references a `home` root that 002 narrowed away. Root renames orphan history; host-qualification will do it again at scale. Decide migrate-vs-accept. |
 | #1048 secrets | No signal. The only `denied` ever recorded was a deliberate test. No evidence yet of agents meeting secret files in real work — consistent with shipping redaction without `reveal`. |
 
+## Deployed 2026-08-06
+
+Published `0.1.0-16ea636` from merged `main` and installed it on both fleet
+hosts. Rollback target: `0.1.0-5b5858d` (also `~/.local/bin/kaed.prev` on each
+host).
+
+**The binary is functionally unchanged.** This sprint touched no Rust — the
+deliverables are a report, a Python script and documentation. The deploy exists
+to keep each host's reported build aligned with `main`, which is what the
+version floor in k-homelab's `kaed-service` recipe checks and what #930/#1045
+are about making legible. It is a stamp alignment, not a behaviour change, and
+should not be read as one.
+
+Verified on both hosts — all four checks, not just the first:
+
+| check | kai | kubs0 |
+|---|---|---|
+| `kaed --version` | `0.1.0 (16ea636 2026-08-06)` | `0.1.0 (16ea636 2026-08-06)` |
+| exact match to published `$V` | yes | yes |
+| `kaed check-config` | exit 0 | exit 0 |
+| `systemctl --user is-active` | active | active |
+| MCP `serverInfo.version` over the host's real URL | `0.1.0 (16ea636 2026-08-06)` | `0.1.0 (16ea636 2026-08-06)` |
+
+**Sprint-specific smoke test.** Unit health proves a kaed is running, not that
+this sprint's work is live — and this sprint's work is not in the binary at all.
+The honest equivalent is that the shipped artifact runs from the merged tree:
+`python3 scripts/journal-report.py` was re-run from `main` at `16ea636` on kai
+and produced a correct summary — 39 transactions on kai at that point, up from
+the 34 in the report's snapshot, because the sprint's own writes are themselves
+journaled. (Fleet total 46, against the report's 41. The report's figures are a
+snapshot and will not reproduce exactly on a later run; that is the point of
+committing the script rather than only the numbers.)
+
+No migration, so nothing to diff before and after.
+
 ## Exit criteria
 
 - [x] Written report in-repo, with the sample-size limitation stated rather than
