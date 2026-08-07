@@ -1,9 +1,16 @@
-//! TOML config: roots, auth token indirection, limits, journal.
+//! TOML config: roots, auth token indirection, limits, journal, peers.
 //!
 //! Tokens never live in the file — `[auth]` maps an author identity to the
 //! env var holding its bearer token, resolved at startup. `resolve()` is
 //! the validation gate: it canonicalizes roots, rejects duplicates, and
 //! reads token env vars, producing the runtime view the server uses.
+//!
+//! Since sprint 007 this file also carries the **declared fleet**. Roots
+//! are declared by their local name and served under a host-qualified one
+//! (`src` → `kai:src`), and `[peers]` names every host that should — or
+//! deliberately should not — run kaed. `config.toml` is *installed* rather
+//! than cloned, so it is the one place a declaration can live that is
+//! present on clone-less hosts (PD-5, korg #930).
 
 use crate::deny::{DEFAULT_DENY, DenyList};
 use anyhow::{Context, bail};
@@ -29,6 +36,56 @@ pub struct Config {
     pub journal: JournalConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    /// The declared fleet: every *other* host that should, or deliberately
+    /// should not, run kaed. `None` — the table absent entirely — is the
+    /// `never-declared` state, and is reported as such rather than being
+    /// silently indistinguishable from "this host is the whole fleet".
+    pub peers: Option<BTreeMap<String, PeerConfig>>,
+}
+
+/// One declared fleet member. Statuses carry the evidence for themselves:
+/// a `deferred` host without a `ref` is the documentation-that-lives-nowhere
+/// problem PD-5 moved this declaration into `config.toml` to escape, and an
+/// `unreachable` without a `since` starts lying about the present the moment
+/// it is written. Both are refused at startup (D-5).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeerConfig {
+    pub status: PeerStatus,
+    /// Why this host is what it is — a korg reference, e.g. `korg:929`.
+    /// Required for `deferred`.
+    #[serde(rename = "ref")]
+    pub reference: Option<String>,
+    /// Free-text elaboration, surfaced verbatim in `roots`.
+    pub note: Option<String>,
+    /// When this host was last known good. Required for `unreachable`.
+    pub since: Option<String>,
+    /// Base URL of the peer's MCP endpoint. Unused until peer mode
+    /// (korg:1050) — declared now so the fleet table is complete when it
+    /// lands, and so a host's absence from it is a real signal.
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerStatus {
+    /// Declared to be running kaed. Whether it *is* is a separate question —
+    /// see `FleetHost::verified`.
+    Active,
+    /// Deliberately not running kaed. Carries `ref` to the reasoning.
+    Deferred,
+    /// Should be running kaed and is known not to be answering.
+    Unreachable,
+}
+
+impl PeerStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PeerStatus::Active => "active",
+            PeerStatus::Deferred => "deferred",
+            PeerStatus::Unreachable => "unreachable",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +124,11 @@ pub struct ServerConfig {
     /// to the tailnet hostname when fronted by `tailscale serve`.
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// This instance's name in the fleet, and the prefix on every root name
+    /// it serves (`src` → `kai:src`). Defaults to the short system
+    /// hostname, which is what makes the 007 rename a zero-touch upgrade on
+    /// hosts whose config `install.sh` will never overwrite (D-1).
+    pub host: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -74,8 +136,39 @@ impl Default for ServerConfig {
         Self {
             bind: default_bind(),
             allowed_hosts: Vec::new(),
+            host: None,
         }
     }
+}
+
+/// The short system hostname — the first label of `/etc/hostname`, falling
+/// back to `$HOSTNAME`. An FQDN is truncated: `kai.example.ts.net` is still
+/// `kai`, because the fleet names hosts the way `tailscale status` and the
+/// deploy docs do.
+///
+/// `None` when neither source yields anything usable, which `resolve` turns
+/// into a startup failure naming `[server] host`. Guessing here would put a
+/// wrong prefix on every root name and every journal row.
+pub fn system_host() -> Option<String> {
+    let from_file = std::fs::read_to_string("/etc/hostname").ok();
+    let from_env = std::env::var("HOSTNAME").ok();
+    from_file
+        .into_iter()
+        .chain(from_env)
+        .filter_map(|raw| {
+            let short = raw.trim().split('.').next().unwrap_or("").trim().to_owned();
+            (!short.is_empty()).then_some(short)
+        })
+        .next()
+}
+
+/// A host name has to survive being half of `host:root`, so it may not
+/// contain the separator — nor a slash, which would let it forge a path.
+fn check_host_name(what: &str, name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.contains(':') || name.contains('/') {
+        bail!("{what} {name:?} must be non-empty and free of ':' and '/'");
+    }
+    Ok(())
 }
 
 fn default_bind() -> SocketAddr {
@@ -216,12 +309,33 @@ impl Config {
         let deny =
             Arc::new(DenyList::new(builtin, &globs).context("building the security deny list")?);
 
+        let host = match &self.server.host {
+            Some(h) => h.trim().to_owned(),
+            None => system_host().unwrap_or_default(),
+        };
+        check_host_name("host", &host).context(
+            "kaed could not determine this host's name, and every root name is \
+             prefixed with it — set `host` under [server] in config.toml",
+        )?;
+        tracing::info!(
+            host,
+            configured = self.server.host.is_some(),
+            "serving roots under this host name"
+        );
+
         let mut roots = Vec::new();
         for r in &self.roots {
-            if r.name.is_empty() || r.name.contains('/') {
-                bail!("root name {:?} must be non-empty and slash-free", r.name);
+            if r.name.is_empty() || r.name.contains('/') || r.name.contains(':') {
+                bail!(
+                    "root name {:?} must be non-empty and free of '/' and ':' — declare \
+                     the local name only; kaed prefixes it with the host",
+                    r.name
+                );
             }
-            if roots.iter().any(|x: &ResolvedRoot| x.name == r.name) {
+            // Qualified from here on: this is what tools match, what `roots`
+            // advertises, and what lands in the journal (D-6).
+            let name = format!("{host}:{}", r.name);
+            if roots.iter().any(|x: &ResolvedRoot| x.name == name) {
                 bail!("duplicate root name {:?}", r.name);
             }
             let expanded = expand_home(&r.path);
@@ -245,7 +359,9 @@ impl Config {
                 );
             }
             roots.push(ResolvedRoot {
-                name: r.name.clone(),
+                name,
+                local_name: r.name.clone(),
+                host: host.clone(),
                 path: canonical,
                 description: r.description.clone(),
                 deny: deny.clone(),
@@ -268,11 +384,14 @@ impl Config {
             }
         }
         let identities = resolve_identities(&self.auth);
+        let peers = self.resolve_peers(&host)?;
 
         Ok(Resolved {
             bind: self.server.bind,
             allowed_hosts: self.server.allowed_hosts.clone(),
+            host,
             roots,
+            peers,
             identities,
             limits: self.limits,
             journal_path,
@@ -280,6 +399,51 @@ impl Config {
             deny,
             auth: self.auth.clone(),
         })
+    }
+
+    /// Validate `[peers]` into the declared fleet. `None` in, `None` out:
+    /// an absent table is the `never-declared` state and must stay
+    /// distinguishable from an empty one, which asserts that this host is
+    /// the whole fleet (D-4).
+    fn resolve_peers(&self, host: &str) -> anyhow::Result<Option<Vec<Peer>>> {
+        let Some(declared) = &self.peers else {
+            tracing::warn!(
+                "no [peers] table in config: this host declares no fleet, so `roots` \
+                 reports fleet.declared = false and an absent host means nothing"
+            );
+            return Ok(None);
+        };
+        let mut peers = Vec::new();
+        for (name, p) in declared {
+            check_host_name("peer name", name)?;
+            if name == host {
+                bail!(
+                    "peer {name:?} is this host: [peers] declares the *rest* of the \
+                     fleet, and this instance's own entry is derived from what it serves"
+                );
+            }
+            match p.status {
+                PeerStatus::Deferred if p.reference.is_none() => bail!(
+                    "peer {name:?}: status \"deferred\" needs `ref` — a host declared \
+                     deliberately absent with no pointer to the reasoning is the gap \
+                     korg #930 was filed about"
+                ),
+                PeerStatus::Unreachable if p.since.is_none() => bail!(
+                    "peer {name:?}: status \"unreachable\" needs `since` — an undated \
+                     outage cannot be told apart from a stale declaration"
+                ),
+                _ => {}
+            }
+            peers.push(Peer {
+                host: name.clone(),
+                status: p.status,
+                reference: p.reference.clone(),
+                note: p.note.clone(),
+                since: p.since.clone(),
+                url: p.url.clone(),
+            });
+        }
+        Ok(Some(peers))
     }
 }
 
@@ -344,12 +508,30 @@ fn read_token_quiet(path: &str) -> Option<String> {
     read_token(path)
 }
 
+/// One validated fleet member. The declaration only — whether the host is
+/// *actually* serving is a separate question this instance cannot answer
+/// until peer mode (korg:1050), and conflating the two would rebuild #930.
+#[derive(Debug, Clone)]
+pub struct Peer {
+    pub host: String,
+    pub status: PeerStatus,
+    pub reference: Option<String>,
+    pub note: Option<String>,
+    pub since: Option<String>,
+    pub url: Option<String>,
+}
+
 /// The validated runtime view of the config.
 #[derive(Debug)]
 pub struct Resolved {
     pub bind: SocketAddr,
     pub allowed_hosts: Vec<String>,
+    /// This instance's fleet name; the prefix on every root name it serves.
+    pub host: String,
     pub roots: Vec<ResolvedRoot>,
+    /// The declared fleet, minus this host. `None` means no `[peers]` table
+    /// at all — never-declared, not "no peers".
+    pub peers: Option<Vec<Peer>>,
     pub identities: Vec<Identity>,
     pub limits: Limits,
     pub journal_path: PathBuf,
@@ -362,7 +544,14 @@ pub struct Resolved {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRoot {
+    /// Host-qualified — `kai:src`. This is what tools take, what `roots`
+    /// advertises, and what the journal records.
     pub name: String,
+    /// The name as declared in `config.toml`, without the host. Kept so an
+    /// agent that passed the old unqualified form gets told what to pass
+    /// instead (D-2) rather than a bare `not_found`.
+    pub local_name: String,
+    pub host: String,
     /// Canonicalized; the jail boundary for every path under this root.
     pub path: PathBuf,
     pub description: Option<String>,
@@ -372,10 +561,18 @@ pub struct ResolvedRoot {
 
 impl ResolvedRoot {
     /// A root that denies nothing — for tests and for callers that build a
-    /// root outside `Config::resolve`.
+    /// root outside `Config::resolve`. `name` is taken as already qualified
+    /// if it carries a host, and qualified under `local` otherwise.
     pub fn unrestricted(name: impl Into<String>, path: PathBuf) -> ResolvedRoot {
+        let name = name.into();
+        let (host, local_name) = match name.split_once(':') {
+            Some((h, l)) => (h.to_owned(), l.to_owned()),
+            None => ("local".to_owned(), name.clone()),
+        };
         ResolvedRoot {
-            name: name.into(),
+            name,
+            local_name,
+            host,
             path,
             description: None,
             deny: Arc::new(DenyList::empty()),
@@ -580,6 +777,140 @@ mod tests {
             err.to_string().contains("refused by the deny list"),
             "{err}"
         );
+    }
+
+    /// The 007 rename: config declares the local name, the server serves it
+    /// host-qualified, and both halves stay addressable for error messages.
+    #[test]
+    fn roots_are_served_host_qualified() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[server]\nhost = \"kai\"\n[[roots]]\nname = \"src\"\npath = \"{}\"\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let r = cfg.resolve(None).unwrap();
+        assert_eq!(r.host, "kai");
+        assert_eq!(r.roots[0].name, "kai:src");
+        assert_eq!(r.roots[0].local_name, "src");
+        assert_eq!(r.roots[0].host, "kai");
+    }
+
+    #[test]
+    fn an_unset_host_falls_back_to_the_short_system_hostname() {
+        // Zero-touch upgrade (D-1): kai and kubs0 gain qualified names on
+        // restart without anyone editing a config install.sh won't overwrite.
+        let Some(sys) = system_host() else {
+            return; // no /etc/hostname and no $HOSTNAME: nothing to assert
+        };
+        assert!(!sys.contains('.'), "{sys:?} should be the short form");
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[[roots]]\nname = \"src\"\npath = \"{}\"\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let r = cfg.resolve(None).unwrap();
+        assert_eq!(r.host, sys);
+        assert_eq!(r.roots[0].name, format!("{sys}:src"));
+    }
+
+    #[test]
+    fn a_root_name_may_not_carry_its_own_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg: Config = toml::from_str(&format!(
+            "[server]\nhost = \"kai\"\n[[roots]]\nname = \"kai:src\"\npath = \"{}\"\n",
+            dir.path().display()
+        ))
+        .unwrap();
+        let err = cfg.resolve(None).unwrap_err();
+        assert!(
+            err.to_string().contains("declare the local name only"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_unusable_host_name_is_refused_rather_than_prefixed_onto_everything() {
+        for bad in ["", "  ", "kai:2", "a/b"] {
+            let cfg: Config = toml::from_str(&format!("[server]\nhost = \"{bad}\"\n")).unwrap();
+            let err = cfg.resolve(None).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("[server]") || format!("{err:#}").contains("host"),
+                "host {bad:?}: {err:#}"
+            );
+        }
+    }
+
+    /// PD-5's three states start here: an absent `[peers]` table is
+    /// `never-declared` and must not read as "the fleet is just me".
+    #[test]
+    fn an_absent_peers_table_is_never_declared_not_an_empty_fleet() {
+        let no_table: Config = toml::from_str("[server]\nhost = \"kai\"\n").unwrap();
+        assert!(no_table.resolve(None).unwrap().peers.is_none());
+
+        let empty: Config = toml::from_str("[server]\nhost = \"kai\"\n[peers]\n").unwrap();
+        assert_eq!(empty.resolve(None).unwrap().peers.unwrap().len(), 0);
+    }
+
+    #[test]
+    fn peers_parse_into_the_declared_fleet() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            host = "kai"
+
+            [peers.kubs0]
+            status = "active"
+            url = "https://kubs0.example:4870/mcp"
+
+            [peers.kubsdb]
+            status = "deferred"
+            ref = "korg:929"
+            note = "broad-access design not settled"
+            "#,
+        )
+        .unwrap();
+        let peers = cfg.resolve(None).unwrap().peers.unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].host, "kubs0");
+        assert_eq!(peers[0].status, PeerStatus::Active);
+        assert_eq!(peers[1].status, PeerStatus::Deferred);
+        assert_eq!(peers[1].reference.as_deref(), Some("korg:929"));
+        assert_eq!(
+            peers[1].note.as_deref(),
+            Some("broad-access design not settled")
+        );
+    }
+
+    /// D-5: a status has to carry its own evidence, or the declaration is
+    /// just the doc-that-lives-nowhere problem in a new file.
+    #[test]
+    fn deferred_needs_a_ref_and_unreachable_needs_a_since() {
+        let no_ref: Config =
+            toml::from_str("[server]\nhost = \"kai\"\n[peers.x]\nstatus = \"deferred\"\n").unwrap();
+        let err = no_ref.resolve(None).unwrap_err();
+        assert!(err.to_string().contains("needs `ref`"), "{err}");
+
+        let no_since: Config =
+            toml::from_str("[server]\nhost = \"kai\"\n[peers.x]\nstatus = \"unreachable\"\n")
+                .unwrap();
+        let err = no_since.resolve(None).unwrap_err();
+        assert!(err.to_string().contains("needs `since`"), "{err}");
+
+        let ok: Config = toml::from_str(
+            "[server]\nhost = \"kai\"\n[peers.x]\nstatus = \"unreachable\"\nsince = \"2026-08-07\"\n",
+        )
+        .unwrap();
+        assert!(ok.resolve(None).is_ok());
+    }
+
+    #[test]
+    fn a_peer_may_not_be_this_host() {
+        let cfg: Config =
+            toml::from_str("[server]\nhost = \"kai\"\n[peers.kai]\nstatus = \"active\"\n").unwrap();
+        let err = cfg.resolve(None).unwrap_err();
+        assert!(err.to_string().contains("is this host"), "{err}");
     }
 
     #[test]

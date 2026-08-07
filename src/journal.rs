@@ -436,6 +436,34 @@ mod tests {
         assert_eq!((added, removed), (2, 1));
     }
 
+    /// D-6, the dated boundary #1049 has to detect. From sprint 007 every
+    /// journalled `root` is host-qualified. Rows written before it are not,
+    /// and kai's journal already holds five naming a root (`home`) that
+    /// sprint 002 removed — so `journal`/`diff`/`revert` must be built to
+    /// *label* an unresolvable historical root, never to rewrite the row or
+    /// alias the name back into existence.
+    #[test]
+    fn a_transaction_journals_the_host_qualified_root_name() {
+        let j = Journal::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = ResolvedRoot::unrestricted("kai:src", dir.path().canonicalize().unwrap());
+        let id = j
+            .begin(
+                "claude",
+                None,
+                &root,
+                &[record("f.txt", None, "x\n", None, "v000000000000000")],
+            )
+            .unwrap();
+        j.complete(id).unwrap();
+
+        let stored: String = j
+            .lock()
+            .query_row("SELECT root FROM txns WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, "kai:src");
+    }
+
     #[test]
     fn pending_scan_reports_torn_txns_with_files() {
         let j = Journal::open_in_memory().unwrap();

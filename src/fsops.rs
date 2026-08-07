@@ -241,6 +241,14 @@ pub struct ListResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
+    /// Entries the walk produced before `glob` filtered them. Always
+    /// present, including zero: an empty `entries` with 41 scanned is a
+    /// glob that selected nothing, and with 0 scanned is an empty subtree.
+    pub entries_scanned: usize,
+    /// Why the result is empty, when the emptiness is more likely to be the
+    /// caller's scoping than the truth about the tree (korg #1066).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<EmptyReason>,
     /// Entries the deny list hid (a hidden directory counts once, with its
     /// subtree). Omitted when zero — present so a filtered listing is never
     /// mistaken for the whole directory.
@@ -250,6 +258,88 @@ pub struct ListResult {
 
 fn is_zero(n: &usize) -> bool {
     *n == 0
+}
+
+/// Why an enumerating tool came back empty, when the emptiness is probably
+/// self-inflicted. The sibling of `denied_hidden`: both exist so a filtered
+/// result is never mistaken for the whole picture (R3, R7).
+///
+/// `hint` is built from the call's own `glob` and `path` rather than
+/// describing the rule in the abstract — the report that produced this
+/// (korg #1066) came from an agent that had read the accurate parameter
+/// docs and still drew the wrong conclusion from a zero.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct EmptyReason {
+    pub code: &'static str,
+    pub hint: String,
+}
+
+/// What an enumerating walk actually looked at, so an honest zero can be
+/// told from a self-inflicted one. `list` fills `candidates`/`kept`;
+/// `search` fills all three, since it can also skip a glob-matched file for
+/// being binary or over the size limit.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ScopeTally {
+    /// Produced by the walk, before `glob`.
+    pub candidates: usize,
+    /// …of those, admitted by `glob`.
+    pub kept: usize,
+    /// …of those, actually opened and read.
+    pub opened: usize,
+}
+
+impl ScopeTally {
+    /// The diagnosis, or `None` when the zero is genuine and there is
+    /// nothing useful to add.
+    pub fn explain(&self, glob: Option<&str>, path: &str) -> Option<EmptyReason> {
+        let scope = if path.is_empty() {
+            "the root".to_owned()
+        } else {
+            format!("{path:?}")
+        };
+        if self.candidates == 0 {
+            return Some(EmptyReason {
+                code: "no_files_under_path",
+                hint: format!(
+                    "nothing was scanned: {scope} contains no readable entries (or they \
+                     are all gitignored — pass `ignored: true` to include them)."
+                ),
+            });
+        }
+        if let Some(g) = glob
+            && self.kept == 0
+        {
+            let anchored = if path.is_empty() {
+                format!("no path under the root matched `glob` {g:?}")
+            } else {
+                format!(
+                    "`glob` is matched against ROOT-relative paths and is not re-anchored \
+                     by `path`, so with path {path:?} the glob {g:?} could only ever match \
+                     at the root's top level — try {:?} or {:?}",
+                    format!("{}/{}", path.trim_end_matches('/'), g),
+                    format!("**/{g}"),
+                )
+            };
+            return Some(EmptyReason {
+                code: "glob_matched_no_files",
+                hint: format!(
+                    "{} of {} scanned entries matched: {anchored}.",
+                    self.kept, self.candidates
+                ),
+            });
+        }
+        if self.kept > 0 && self.opened == 0 {
+            return Some(EmptyReason {
+                code: "all_files_skipped",
+                hint: format!(
+                    "{} file(s) matched but none could be searched — all were binary, \
+                     over `max_file_bytes`, or unreadable.",
+                    self.kept
+                ),
+            });
+        }
+        None
+    }
 }
 
 pub struct ListParams<'a> {
@@ -285,6 +375,7 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
     // walk never calls resolve_existing per entry, so a resolver-only check
     // would still enumerate denied paths.
     let denied_hidden = Arc::new(AtomicUsize::new(0));
+    let mut tally = ScopeTally::default();
     let mut entries = Vec::new();
     let walker = {
         let deny = root.deny.clone();
@@ -320,11 +411,13 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             .unwrap_or(abs)
             .to_string_lossy()
             .into_owned();
+        tally.candidates += 1;
         if let Some(m) = &matcher
             && !m.is_match(&rel_to_root)
         {
             continue;
         }
+        tally.kept += 1;
         let meta = entry
             .metadata()
             .map_err(|e| KaedError::internal(e.to_string()))?;
@@ -350,10 +443,18 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
     let total = entries.len();
     let page: Vec<ListEntry> = entries.into_iter().skip(p.offset).take(p.max).collect();
     let truncated = p.offset + page.len() < total;
+    // Only when nothing matched at all: an empty *page* past the end is
+    // already explained by `next_offset`, and diagnosing it as a scoping
+    // mistake would be the wrong answer confidently given.
+    tally.opened = tally.kept;
     Ok(ListResult {
         next_offset: truncated.then_some(p.offset + page.len()),
         entries: page,
         truncated,
+        entries_scanned: tally.candidates,
+        reason: (total == 0)
+            .then(|| tally.explain(p.glob, p.path))
+            .flatten(),
         denied_hidden: denied_hidden.load(Ordering::Relaxed),
     })
 }
@@ -896,6 +997,55 @@ mod tests {
         .unwrap();
         assert_eq!(page2.entries.len(), 1);
         assert!(!page2.truncated);
+        // A page past the end is explained by pagination, not by scoping —
+        // diagnosing it as a bad glob would be a confident wrong answer.
+        assert!(page2.reason.is_none());
+    }
+
+    /// `list` has #1066's trap too — the same root-relative `glob`, the same
+    /// `path` scoping, and an empty `entries` that reads as "empty directory"
+    /// (D-7).
+    #[test]
+    fn list_explains_an_empty_result_it_caused_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "ai/kaed/README.md", "");
+        write(dir.path(), "ai/kaed/src/main.rs", "");
+        let root = test_root(dir.path());
+        let scoped = |glob| ListParams {
+            path: "ai/kaed",
+            glob,
+            depth: 3,
+            max: 100,
+            offset: 0,
+            ignored: false,
+        };
+
+        let trap = list(&root, &scoped(Some("README.md"))).unwrap();
+        assert!(trap.entries.is_empty());
+        assert_eq!(trap.entries_scanned, 3, "src/, src/main.rs, README.md");
+        let reason = trap
+            .reason
+            .expect("an empty listing this shape explains itself");
+        assert_eq!(reason.code, "glob_matched_no_files");
+        assert!(reason.hint.contains("ai/kaed/README.md"), "{}", reason.hint);
+
+        let fixed = list(&root, &scoped(Some("**/README.md"))).unwrap();
+        assert_eq!(fixed.entries.len(), 1);
+        assert_eq!(fixed.entries_scanned, 3);
+        assert!(fixed.reason.is_none());
+
+        // A directory that really is empty says that instead.
+        std::fs::create_dir_all(dir.path().join("void")).unwrap();
+        let empty = list(
+            &root,
+            &ListParams {
+                path: "void",
+                ..scoped(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(empty.entries_scanned, 0);
+        assert_eq!(empty.reason.unwrap().code, "no_files_under_path");
     }
 
     #[test]

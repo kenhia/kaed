@@ -269,6 +269,14 @@ run "install -d -m 0700 '$CONFIG_DIR'"
 CONFIG_IS_NEW=0
 if [ -f "$CONFIG_DST" ]; then
     note "config exists, left untouched: $CONFIG_DST"
+    # An existing config predates the [peers] block, and this script will
+    # not add one — but a fleet that is silently undeclared is the gap
+    # korg #930 was filed about, so say it out loud rather than letting a
+    # green deploy imply the declaration landed too.
+    if ! grep -q '^\[peers' "$CONFIG_DST"; then
+        note "no [peers] in $CONFIG_DST: this host declares no fleet, so"
+        note "  \`roots\` reports fleet.declared=false. See config.example.toml."
+    fi
 else
     CONFIG_IS_NEW=1
     run "install -m 0600 '$ASSET_DIR/config.example.toml' '$CONFIG_DST'"

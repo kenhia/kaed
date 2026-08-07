@@ -47,10 +47,37 @@ async fn main() -> anyhow::Result<()> {
             println!("config: {}", path.display());
             let resolved = load(Some(path))?;
             println!("bind: {}", resolved.bind);
+            println!("host: {}", resolved.host);
             println!("roots:");
             for r in &resolved.roots {
                 let desc = r.description.as_deref().unwrap_or("");
-                println!("  {:<12} {}  {}", r.name, r.path.display(), desc);
+                println!("  {:<20} {}  {}", r.name, r.path.display(), desc);
+            }
+            // The same answer `roots` gives an agent, for whoever is on the
+            // host with a shell instead of an MCP client (korg #930).
+            match &resolved.peers {
+                None => println!(
+                    "fleet: UNDECLARED — no [peers] table in this config, so nothing here \
+                     says which hosts should run kaed"
+                ),
+                Some(peers) => {
+                    println!("fleet:");
+                    println!("  {:<20} {:<12} (this host)", resolved.host, "active");
+                    for p in peers {
+                        let why = p
+                            .reference
+                            .as_deref()
+                            .or(p.since.as_deref())
+                            .map(|s| format!("({s}) "))
+                            .unwrap_or_default();
+                        println!(
+                            "  {:<20} {:<12} declared, unverified {why}{}",
+                            p.host,
+                            p.status.as_str(),
+                            p.note.as_deref().unwrap_or("")
+                        );
+                    }
+                }
             }
             println!("identities:");
             for id in &resolved.identities {

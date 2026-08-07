@@ -10,6 +10,13 @@
 [server]
 bind = "127.0.0.1:4870"
 
+# This instance's name in the fleet, and the prefix on every root name it
+# serves: root `src` is addressed as `kai:src`. Defaults to the short system
+# hostname, which is almost always what you want — set it only if this host
+# is known to the fleet by some other name. kaed logs the name it resolved
+# and refuses to start if it cannot find one.
+# host = "kai"
+
 # Host header values accepted beyond loopback. The MCP layer validates
 # `Host` as a DNS-rebinding guard, BEFORE auth runs — so behind a proxy an
 # unlisted hostname gives you a 4xx that looks nothing like an auth problem.
@@ -28,6 +35,9 @@ allowed_hosts = [
 # ~/.config/kaed/env returned the very bearer token gating the service.
 # Name the directories holding work you actually want an agent editing.
 
+# Declare the LOCAL name only. kaed prefixes it with `host`, so `src` below
+# is served — and journaled — as `kai:src`.
+
 [[roots]]
 name = "src"
 path = "~/src"
@@ -37,6 +47,39 @@ description = "code repos"
 name = "scratch"
 path = "~/scratch"
 description = "scratch space"
+
+# ---------------------------------------------------------------- peers
+#
+# The declared fleet: every OTHER host that should — or deliberately should
+# not — run kaed. Surfaced in the `roots` response, which is the one place
+# an agent already looks, and reported by `kaed check-config` for whoever
+# has a shell instead of an MCP client.
+#
+# Why here and not in a repo file: config.toml is *installed*, not cloned.
+# It is present on hosts with no checkout, it survives reinstalls, and it is
+# not a gitignored file that ends up living nowhere.
+#
+# LEAVE THE TABLE OUT ENTIRELY and kaed reports `fleet.declared: false` —
+# an honest "this host claims nothing", so a missing entry proves nothing.
+# Write it, and every absence becomes meaningful. That is the point:
+#
+#   status = "active"       should be serving. (Not verified until peer
+#                           mode — kaed does not probe peers yet.)
+#   status = "deferred"     deliberately WITHOUT an instance. Requires
+#                           `ref`. This is the entry that stops an agent
+#                           reading a decision as a broken rollout and
+#                           "fixing" it.
+#   status = "unreachable"  should be serving and is known not to be.
+#                           Requires `since`.
+#
+# [peers.otherhost]
+# status = "active"
+# url    = "https://otherhost.example.ts.net:4870/mcp"
+#
+# [peers.dbhost]
+# status = "deferred"
+# ref    = "korg:929"
+# note   = "broad-access design not settled; sits next to the datastore"
 
 # ----------------------------------------------------------------- auth
 #

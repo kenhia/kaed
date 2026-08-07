@@ -46,7 +46,7 @@ Six tools over streamable HTTP with per-agent bearer auth:
 
 | tool | what it does |
 |---|---|
-| `roots` | list the configured workspace roots |
+| `roots` | the workspace roots this host serves, plus the declared fleet |
 | `stat` | metadata + content version — the cheap staleness probe |
 | `list` | directory entries, gitignore-aware, paginated |
 | `read` | whole file, a line range, or a window around a line or unique anchor |

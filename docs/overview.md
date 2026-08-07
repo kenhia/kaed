@@ -163,7 +163,10 @@ whom, so a human's edits and several agents' edits stay mutually visible.
 
 **Early beta.** Six tools — `roots`, `stat`, `list`, `read`, `search`, `edit`
 — running on a small fleet of hosts, dogfooded daily, with the full
-verified-write loop working end to end from a remote agent.
+verified-write loop working end to end from a remote agent. Roots are
+host-qualified (`kai:src`), and `roots` also reports the **declared fleet**:
+which hosts should run kaed, including the ones deliberately without an
+instance.
 
 Four sprints in:
 

@@ -2,7 +2,7 @@
 //! an rmcp client — the worked example from the contract, conflict path
 //! included.
 
-use kaed::config::{AuthEntry, Identity, Limits, Resolved, ResolvedRoot};
+use kaed::config::{AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use kaed::fsops;
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientInfo};
@@ -11,6 +11,10 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use serde_json::{Value, json};
 
 const TOKEN: &str = "test-token-claude";
+/// This instance's fleet name, and therefore the prefix on every root name
+/// it serves. Roots have been host-qualified since sprint 007.
+const HOST: &str = "testhost";
+const ROOT: &str = "testhost:scratch";
 
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -46,10 +50,40 @@ async fn start_server_with(
     let resolved = Resolved {
         bind: "127.0.0.1:0".parse()?,
         allowed_hosts: vec![],
+        host: HOST.into(),
         roots: vec![ResolvedRoot {
             description: Some("test root".into()),
-            ..ResolvedRoot::unrestricted("scratch", workdir_path.clone())
+            ..ResolvedRoot::unrestricted(ROOT, workdir_path.clone())
         }],
+        // A fleet with one of each declared status, so the three states
+        // korg #930 turns on are exercised end to end and not just in unit
+        // tests of the config parser.
+        peers: Some(vec![
+            Peer {
+                host: "peer-active".into(),
+                status: PeerStatus::Active,
+                reference: None,
+                note: None,
+                since: None,
+                url: Some("https://peer-active.example:4870/mcp".into()),
+            },
+            Peer {
+                host: "peer-deferred".into(),
+                status: PeerStatus::Deferred,
+                reference: Some("korg:929".into()),
+                note: Some("broad-access design not settled".into()),
+                since: None,
+                url: None,
+            },
+            Peer {
+                host: "peer-down".into(),
+                status: PeerStatus::Unreachable,
+                reference: None,
+                note: None,
+                since: Some("2026-08-07".into()),
+                url: None,
+            },
+        ]),
         identities,
         limits: Limits::default(),
         journal_path: workdir_path.join("journal.db"),
@@ -223,17 +257,17 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let server = start_server().await?;
     let client = connect(&server).await?;
 
-    // roots
+    // roots — host-qualified since sprint 007
     let roots = client
         .call_tool(CallToolRequestParams::new("roots"))
         .await?;
-    assert_eq!(structured(&roots)["roots"][0]["name"], "scratch");
+    assert_eq!(structured(&roots)["roots"][0]["name"], ROOT);
 
     // 1. search — the hit carries the version
     let search = client
         .call_tool(
             CallToolRequestParams::new("search")
-                .with_arguments(args(json!({"root": "scratch", "pattern": "old_name"}))),
+                .with_arguments(args(json!({"root": ROOT, "pattern": "old_name"}))),
         )
         .await?;
     let s = structured(&search);
@@ -245,7 +279,7 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let read = client
         .call_tool(
             CallToolRequestParams::new("read").with_arguments(args(json!({
-                "root": "scratch", "path": "hello.txt",
+                "root": ROOT, "path": "hello.txt",
                 "window": {"anchor": "old_name", "context": 1}
             }))),
         )
@@ -258,7 +292,7 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let edit = client
         .call_tool(
             CallToolRequestParams::new("edit").with_arguments(args(json!({
-                "root": "scratch",
+                "root": ROOT,
                 "base": [{"path": "hello.txt", "version": version}],
                 "ops": [{"op": "anchor_replace", "path": "hello.txt",
                          "old_text": "old_name", "new_text": "new_name"}],
@@ -287,7 +321,7 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let stale = client
         .call_tool(
             CallToolRequestParams::new("edit").with_arguments(args(json!({
-                "root": "scratch",
+                "root": ROOT,
                 "base": [{"path": "hello.txt", "version": version}],
                 "ops": [{"op": "anchor_replace", "path": "hello.txt",
                          "old_text": "new_name", "new_text": "third_name"}]
@@ -302,6 +336,147 @@ async fn core_loop_and_conflict_path() -> anyhow::Result<()> {
     let delta = err["data"]["delta"].as_str().unwrap();
     assert!(delta.contains("-fn old_name() {"), "delta: {delta}");
     assert!(delta.contains("+fn new_name() {"), "delta: {delta}");
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// korg #930: "which hosts should run kaed, and do they" must be answerable
+/// from the tool surface, without reading korg history — and a host that is
+/// deliberately without an instance must not look like a failed rollout.
+#[tokio::test]
+async fn roots_answers_which_hosts_should_run_kaed() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    let r = structured(
+        &client
+            .call_tool(CallToolRequestParams::new("roots"))
+            .await?,
+    );
+    assert_eq!(r["host"], HOST);
+
+    let root = &r["roots"][0];
+    assert_eq!(root["name"], ROOT);
+    assert_eq!(root["host"], HOST);
+    assert_eq!(root["status"], "active");
+    // the union, per-root — never the intersection
+    assert!(
+        root["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("edit"))
+    );
+
+    let fleet = &r["fleet"];
+    assert_eq!(fleet["declared"], true);
+    let hosts = fleet["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 4, "self plus three declared peers");
+
+    // Only the instance answering the call reports an observed status.
+    assert_eq!(hosts[0]["host"], HOST);
+    assert_eq!(hosts[0]["self"], true);
+    assert_eq!(hosts[0]["verified"], true);
+    assert_eq!(hosts[0]["roots"][0], ROOT);
+    assert!(hosts[0]["version"].as_str().is_some());
+
+    let by_host = |name: &str| {
+        hosts
+            .iter()
+            .find(|h| h["host"] == name)
+            .expect("declared host present")
+            .clone()
+    };
+    // The three states stay apart, and each carries its own evidence.
+    let deferred = by_host("peer-deferred");
+    assert_eq!(deferred["status"], "deferred");
+    assert_eq!(deferred["ref"], "korg:929");
+    assert_eq!(deferred["verified"], false);
+
+    let down = by_host("peer-down");
+    assert_eq!(down["status"], "unreachable");
+    assert_eq!(down["since"], "2026-08-07");
+
+    let active = by_host("peer-active");
+    assert_eq!(active["status"], "active");
+    // declared, not observed: this sprint proxies nothing and probes nothing
+    assert_eq!(active["verified"], false);
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The other half of #930: the agent that assumed rather than asked never
+/// reads `roots`, it reads the error. Each wrong `root` gets the remedy that
+/// belongs to it (D-2).
+#[tokio::test]
+async fn a_wrong_root_name_gets_the_remedy_that_belongs_to_it() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    let stat = |root: &str| {
+        let client = &client;
+        let root = root.to_string();
+        async move {
+            let out = client
+                .call_tool(
+                    CallToolRequestParams::new("stat")
+                        .with_arguments(args(json!({"root": root, "path": ""}))),
+                )
+                .await
+                .expect("tool call completes");
+            assert_eq!(out.is_error, Some(true), "root {root:?} should fail");
+            let v = structured(&out);
+            assert_eq!(v["code"], "not_found");
+            v
+        }
+    };
+
+    // the pre-007 spelling: name the replacement rather than shrugging
+    let unqualified = stat("scratch").await;
+    assert_eq!(unqualified["data"]["reason"], "unqualified_root");
+    assert_eq!(unqualified["data"]["did_you_mean"], ROOT);
+
+    // right host, wrong root
+    assert_eq!(
+        stat("testhost:nope").await["data"]["reason"],
+        "unknown_root"
+    );
+
+    // A deferred host is the case that got #930 filed: an agent read the
+    // absence as a broken deploy and was one step from "fixing" it.
+    let deferred = stat("peer-deferred:src").await;
+    assert_eq!(deferred["data"]["reason"], "host_deferred");
+    assert_eq!(deferred["data"]["ref"], "korg:929");
+    // two machines in one payload: which is which must not be inferred
+    assert_eq!(deferred["data"]["target_host"], "peer-deferred");
+    assert_eq!(deferred["data"]["this_host"], HOST);
+    assert!(
+        deferred["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a broken deploy"),
+        "{}",
+        deferred["message"]
+    );
+
+    let down = stat("peer-down:src").await;
+    assert_eq!(down["data"]["reason"], "host_unreachable");
+    assert_eq!(down["data"]["since"], "2026-08-07");
+
+    // declared and up, but this instance does not proxy yet
+    assert_eq!(
+        stat("peer-active:src").await["data"]["reason"],
+        "peer_routing_unavailable"
+    );
+
+    // never declared — distinct from deferred, which is the whole point
+    assert_eq!(
+        stat("wat:src").await["data"]["reason"],
+        "host_never_declared"
+    );
 
     let _ = client.cancel().await;
     server.ct.cancel();
@@ -327,7 +502,7 @@ async fn structured_errors_reach_the_agent() -> anyhow::Result<()> {
     let escape = client
         .call_tool(
             CallToolRequestParams::new("read")
-                .with_arguments(args(json!({"root": "scratch", "path": "../etc/passwd"}))),
+                .with_arguments(args(json!({"root": ROOT, "path": "../etc/passwd"}))),
         )
         .await?;
     assert_eq!(escape.is_error, Some(true));
@@ -339,7 +514,7 @@ async fn structured_errors_reach_the_agent() -> anyhow::Result<()> {
     let ambiguous = client
         .call_tool(
             CallToolRequestParams::new("edit").with_arguments(args(json!({
-                "root": "scratch",
+                "root": ROOT,
                 "base": [{"path": "dup.txt", "version": v}],
                 "ops": [{"op": "anchor_replace", "path": "dup.txt",
                          "old_text": "x", "new_text": "y"}]
@@ -364,7 +539,7 @@ async fn dry_run_multi_file_create() -> anyhow::Result<()> {
     let dry = client
         .call_tool(
             CallToolRequestParams::new("edit").with_arguments(args(json!({
-                "root": "scratch",
+                "root": ROOT,
                 "ops": [
                     {"op": "create", "path": "a/new.txt", "content": "one\n"},
                     {"op": "create", "path": "b/run.sh", "content": "#!/bin/sh\n",
@@ -381,7 +556,7 @@ async fn dry_run_multi_file_create() -> anyhow::Result<()> {
     let real = client
         .call_tool(
             CallToolRequestParams::new("edit").with_arguments(args(json!({
-                "root": "scratch",
+                "root": ROOT,
                 "ops": [
                     {"op": "create", "path": "a/new.txt", "content": "one\n"},
                     {"op": "create", "path": "b/run.sh", "content": "#!/bin/sh\n",
