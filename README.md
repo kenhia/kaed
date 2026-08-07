@@ -51,7 +51,7 @@ Six tools over streamable HTTP with per-agent bearer auth:
 | `list` | directory entries, gitignore-aware, paginated |
 | `read` | whole file, a line range, or a window around a line or unique anchor |
 | `search` | ripgrep-grade, every hit carrying its file's version |
-| `edit` | anchor/range replace + create; multi-file, atomic, `dry_run` |
+| `edit` | anchor/range replace + create + typed dotenv ops; multi-file, atomic, `dry_run` |
 
 The bet underneath them is **verified writes**:
 
@@ -69,6 +69,17 @@ version it recorded an hour ago and either succeed or get a precise conflict.
 
 Every applied transaction — and every *failed* attempt — is journaled with the
 identity that made it and an optional `intent` note.
+
+Secret-bearing files (`.env` and friends) are **classified, not denied**:
+`read` serves them redacted — each value becomes a sealed
+`⟨kaed:KEY@digest⟩` placeholder, line-for-line with the raw file — and
+`edit` takes typed env ops (`env_set`, `env_rename`, `env_delete`,
+`env_reorder`) where passing a placeholder as a value writes the real value
+back. The agent edits a secrets file without ever holding a secret. Diffs,
+conflict deltas, search hits and journal blobs are redacted too; destroying
+a value must be declared (`drop_keys`); and a gitignore-shaped
+`.kaedignore` (or an in-file `# kaedignore` marker) opts paths out of kaed
+entirely. There is deliberately no reveal operation.
 
 **Deliberately absent:** no exec/shell tool, and no git tool. An agent that
 can already run commands does not need kaed to run them, and keeping them out
@@ -130,7 +141,7 @@ Uses the [kproject](https://github.com/kenhia/kprojects) minimal harness.
 ```sh
 just                          # list recipes
 just check                    # CI gates: fmt --check, clippy -D warnings, tests
-cargo run -- check-config     # validate config, print roots + deny rules
+cargo run -- check-config     # validate config, print roots + deny/classify rules
 cargo run -- serve            # run the daemon
 ```
 

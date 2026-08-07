@@ -33,6 +33,33 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// Which policy layer refused a path (D-5). One wire code (`denied`) for
+/// all of them — agents already know `denied` is permanent and not worth
+/// retrying — with the layer, and its remedy, in `data`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// `[security] deny` or a built-in. Changing it is a human's call.
+    ServerDenylist,
+    /// A `.kaedignore` in the tree; the data names the file.
+    Kaedignore,
+    /// The file opts out via a `kaedignore` comment in its first lines.
+    InFileMarker,
+    /// Classified secret-bearing, and not dotenv-shaped, so kaed has no
+    /// redacted surface to serve for it.
+    ClassifiedOpaque,
+    /// `.kaedignore` files are policy and cannot be written through kaed.
+    KaedignoreProtected,
+}
+
+impl fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // serde's snake_case rename is the single source of the wire name
+        let s = serde_json::to_value(self).expect("RefusalReason serializes");
+        f.write_str(s.as_str().expect("RefusalReason is a string"))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct KaedError {
     pub code: ErrorCode,
@@ -73,14 +100,24 @@ impl KaedError {
         Self::new(ErrorCode::OutsideRoot, message)
     }
 
-    /// A path the deny list refuses. Distinct from `outside_root` because
-    /// the remedy differs: no path correction makes this one work.
-    pub fn denied(path: &str, rule: &str) -> Self {
+    /// A refusal. Distinct from `outside_root` because the remedy differs:
+    /// no path correction makes this one work. Every refusal carries a
+    /// structured `reason` naming which policy layer refused, and a `hint`
+    /// saying what to do instead — a refusal with no alternative is how an
+    /// agent ends up routing around kaed via ssh, and then the journal
+    /// loses the edit too (D-5).
+    pub fn refused(path: &str, rule: &str, reason: RefusalReason, hint: impl Into<String>) -> Self {
+        let hint = hint.into();
         Self::new(
             ErrorCode::Denied,
-            format!("{path}: refused by the server's deny list (rule: {rule})"),
+            format!("{path}: refused ({reason}, rule: {rule}) — {hint}"),
         )
-        .with_data(serde_json::json!({ "path": path, "rule": rule }))
+        .with_data(serde_json::json!({
+            "path": path,
+            "rule": rule,
+            "reason": reason,
+            "hint": hint,
+        }))
     }
 
     pub fn invalid_input(message: impl Into<String>) -> Self {

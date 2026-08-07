@@ -110,13 +110,26 @@ retention_days = 7
 
 # ------------------------------------------------------------- security
 #
-# Extends the built-in defaults (.ssh, .gnupg, .aws, .env, *.pem, id_*, …),
-# which already cover kaed's own config and journal directories
-# unconditionally. A path is refused if it or any ancestor matches.
+# Two lists with different teeth (sprint 008):
 #
-# These two are not built-in defaults but have earned their place on every
-# host this project runs on: a directory literally named `secrets`, and
-# private key material that does not happen to end in `.pem`.
+#   deny     — hard refusal. Built-in defaults cover credential *stores*
+#              (.ssh, .gnupg, .aws, .netrc, …) plus kaed's own config and
+#              journal directories unconditionally.
+#   classify — served REDACTED instead of refused. Built-in defaults cover
+#              secret-bearing *files* (.env, *.env, *.pem, id_*,
+#              credentials*, *.kdbx). Dotenv-shaped classified files get a
+#              redacted read (values become ⟨kaed:KEY@digest⟩ placeholders)
+#              and typed env ops; other classified files refuse with a
+#              structured reason. Heuristics classify; only explicit deny
+#              entries hard-refuse.
+#
+# A path matches either list if it or any ancestor matches. There is also a
+# third, in-repo layer: a gitignore-shaped `.kaedignore` at any level of a
+# root denies paths beneath it (readable through kaed, never writable).
+#
+# These deny entries are not built-in defaults but have earned their place
+# on every host this project runs on: a directory literally named
+# `secrets`, and private key material that does not happen to end in `.pem`.
 #
 # Write `**/secrets`, NOT `**/secrets/**`. A path is denied if it or any
 # ancestor matches, so the bare form covers the directory *and* everything
@@ -128,3 +141,5 @@ deny = [
     "**/secrets",
     "**/*.key",
 ]
+# classify = ["**/service.conf"]   # extra redaction targets, same shapes
+# use_default_classify = true      # the built-in classify list above

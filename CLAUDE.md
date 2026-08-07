@@ -110,7 +110,19 @@ fails, and what the journal structurally cannot tell you — see
   `fsops::resolve_existing`/`resolve_creatable` cover *addressed* paths;
   `list` and `search` walk directories themselves and each need their own
   `filter_entry` check. Any new tool that enumerates rather than addresses
-  needs one too — see `src/deny.rs` and R7 in the contract.
+  needs one too — see `src/deny.rs` and R7 in the contract. Since 008 the
+  `.kaedignore` layer rides the same three places (`src/policy.rs`), and
+  the in-file `kaedignore` marker is checked wherever content is *opened*
+  (`load_text`, `search`) — `list` cannot see it by design.
+- **Secrets are classified, not denied, since 008** (R9 in the contract;
+  `sprints/008-secrets-model/decisions.md`). `.env`-shaped files read
+  redacted (`⟨kaed:KEY@digest⟩` placeholders — BLAKE3 + entropy floor,
+  PD-2, never HMAC) and are edited via typed env ops on the `edit` tool;
+  every derived surface (diff, conflict delta, search hits, journal blobs)
+  is redacted too, and `search` runs over the redacted rendering, so a
+  value probe matches nothing by construction. Destroying a value needs
+  `drop_keys`; there is deliberately no `reveal` and no plaintext shadow —
+  do not add either without reopening D-11/#1051.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

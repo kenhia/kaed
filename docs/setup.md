@@ -281,6 +281,8 @@ the other is the bug this feature exists to prevent.
 | `journal.retention_days` | Blob content retention. Metadata is kept forever. |
 | `security.deny` | Extra deny globs, matched against absolute paths. |
 | `security.use_default_deny` | Set `false` to drop the built-in glob defaults. kaed's own directories stay refused regardless. |
+| `security.classify` | Extra *classification* globs: matching files are secret-bearing but served **redacted** (dotenv-shaped files get placeholders and typed env ops) rather than refused. |
+| `security.use_default_classify` | Set `false` to drop the built-in classify defaults (`.env*`, `*.env`, `*.pem`, `id_*`, `credentials*`, `*.kdbx`). |
 
 ### Validate it
 

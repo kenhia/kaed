@@ -98,6 +98,10 @@ async fn main() -> anyhow::Result<()> {
             for rule in resolved.deny.describe() {
                 println!("  {rule}");
             }
+            println!("classified paths (served redacted, or refused if not dotenv-shaped):");
+            for rule in resolved.classify.describe() {
+                println!("  {rule}");
+            }
             Ok(())
         }
     }

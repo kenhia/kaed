@@ -100,6 +100,15 @@ pub struct SecurityConfig {
     /// journal stay refused either way.
     #[serde(default = "default_true")]
     pub use_default_deny: bool,
+    /// Extra classification globs: secret-bearing, but served redacted
+    /// rather than refused (dotenv-shaped files get the typed surface;
+    /// anything else refuses with `classified_opaque`). Only explicit
+    /// `deny` hard-refuses — heuristics classify (D-1).
+    #[serde(default)]
+    pub classify: Vec<String>,
+    /// Apply `policy::DEFAULT_CLASSIFY` on top of `classify`.
+    #[serde(default = "default_true")]
+    pub use_default_classify: bool,
 }
 
 impl Default for SecurityConfig {
@@ -107,6 +116,8 @@ impl Default for SecurityConfig {
         Self {
             deny: Vec::new(),
             use_default_deny: true,
+            classify: Vec::new(),
+            use_default_classify: true,
         }
     }
 }
@@ -309,6 +320,19 @@ impl Config {
         let deny =
             Arc::new(DenyList::new(builtin, &globs).context("building the security deny list")?);
 
+        let mut classify_globs = self.security.classify.clone();
+        if self.security.use_default_classify {
+            classify_globs.extend(
+                crate::policy::DEFAULT_CLASSIFY
+                    .iter()
+                    .map(|s| (*s).to_string()),
+            );
+        }
+        let classify = Arc::new(
+            crate::policy::Classifier::new(&classify_globs)
+                .context("building the classification list")?,
+        );
+
         let host = match &self.server.host {
             Some(h) => h.trim().to_owned(),
             None => system_host().unwrap_or_default(),
@@ -365,6 +389,7 @@ impl Config {
                 path: canonical,
                 description: r.description.clone(),
                 deny: deny.clone(),
+                classify: classify.clone(),
             });
         }
 
@@ -397,6 +422,7 @@ impl Config {
             journal_path,
             journal_retention_days: self.journal.retention_days,
             deny,
+            classify,
             auth: self.auth.clone(),
         })
     }
@@ -537,6 +563,7 @@ pub struct Resolved {
     pub journal_path: PathBuf,
     pub journal_retention_days: u32,
     pub deny: Arc<DenyList>,
+    pub classify: Arc<crate::policy::Classifier>,
     /// Where each identity's token lives, kept so SIGHUP can re-read them
     /// without reparsing the config file.
     pub auth: BTreeMap<String, AuthEntry>,
@@ -557,6 +584,8 @@ pub struct ResolvedRoot {
     pub description: Option<String>,
     /// Shared across every root: paths refused inside the jail, too.
     pub deny: Arc<DenyList>,
+    /// Shared across every root: paths served redacted, not plain.
+    pub classify: Arc<crate::policy::Classifier>,
 }
 
 impl ResolvedRoot {
@@ -576,6 +605,24 @@ impl ResolvedRoot {
             path,
             description: None,
             deny: Arc::new(DenyList::empty()),
+            classify: Arc::new(crate::policy::Classifier::empty()),
+        }
+    }
+
+    /// `unrestricted`, but with the default classification rules — the
+    /// test-side stand-in for a `Config::resolve`d root.
+    pub fn with_default_classify(name: impl Into<String>, path: PathBuf) -> ResolvedRoot {
+        ResolvedRoot {
+            classify: Arc::new(
+                crate::policy::Classifier::new(
+                    &crate::policy::DEFAULT_CLASSIFY
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .expect("default classify globs build"),
+            ),
+            ..ResolvedRoot::unrestricted(name, path)
         }
     }
 }

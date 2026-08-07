@@ -7,7 +7,9 @@
 
 use crate::addr;
 use crate::config::{Limits, ResolvedRoot};
-use crate::errors::{KaedError, Result};
+use crate::dotenv;
+use crate::errors::{KaedError, RefusalReason, Result};
+use crate::policy;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::io::Write;
@@ -57,11 +59,39 @@ fn clean_rel(rel: &str) -> Result<PathBuf> {
 /// filesystem is touched, so a denied name answers the same whether or not
 /// it exists, and again on the resolved target, so a symlink cannot walk
 /// into a denied directory.
+///
+/// Two layers, in order of absoluteness: the server deny list, then any
+/// `.kaedignore` between the root and the path. The in-file marker and
+/// classification are content-level and live in `load_text`.
 pub fn check_denied(root: &ResolvedRoot, rel: &str, abs: &Path) -> Result<()> {
-    match root.deny.denied_by(abs) {
-        Some(rule) => Err(KaedError::denied(rel, &rule)),
-        None => Ok(()),
+    if let Some(rule) = root.deny.denied_by(abs) {
+        return Err(KaedError::refused(
+            rel,
+            &rule,
+            RefusalReason::ServerDenylist,
+            "permanent server policy ([security] deny in kaed's config, or a built-in); \
+             no retry or path variation will succeed — if the file is genuinely needed, \
+             a human must change the config",
+        ));
     }
+    if let Some(m) = policy::kaedignore_denied(&root.path, abs) {
+        let file = m
+            .file
+            .strip_prefix(&root.path)
+            .unwrap_or(&m.file)
+            .display()
+            .to_string();
+        return Err(KaedError::refused(
+            rel,
+            &m.pattern,
+            RefusalReason::Kaedignore,
+            format!(
+                "denied by {file} in this root — read that file for the policy; \
+                 it can only be changed outside kaed"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve a path that must already exist. Canonicalizes (so symlinks
@@ -151,6 +181,10 @@ pub struct StatResult {
     /// RFC 3339, second precision.
     pub modified: String,
     pub binary: bool,
+    /// Classified secret-bearing: `read` will serve it redacted (dotenv)
+    /// or refuse with `classified_opaque`. Lexical, like the deny list.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub classified: bool,
 }
 
 pub fn stat(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<StatResult> {
@@ -194,6 +228,7 @@ pub fn stat(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<StatResul
         executable: meta.permissions().mode() & 0o111 != 0,
         modified,
         binary: false,
+        classified: root.classify.classified_by(&abs).is_some(),
     };
     if kind == EntryKind::File && meta.len() <= limits.max_file_bytes {
         let bytes = std::fs::read(&abs)?;
@@ -373,12 +408,15 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
 
     // The deny check has to happen here as well as in the resolver: this
     // walk never calls resolve_existing per entry, so a resolver-only check
-    // would still enumerate denied paths.
+    // would still enumerate denied paths. `.kaedignore` denials are the
+    // same layer (R7) and use the same counter; markers are content-level
+    // and invisible to `list`, which never opens files (D-4).
     let denied_hidden = Arc::new(AtomicUsize::new(0));
     let mut tally = ScopeTally::default();
     let mut entries = Vec::new();
     let walker = {
         let deny = root.deny.clone();
+        let kaedignore = policy::KaedignoreCache::new(root.path.clone());
         let counter = denied_hidden.clone();
         ignore::WalkBuilder::new(&base)
             .max_depth(Some(p.depth))
@@ -392,7 +430,7 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
                 if e.file_name() == ".git" {
                     return false;
                 }
-                if deny.is_denied(e.path()) {
+                if deny.is_denied(e.path()) || kaedignore.denied(e.path()).is_some() {
                     counter.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -470,6 +508,9 @@ pub struct LineRange {
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct ReadResult {
     pub content: String,
+    /// Always the **raw** file's version — a content address of the bytes
+    /// on disk (R1), valid as an edit base even when `content` is a
+    /// redacted view.
     pub version: String,
     /// The lines actually returned (1-based, inclusive).
     pub range: LineRange,
@@ -477,6 +518,19 @@ pub struct ReadResult {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
+    /// True when `content` is the redacted rendering of a classified file:
+    /// values replaced by sealed placeholders, line-for-line with the raw
+    /// file, so ranges, anchors and line numbers all still hold (D-7).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub redacted: bool,
+    /// The typed per-entry view (whole-file reads of classified dotenv).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dotenv: Option<Vec<dotenv::EntryView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_hint: Option<&'static str>,
+    /// e.g. a classified file that is not gitignored (D-12).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 pub enum ReadMode<'a> {
@@ -484,6 +538,20 @@ pub enum ReadMode<'a> {
     Range { start: usize, end: usize },
     WindowLine { line: usize, context: usize },
     WindowAnchor { anchor: &'a str, context: usize },
+}
+
+/// What the policy layers decided about a loaded file's content.
+#[derive(Debug)]
+pub enum Secrecy {
+    Plain,
+    /// Classified secret-bearing and dotenv-shaped: serve it redacted.
+    /// Carries the parse so callers never re-derive it. Classified files
+    /// that are *not* dotenv-shaped never load at all — `load_text`
+    /// refuses them with `classified_opaque` (D-2).
+    ClassifiedDotenv {
+        rule: String,
+        file: dotenv::DotenvFile,
+    },
 }
 
 /// A file loaded through the jail: resolved location, exact content, and
@@ -495,10 +563,14 @@ pub struct Loaded {
     pub version: String,
     /// Unix permission bits, for mode preservation on edit.
     pub mode: u32,
+    pub secrecy: Secrecy,
 }
 
-/// Load a file through the jail as UTF-8 text, enforcing size and binary
-/// rules. The version is over the raw bytes, usable as an edit base.
+/// Load a file through the jail as UTF-8 text, enforcing size, binary,
+/// marker, and classification rules. The version is over the raw bytes,
+/// usable as an edit base. **This is the choke point for content-level
+/// policy**: a caller holding a `Loaded` either has a plain file or knows
+/// it holds a classified dotenv it must serve redacted.
 pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Loaded> {
     let abs = resolve_existing(root, rel)?;
     let meta = std::fs::metadata(&abs)?;
@@ -513,19 +585,64 @@ pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Load
         )));
     }
     let bytes = std::fs::read(&abs)?;
-    if looks_binary(&bytes) {
-        return Err(KaedError::is_binary(format!("{rel}: binary file")));
-    }
     let version = version_of(&bytes);
-    let content = String::from_utf8(bytes)
-        .map_err(|_| KaedError::is_binary(format!("{rel}: not valid UTF-8")))?;
+    let classified = root.classify.classified_by(&abs);
+    let text = if looks_binary(&bytes) {
+        Err(KaedError::is_binary(format!("{rel}: binary file")))
+    } else {
+        String::from_utf8(bytes)
+            .map_err(|_| KaedError::is_binary(format!("{rel}: not valid UTF-8")))
+    };
+    let content = match (text, &classified) {
+        (Ok(c), _) => c,
+        // a classified binary (.kdbx, .p12) gets the refusal that explains,
+        // not a bare is_binary
+        (Err(_), Some(rule)) => return Err(classified_opaque(rel, rule)),
+        (Err(e), None) => return Err(e),
+    };
+    if policy::has_ignore_marker(&content) {
+        return Err(KaedError::refused(
+            rel,
+            "in-file `kaedignore` marker",
+            RefusalReason::InFileMarker,
+            "the file opts out of kaed via a `kaedignore` comment in its first 5 lines; \
+             edit it outside kaed if that is wrong",
+        ));
+    }
+    let secrecy = match classified {
+        None => Secrecy::Plain,
+        Some(rule) => match dotenv::parse(&content) {
+            Some(file) => Secrecy::ClassifiedDotenv { rule, file },
+            None => return Err(classified_opaque(rel, &rule)),
+        },
+    };
     Ok(Loaded {
         abs,
         content,
         version,
         mode: meta.permissions().mode(),
+        secrecy,
     })
 }
+
+fn classified_opaque(rel: &str, rule: &str) -> KaedError {
+    KaedError::refused(
+        rel,
+        rule,
+        RefusalReason::ClassifiedOpaque,
+        "classified as secret-bearing and not dotenv-shaped, so kaed has no redacted \
+         surface for it; if the content is genuinely needed, use your shell — and \
+         consider whether a reference to the file would do instead",
+    )
+}
+
+/// The hint carried on every redacted read: the common paths that feel
+/// like they need plaintext usually don't (shipped without `reveal` to
+/// measure how much pressure for it actually materialises — PD-1/#1051).
+const USAGE_HINT: &str = "values are sealed placeholders; you rarely need plaintext. To *use* a value in a \
+     shell: `set -a; . <file>; set +a`, then reference $KEY. To *edit*, use the env ops \
+     (env_set / env_rename / env_delete / env_reorder) — a placeholder passed as a value \
+     is substituted with the real value on write.";
 
 pub fn read(
     root: &ResolvedRoot,
@@ -535,9 +652,56 @@ pub fn read(
     max_bytes: Option<usize>,
     limits: &Limits,
 ) -> Result<ReadResult> {
-    let Loaded {
-        content, version, ..
-    } = load_text(root, rel, limits)?;
+    let loaded = load_text(root, rel, limits)?;
+    match &loaded.secrecy {
+        Secrecy::Plain => slice_lines(
+            &loaded.content,
+            rel,
+            &loaded.version,
+            mode,
+            numbered,
+            max_bytes,
+            limits,
+        ),
+        Secrecy::ClassifiedDotenv { file, .. } => {
+            // the redacted rendering is line-for-line with the raw file
+            // (D-7), so every read mode works over it unchanged; the
+            // version stays the raw file's — it is the edit base
+            let redacted = file.redact();
+            let mut out = slice_lines(
+                &redacted,
+                rel,
+                &loaded.version,
+                mode,
+                numbered,
+                max_bytes,
+                limits,
+            )?;
+            out.redacted = true;
+            if matches!(mode, ReadMode::Whole) {
+                out.dotenv = Some(file.entries());
+            }
+            out.usage_hint = Some(USAGE_HINT);
+            out.warnings
+                .extend(policy::gitignore_warning(&loaded.abs, rel));
+            Ok(out)
+        }
+    }
+}
+
+/// The shaped-read engine: range/window/budget math over `content`, which
+/// is either a file's raw text or its redacted rendering. `rel` is for
+/// error messages only.
+fn slice_lines(
+    content: &str,
+    rel: &str,
+    version: &str,
+    mode: &ReadMode,
+    numbered: bool,
+    max_bytes: Option<usize>,
+    limits: &Limits,
+) -> Result<ReadResult> {
+    let version = version.to_owned();
     let budget = max_bytes
         .unwrap_or(limits.max_read_bytes)
         .min(limits.max_read_bytes);
@@ -578,7 +742,7 @@ pub fn read(
             window(line, context, total_lines)
         }
         ReadMode::WindowAnchor { anchor, context } => {
-            let hit = addr::resolve_anchor(&content, anchor, None, rel)?;
+            let hit = addr::resolve_anchor(content, anchor, None, rel)?;
             window(hit.line, context, total_lines)
         }
     };
@@ -592,6 +756,10 @@ pub fn read(
             total_lines: 0,
             truncated: false,
             next_offset: None,
+            redacted: false,
+            dotenv: None,
+            usage_hint: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -645,6 +813,10 @@ pub fn read(
         total_lines,
         truncated,
         next_offset: (included_end < end && !cut_mid_line).then_some(included_end + 1),
+        redacted: false,
+        dotenv: None,
+        usage_hint: None,
+        warnings: Vec::new(),
     })
 }
 
@@ -1310,5 +1482,198 @@ mod tests {
         promote(&staged).unwrap();
         let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755);
+    }
+
+    // ------------------------------------------------ secrets model (008)
+
+    const ENV: &str = "# service\nKLAMS_TOKEN=b7f3a9d2c8e14f60b7f3a9d2c8e14f60\nDEBUG=true\n";
+
+    fn classified_root(dir: &Path) -> ResolvedRoot {
+        ResolvedRoot::with_default_classify("t", dir.canonicalize().unwrap())
+    }
+
+    #[test]
+    fn read_of_a_classified_dotenv_is_redacted_and_carries_the_raw_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", ENV);
+        let root = classified_root(dir.path());
+        let r = read(
+            &root,
+            ".env",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(r.redacted);
+        assert!(
+            !r.content.contains("b7f3a9d2c8e14f60b7f3a9d2c8e14f60"),
+            "value leaked: {}",
+            r.content
+        );
+        assert!(r.content.contains("⟨kaed:KLAMS_TOKEN@"), "{}", r.content);
+        assert!(r.content.contains("⟨kaed:DEBUG⟩"), "{}", r.content);
+        // R1: the version is a content address of the bytes on disk — the
+        // redacted view has no identity of its own, and this version is
+        // directly usable as an edit base
+        assert_eq!(r.version, version_of(ENV.as_bytes()));
+        assert_eq!(r.total_lines, 3);
+        let entries = r.dotenv.expect("whole-file read carries the typed view");
+        assert_eq!(entries[0].key, "KLAMS_TOKEN");
+        assert_eq!(entries[0].meta.shape, "hex");
+        assert!(r.usage_hint.unwrap().contains("set -a"));
+    }
+
+    /// D-7: redaction is line-preserving, so shaped reads keep meaning.
+    #[test]
+    fn shaped_reads_of_redacted_content_keep_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", ENV);
+        let root = classified_root(dir.path());
+        let r = read(
+            &root,
+            ".env",
+            &ReadMode::Range { start: 2, end: 2 },
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(r.redacted);
+        assert!(r.content.starts_with("KLAMS_TOKEN=⟨kaed:"), "{}", r.content);
+        assert_eq!((r.range.start, r.range.end), (2, 2));
+        assert!(r.dotenv.is_none(), "typed view only on whole-file reads");
+
+        // anchors resolve against the redacted text (which is what the
+        // agent saw); "DEBUG" alone would be ambiguous — it appears in the
+        // key AND inside its own placeholder ⟨kaed:DEBUG⟩
+        let by_anchor = read(
+            &root,
+            ".env",
+            &ReadMode::WindowAnchor {
+                anchor: "DEBUG=",
+                context: 0,
+            },
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!((by_anchor.range.start, by_anchor.range.end), (3, 3));
+    }
+
+    /// D-5: every refusal names its policy layer and what to do instead.
+    #[test]
+    fn refusals_carry_their_reason_and_a_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "opted-out.txt", "# kaedignore\ncontent\n");
+        write(
+            dir.path(),
+            "server.pem",
+            "-----BEGIN CERTIFICATE-----\nMIIB\n",
+        );
+        write(dir.path(), ".kaedignore", "private/\n");
+        write(dir.path(), "private/notes.md", "x");
+        let root = classified_root(dir.path());
+
+        let reason_of = |err: &KaedError| {
+            let d = err.data.as_ref().unwrap();
+            (
+                d["reason"].as_str().unwrap().to_owned(),
+                d["hint"].as_str().unwrap().to_owned(),
+            )
+        };
+
+        let marker = read(
+            &root,
+            "opted-out.txt",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(marker.code, crate::errors::ErrorCode::Denied);
+        let (reason, hint) = reason_of(&marker);
+        assert_eq!(reason, "in_file_marker");
+        assert!(hint.contains("first 5 lines"), "{hint}");
+
+        let opaque = read(
+            &root,
+            "server.pem",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        let (reason, hint) = reason_of(&opaque);
+        assert_eq!(reason, "classified_opaque");
+        assert!(hint.contains("shell"), "{hint}");
+
+        let ignored = read(
+            &root,
+            "private/notes.md",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        let (reason, hint) = reason_of(&ignored);
+        assert_eq!(reason, "kaedignore");
+        assert!(hint.contains(".kaedignore"), "{hint}");
+
+        // …and the policy file itself stays readable, so the hint works
+        assert!(
+            read(
+                &root,
+                ".kaedignore",
+                &ReadMode::Whole,
+                false,
+                None,
+                &Limits::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn stat_reports_classification_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".env", ENV);
+        write(dir.path(), "plain.txt", "x\n");
+        let root = classified_root(dir.path());
+        assert!(stat(&root, ".env", &Limits::default()).unwrap().classified);
+        assert!(
+            !stat(&root, "plain.txt", &Limits::default())
+                .unwrap()
+                .classified
+        );
+    }
+
+    #[test]
+    fn list_hides_kaedignore_denied_entries_and_counts_them() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".kaedignore", "private/\n");
+        write(dir.path(), "private/journal.md", "x");
+        write(dir.path(), "kept.txt", "x");
+        let root = classified_root(dir.path());
+        let out = list(
+            &root,
+            &ListParams {
+                path: "",
+                glob: None,
+                depth: 3,
+                max: 100,
+                offset: 0,
+                ignored: true,
+            },
+        )
+        .unwrap();
+        let paths: Vec<_> = out.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, [".kaedignore", "kept.txt"]);
+        assert_eq!(out.denied_hidden, 1, "the pruned subtree counts once");
     }
 }

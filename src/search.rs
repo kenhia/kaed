@@ -8,8 +8,10 @@
 //! and truncation are deterministic.
 
 use crate::config::{Limits, ResolvedRoot};
+use crate::dotenv;
 use crate::errors::{KaedError, Result};
 use crate::fsops;
+use crate::policy;
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkContextKind, SinkMatch};
@@ -46,11 +48,17 @@ pub struct SearchResult {
     /// caller's `glob`/`path` than the truth about the tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<fsops::EmptyReason>,
-    /// Files the deny list kept out of the search entirely. Omitted when
-    /// zero — "no matches" and "no matches in what I was allowed to read"
-    /// are different answers.
+    /// Files the deny list (or a `.kaedignore`, or an in-file marker) kept
+    /// out of the search entirely. Omitted when zero — "no matches" and
+    /// "no matches in what I was allowed to read" are different answers.
     #[serde(skip_serializing_if = "is_zero")]
     pub denied_hidden: usize,
+    /// Classified files with no redacted surface, skipped whole. Sibling
+    /// of `denied_hidden`, same R7 honesty rule. Classified *dotenv* files
+    /// are not counted here: they are searched, over their redacted
+    /// rendering (D-8).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub classified_hidden: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -95,6 +103,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
     } else {
         let walker = {
             let deny = root.deny.clone();
+            let kaedignore = policy::KaedignoreCache::new(root.path.clone());
             let counter = denied_hidden.clone();
             ignore::WalkBuilder::new(&base)
                 .hidden(false)
@@ -102,7 +111,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
                     if e.file_name() == ".git" {
                         return false;
                     }
-                    if deny.is_denied(e.path()) {
+                    if deny.is_denied(e.path()) || kaedignore.denied(e.path()).is_some() {
                         counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return false;
                     }
@@ -127,6 +136,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
 
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut classified_hidden = 0usize;
     let mut tally = fsops::ScopeTally {
         candidates: files.len(),
         ..Default::default()
@@ -152,22 +162,51 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         let Ok(bytes) = std::fs::read(abs) else {
             continue;
         };
-        if fsops::looks_binary(&bytes) {
+        let text = if fsops::looks_binary(&bytes) {
+            None
+        } else {
+            std::str::from_utf8(&bytes).ok()
+        };
+        // in-file marker: the file opted out — same deny layer, same count
+        if text.is_some_and(policy::has_ignore_marker) {
+            denied_hidden.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
+        }
+        // Classified files are never searched raw. Dotenv-shaped ones are
+        // searched over the same redacted rendering `read` serves — so a
+        // pattern probing for a secret's *value* matches nothing, by
+        // construction rather than by filtering (D-8). The rest are
+        // skipped whole and counted.
+        let searched: std::borrow::Cow<'_, [u8]>;
+        let mut version = None;
+        if root.classify.classified_by(abs).is_some() {
+            let Some(file) = text.and_then(dotenv::parse) else {
+                classified_hidden += 1;
+                continue;
+            };
+            // the version each hit carries stays the RAW file's — it is a
+            // content address of the bytes on disk, and the edit base (R1)
+            version = Some(fsops::version_of(&bytes));
+            searched = std::borrow::Cow::Owned(file.redact().into_bytes());
+        } else {
+            if text.is_none() {
+                continue; // binary or non-UTF-8, skipped like ripgrep
+            }
+            searched = std::borrow::Cow::Borrowed(&bytes);
         }
         tally.opened += 1;
         let mut sink = CollectSink {
             matcher: &matcher,
             rel: &rel,
-            version: None,
-            bytes: &bytes,
+            version,
+            bytes: &searched,
             matches: &mut matches,
             before_buf: Vec::new(),
             budget: p.max_results,
             hit_budget: false,
         };
         searcher
-            .search_slice(&matcher, &bytes, &mut sink)
+            .search_slice(&matcher, &searched, &mut sink)
             .map_err(|e| KaedError::internal(format!("{rel}: {e}")))?;
         if sink.hit_budget {
             truncated = true;
@@ -184,6 +223,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         truncated,
         files_searched: tally.opened,
         denied_hidden: denied_hidden.load(std::sync::atomic::Ordering::Relaxed),
+        classified_hidden,
     })
 }
 
@@ -524,6 +564,91 @@ mod tests {
         let (_dir, root) = setup();
         let err = search(&root, &params("(unclosed"), &Limits::default()).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    // ------------------------------------------------ secrets model (008)
+
+    fn classified_root(dir: &Path) -> ResolvedRoot {
+        ResolvedRoot::with_default_classify("t", dir.canonicalize().unwrap())
+    }
+
+    /// D-8: search runs over the redacted rendering, so a probe for a
+    /// secret's VALUE matches nothing — the oracle is dead by construction,
+    /// not by result filtering.
+    #[test]
+    fn classified_dotenv_is_searched_redacted_and_value_probes_find_nothing() {
+        let (dir, _) = setup();
+        const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+        write(
+            dir.path(),
+            ".env",
+            &format!("KLAMS_TOKEN={VALUE}\nDEBUG=true\n"),
+        );
+        write(
+            dir.path(),
+            "notes.md",
+            &format!("the value {VALUE} leaked here\n"),
+        );
+        let root = classified_root(dir.path());
+
+        // probing for the value: only the plain file answers
+        let probe = search(&root, &params(VALUE), &Limits::default()).unwrap();
+        let paths: Vec<_> = probe.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["notes.md"], "the .env was searched, redacted");
+        assert_eq!(probe.files_searched, 2, "the .env WAS opened and searched");
+
+        // searching for the key: the hit shows the placeholder, never the
+        // value, and carries the RAW file's version as its edit base
+        let by_key = search(&root, &params("KLAMS_TOKEN"), &Limits::default()).unwrap();
+        let hit = by_key
+            .matches
+            .iter()
+            .find(|m| m.path == ".env")
+            .expect("keys are searchable");
+        assert!(hit.text.contains("⟨kaed:KLAMS_TOKEN@"), "{}", hit.text);
+        assert!(!hit.text.contains(VALUE));
+        let raw = std::fs::read(dir.path().join(".env")).unwrap();
+        assert_eq!(hit.version, fsops::version_of(&raw));
+    }
+
+    #[test]
+    fn opaque_classified_files_are_skipped_whole_and_counted() {
+        let (dir, _) = setup();
+        write(
+            dir.path(),
+            "server.pem",
+            "-----BEGIN CERTIFICATE-----\nneedle\n",
+        );
+        write(dir.path(), "plain.txt", "needle\n");
+        let root = classified_root(dir.path());
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["plain.txt"]);
+        assert_eq!(r.classified_hidden, 1);
+        assert_eq!(r.files_searched, 1);
+    }
+
+    #[test]
+    fn marker_files_are_skipped_and_counted_with_the_denied() {
+        let (dir, root) = setup();
+        write(dir.path(), "opted-out.txt", "# kaedignore\nneedle\n");
+        write(dir.path(), "plain.txt", "needle\n");
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["plain.txt"]);
+        assert_eq!(r.denied_hidden, 1);
+    }
+
+    #[test]
+    fn kaedignore_denied_files_are_not_searched() {
+        let (dir, root) = setup();
+        write(dir.path(), ".kaedignore", "private/\n");
+        write(dir.path(), "private/notes.md", "needle\n");
+        write(dir.path(), "plain.txt", "needle\n");
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["plain.txt"]);
+        assert_eq!(r.denied_hidden, 1);
     }
 
     #[test]

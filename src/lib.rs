@@ -6,10 +6,13 @@
 pub mod addr;
 pub mod config;
 pub mod deny;
+pub mod dotenv;
 pub mod errors;
 pub mod fsops;
 pub mod journal;
+pub mod policy;
 pub mod search;
+pub mod secrets;
 pub mod server;
 pub mod txn;
 pub mod version;

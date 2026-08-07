@@ -40,7 +40,11 @@ const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 /// the gateway brainstorm is to advertise the **union** with per-root
 /// capabilities — never the intersection, which silently hides working
 /// features on the most-updated host.
-const ROOT_CAPABILITIES: &[&str] = &["stat", "list", "read", "search", "edit"];
+///
+/// `secrets` (008): classified files are served redacted and take env ops.
+/// A host without it would refuse env ops at deserialization, so a
+/// mid-upgrade fleet needs the flag to route by.
+const ROOT_CAPABILITIES: &[&str] = &["stat", "list", "read", "search", "edit", "secrets"];
 
 /// The authenticated author identity, set by the auth middleware and read
 /// by mutating tools for journal attribution.
@@ -363,6 +367,12 @@ pub struct EditParams {
     pub return_diff: bool,
     /// Journaled note on why this edit was made.
     pub intent: Option<String>,
+    /// Keys in classified dotenv files whose values this edit may destroy.
+    /// A write that makes a value vanish (delete, or overwrite by a new
+    /// literal) refuses unless its key is named here — the value may never
+    /// have been seen and cannot be restored.
+    #[serde(default)]
+    pub drop_keys: Vec<String>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -580,7 +590,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Transactional edit: anchor_replace / range_replace / create ops, multi-file, atomic — all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Supports dry_run."
+        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Supports dry_run."
     )]
     async fn edit(
         &self,
@@ -601,6 +611,7 @@ impl KaedServer {
                 dry_run: p.dry_run,
                 return_diff: p.return_diff,
                 intent: p.intent,
+                drop_keys: p.drop_keys,
             };
             txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
         })
@@ -636,9 +647,19 @@ impl ServerHandler for KaedServer {
              expires and stays valid across your restarts, reconnects and \
              token rotations, so a version you recorded long ago is still a \
              usable base — no defensive re-read. Prefer `window` reads and \
-             anchors over whole-file reads. Some paths are refused by the \
-             server's deny list: `denied` is permanent, don't retry it, and \
-             `denied_hidden` on list/search counts what was filtered out. \
+             anchors over whole-file reads. Some paths are refused: `denied` \
+             is permanent, don't retry it — its data carries a `reason` \
+             (server_denylist, kaedignore, in_file_marker, classified_opaque) \
+             and a `hint` naming what to do instead. `denied_hidden` on \
+             list/search counts what was filtered out. Secret-bearing files \
+             (.env and friends) are *classified*, not denied: `read` serves \
+             them redacted — values become sealed `⟨kaed:KEY@digest⟩` \
+             placeholders, line-for-line with the raw file — and `edit` \
+             takes typed env ops (env_set/env_rename/env_delete/env_reorder) \
+             where a placeholder passed as a value writes the real value \
+             back. You rarely need plaintext: to *use* a value in a shell, \
+             `set -a; . .env; set +a` and reference $KEY. Destroying a value \
+             requires naming its key in `drop_keys`. \
              `list` and `search` also report `files_searched`: zero there \
              means your `glob`/`path` selected nothing, not that the pattern \
              is absent — `glob` matches root-relative paths, so it is not \
