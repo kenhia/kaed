@@ -43,17 +43,27 @@ kaed — "Ken's Agent Editor": an editor whose only user is an AI agent. No
 human UI. A Rust daemon exposes reading/searching/editing files as an HTTP
 MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
-attributed journal on each homelab host (kai, kubs0, kubsdb).
+attributed journal on each host that runs it (today: kai and kubs0).
 
-**Status: v0 live on kai + kubs0** (sprints 001–004, 2026-08-03):
+**Status: v0 live on kai + kubs0** (sprints 001–006, 2026-08-06):
 `roots`/`stat`/`list`/`read`/`search`/`edit` over streamable HTTP with
 bearer auth; journal records successes *and* failures; history read tools
 not yet. **kubsdb deliberately has no instance** (korg #929) — if you find
-none there, that is correct, not a broken rollout. The design lives in
-`sprints/planning/` — read `summary.md` first, then `mcp-contract.md`
-before touching server code. 002's changes are already applied to the
-contract; `sprints/00{1,2}-*/contract-notes.md` record the reasoning
-behind them.
+none there, that is correct, not a broken rollout. The fleet installs a
+published bundle from the package store (005) — **no host but kai has a
+checkout**, so any instruction to `git pull` on a host is wrong.
+
+The design lives in `sprints/planning/` — read `summary.md` first, then
+`mcp-contract.md` before touching server code. 002's changes are already
+applied to the contract; `sprints/00{1,2}-*/contract-notes.md` record the
+reasoning behind them. **Cross-sprint decisions are in
+`sprints/planning/decisions.md` as `PD-n`** (distinct from the per-sprint
+`D-n`); PD-1 sequences the next nine slices as korg program 1063.
+
+For how the tool is actually used in practice — what agents edit, what
+fails, and what the journal structurally cannot tell you — see
+`docs/agent-usage-report-2026-08-06.md`; re-run it with
+`scripts/journal-report.py`.
 
 - Build/test: `just check` (`cargo fmt --check`, `clippy --all-targets
   -D warnings`, `cargo test`) — run and pass it before shipping.

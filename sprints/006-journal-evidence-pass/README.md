@@ -28,11 +28,26 @@ ones, and #1046 needs to know where friction clusters.
 
 ## The headline
 
-**kaed is in real, sustained use, and in practice it is a documentation editor.**
-81% of file touches are `.md`/`.html`, line churn is 16:1 additive, kubs0 is
-100% markdown, and *no Rust source file has ever been edited through kaed
-outside the two verification fixtures* — in a homelab whose most active projects
-are Rust.
+**kaed is doing the job it exists for, and what it edits is overwhelmingly
+documentation.** 81% of file touches are `.md`/`.html`, line churn is 16:1
+additive, kubs0 is 100% markdown, and *no Rust source file has ever been edited
+through kaed outside the two verification fixtures* — in a homelab whose most
+active projects are Rust.
+
+Those two clauses are not in tension, and an early draft of this record framed
+them as if they were. **kaed's primary purpose is remote editing** — replacing
+rclone-mount and base64-over-ssh for agents working the Linux hosts from
+elsewhere — and it is doing that daily on two hosts. The doc-heavy mix describes
+**what remote sessions are** (planning and design, driven from cleo) rather than
+a ceiling on the tool: code sessions run locally on the host where the code is,
+where the built-in editors are the correct choice.
+
+The question that survives is narrower and better: *was there remote work that
+wanted to edit code and didn't?* kaed has no `insert`/`delete`/`rename`, no
+tree-sitter `outline`/`node_replace` and no `apply_patch` — all on the roadmap.
+If remote code editing is being routed to ssh because anchor/range edits are too
+blunt for refactoring, that is a capability gap that should reorder those items.
+The journal cannot tell the two apart (G3).
 
 Reliability looks good: 2 real failures in 34 organic transactions, both
 recovered inside 30 seconds off the error payload, one of them self-documenting

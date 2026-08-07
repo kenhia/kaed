@@ -68,7 +68,19 @@ source file has ever been edited through kaed outside the two verification
 fixtures** (`kaed-dogfood/demo.rs`, `kaed-002-verify/app/main.rs`) — in a
 homelab whose most active projects are Rust.
 
-This is the single most decision-relevant fact in the report. See
+**Read this correctly.** kaed's primary purpose is *remote* editing — replacing
+rclone-mount and base64-over-ssh for agents working on the Linux hosts from
+elsewhere. By that measure the tool is doing the job it exists for, daily, on
+two hosts. The doc-heavy mix is therefore a fact about **what remote sessions
+are**, not a shortfall in kaed's reach: remote sessions from cleo are
+predominantly planning and design work, while code sessions run locally on the
+host where the code is (F5, and Ken's confirmation of the zero-kaed repos).
+
+So the open question is not "will kaed graduate to editing code" — it is
+whether there is remote work that *wants* to touch code and doesn't, because
+something is missing. See [Baseline for the next pass](#baseline-for-the-next-pass).
+
+This is still the single most decision-relevant fact in the report. See
 [Implications](#implications-for-the-program).
 
 ### F3 — Reliability is high, and the errors are genuinely recoverable
@@ -224,8 +236,17 @@ Re-run `scripts/journal-report.py` and compare against:
 
 **The three questions to ask next time:**
 
-1. Did the doc share move? If kaed starts editing code, the tool crossed over
-   from "remote planning surface" to "remote editor", which is the actual bet.
+1. **Did the doc share move, and if not, is anything blocking it?** The doc-heavy
+   mix is expected — remote sessions are mostly planning sessions, and kaed is
+   already succeeding at its actual purpose, which is remote editing. The
+   question worth asking is the narrower one: **was there remote work that
+   wanted to edit code and didn't?** kaed today has no `insert`/`delete`/
+   `rename`, no tree-sitter `outline`/`node_replace`, and no `apply_patch` —
+   all queued on the roadmap. If remote code editing is being routed to ssh
+   because anchor/range edits alone are too blunt for real refactoring, that is
+   a capability gap and it should reorder those roadmap items. If instead code
+   work simply happens where the code is, the mix is correct and needs no fix.
+   G3 means the journal cannot separate these — ask, or add client attribution.
 2. Did `feedback` get rows, and did any of them change the contract? That is
    #1046's real deliverable, not the tool.
 3. Did a second author appear? Everything about attribution — #910, PD-4, the
