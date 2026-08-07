@@ -278,7 +278,7 @@ the other is the bug this feature exists to prevent.
 | `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. |
 | `limits.*` | Response and file size budgets. |
 | `journal.path` | Defaults to `$XDG_DATA_HOME/kaed/journal.db`. |
-| `journal.retention_days` | Blob content retention. Metadata is kept forever. |
+| `journal.retention_days` | Blob content retention. Metadata is kept forever — so past this window `journal` still shows what changed and when, while `diff`/`revert` can name a version they can no longer reconstruct (they say so, with the window, rather than returning an empty diff). |
 | `security.deny` | Extra deny globs, matched against absolute paths. |
 | `security.use_default_deny` | Set `false` to drop the built-in glob defaults. kaed's own directories stay refused regardless. |
 | `security.classify` | Extra *classification* globs: matching files are secret-bearing but served **redacted** (dotenv-shaped files get placeholders and typed env ops) rather than refused. |
@@ -534,6 +534,13 @@ and send you hunting for a TTL that does not exist.
 content of files kaed has edited. It is created `0600` and blob content ages
 out per `retention_days`, but treat it as being as sensitive as the most
 sensitive file kaed is allowed to touch.
+
+Agents can now read that history back (`journal`, `diff`, `revert`), which
+raises the stakes on the file mode rather than lowering them: content from a
+classified file is stored and served as a redacted rendering, and a blob
+written before classification covered its path is redacted on the way out —
+but the store still holds everything else verbatim. The deny list is what
+keeps that set small.
 
 **Logs.** `journalctl --user -u kaed -f`. `RUST_LOG=kaed=debug` for more.
 

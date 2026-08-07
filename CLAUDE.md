@@ -45,10 +45,10 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai and kubs0).
 
-**Status: v0 live on kai + kubs0** (sprints 001–007, 2026-08-07):
-`roots`/`stat`/`list`/`read`/`search`/`edit` over streamable HTTP with
-bearer auth; journal records successes *and* failures; history read tools
-not yet. **kubsdb deliberately has no instance** (korg #929) — if you find
+**Status: v0 live on kai + kubs0** (sprints 001–009, 2026-08-07):
+`roots`/`stat`/`list`/`read`/`search`/`edit` plus
+`journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
+auth. **kubsdb deliberately has no instance** (korg #929) — if you find
 none there, that is correct, not a broken rollout. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
@@ -114,6 +114,19 @@ fails, and what the journal structurally cannot tell you — see
   `.kaedignore` layer rides the same three places (`src/policy.rs`), and
   the in-file `kaedignore` marker is checked wherever content is *opened*
   (`load_text`, `search`) — `list` cannot see it by design.
+- **History is readable through the contract since 009** (`src/history.rs`;
+  `sprints/009-history-and-feedback/decisions.md`). `journal` merges
+  transactions, failed attempts and `feedback` into one stream — `root` is
+  an optional *filter*, not an address. Three things not to re-derive:
+  **reads are still not journaled** (D-2, a deliberate gap disclosed in
+  every response's `coverage` block — don't "fix" it without reopening
+  #909's retention decision); `revert` deliberately refuses historical
+  roots, classified files and creates, each with a named reason; and
+  **redaction lives at the materialisation boundary** (`history::
+  materialise`) so a legacy plaintext blob is redacted on read. Free text
+  bound for the journal — `intent`, error messages, feedback — is redacted
+  too, at both ends: 008's model covered file *content* only, and `intent`
+  leaked straight through it until the 009 gate test caught it.
 - **Secrets are classified, not denied, since 008** (R9 in the contract;
   `sprints/008-secrets-model/decisions.md`). `.env`-shaped files read
   redacted (`⟨kaed:KEY@digest⟩` placeholders — BLAKE3 + entropy floor,

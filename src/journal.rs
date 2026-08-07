@@ -1,11 +1,15 @@
 //! The durable, attributed history (R6): SQLite, one DB per host.
 //!
-//! Sprint 001 records transactions (the `journal`/`diff`/`revert` read
-//! tools come later). `begin` lands before any rename and `complete` after
-//! the last one, so an interrupted transaction survives as a row with
-//! `completed_at IS NULL` — the torn-state signal `scan_pending` reports
-//! at startup. Blobs are content-addressed by version and power conflict
-//! deltas today, `diff`/`revert` later.
+//! `begin` lands before any rename and `complete` after the last one, so
+//! an interrupted transaction survives as a row with `completed_at IS
+//! NULL` — the torn-state signal `scan_pending` reports at startup. Blobs
+//! are content-addressed by version and power conflict deltas and `diff`.
+//!
+//! Sprint 009 added the **read** path this store existed for: the query
+//! surface below is what `src/history.rs` serves as `journal`/`diff`/
+//! `revert`, plus the `feedback` writes that land beside it. Everything
+//! here is SQL and row structs; policy, redaction and the shape agents see
+//! belong to `history.rs`.
 //!
 //! Two things are retained on different clocks (#909): transaction
 //! *metadata* forever — it is the audit trail, it is tiny — and blob
@@ -17,7 +21,7 @@
 use crate::config::ResolvedRoot;
 use crate::errors::{KaedError, Result};
 use crate::txn::{FailedTxnRecord, FileTxnRecord, TxnRecorder};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Mutex;
@@ -138,6 +142,27 @@ impl Journal {
         Self::in_memory_with_retention(30)
     }
 
+    /// Drive the schema directly, for tests that need to reconstruct a
+    /// state kaed itself cannot produce today — an aged blob, a torn
+    /// transaction, a pre-#910 journal with no failure rows.
+    #[cfg(test)]
+    pub fn raw_execute_for_test(&self, sql: &str) {
+        self.lock().execute_batch(sql).expect("test sql");
+    }
+
+    /// A blob exactly as a pre-008 kaed wrote it: raw bytes, `redacted`
+    /// unset. The state D-11's corollary is about.
+    #[cfg(test)]
+    pub fn insert_legacy_blob_for_test(&self, version: &str, content: &str) {
+        self.lock()
+            .execute(
+                "INSERT INTO blobs (version, content, created_at, redacted)
+                 VALUES (?1, ?2, ?3, 0)",
+                rusqlite::params![version, content.as_bytes(), now()],
+            )
+            .expect("test blob");
+    }
+
     #[cfg(test)]
     pub fn in_memory_with_retention(blob_retention_days: u32) -> anyhow::Result<Journal> {
         let conn = Connection::open_in_memory()?;
@@ -219,6 +244,376 @@ impl Journal {
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("journal lock never poisoned")
     }
+
+    /// Days blob *content* survives, so `diff` can explain a missing
+    /// version instead of shrugging at it.
+    pub fn blob_retention_days(&self) -> u32 {
+        self.blob_retention_days
+    }
+}
+
+// ------------------------------------------------------- the read surface
+//
+// Row structs, not tool shapes: `history.rs` decides what an agent sees.
+
+#[derive(Debug)]
+pub struct TxnFileRow {
+    pub path: String,
+    pub old_version: Option<String>,
+    pub new_version: String,
+    pub lines_added: i64,
+    pub lines_removed: i64,
+}
+
+#[derive(Debug)]
+pub struct TxnRow {
+    pub id: i64,
+    pub author: String,
+    pub intent: Option<String>,
+    pub root: String,
+    pub git_head: Option<String>,
+    pub started_at: String,
+    /// `None` = begun but never completed: the torn state `scan_pending`
+    /// reports. History must show it as such rather than as applied.
+    pub completed_at: Option<String>,
+    pub files: Vec<TxnFileRow>,
+}
+
+#[derive(Debug)]
+pub struct FailureRow {
+    pub id: i64,
+    pub author: String,
+    pub intent: Option<String>,
+    pub root: String,
+    pub paths: Vec<String>,
+    pub code: String,
+    pub message: String,
+    pub expected_version: Option<String>,
+    pub actual_version: Option<String>,
+    pub failed_at: String,
+}
+
+#[derive(Debug)]
+pub struct FeedbackRow {
+    pub id: i64,
+    pub author: String,
+    pub category: String,
+    pub summary: String,
+    pub detail: Option<String>,
+    pub context: Option<String>,
+    pub created_at: String,
+}
+
+/// The earliest record of each kind. What `journal` reports as `coverage`
+/// (D-2): a window reaching back before `failures_from` predates #910 and
+/// its silence about failures is not evidence there were none.
+#[derive(Debug, Default)]
+pub struct Coverage {
+    pub txns_from: Option<String>,
+    pub failures_from: Option<String>,
+    pub feedback_from: Option<String>,
+}
+
+/// The query axes sprint 006's evidence pass actually used, minus the
+/// aggregates (those stay in `scripts/journal-report.py`).
+#[derive(Debug, Default)]
+pub struct HistoryFilter<'a> {
+    /// Matched literally against the journalled root name — including
+    /// names no longer served, which is the point (R8's corollary).
+    pub root: Option<&'a str>,
+    /// Exact path, or a subtree when the row's path sits under it.
+    pub path: Option<&'a str>,
+    pub author: Option<&'a str>,
+    /// RFC 3339; timestamps are fixed-offset so a lexical `>=` is a
+    /// chronological one.
+    pub since: Option<&'a str>,
+    pub limit: usize,
+}
+
+impl<'a> HistoryFilter<'a> {
+    fn path_matches(&self, path: &str) -> bool {
+        match self.path {
+            None => true,
+            Some(p) => {
+                let p = p.trim_end_matches('/');
+                p.is_empty() || path == p || path.starts_with(&format!("{p}/"))
+            }
+        }
+    }
+}
+
+impl Journal {
+    /// Applied (and torn) transactions, newest first.
+    pub fn txns(&self, f: &HistoryFilter<'_>) -> Result<Vec<TxnRow>> {
+        let conn = self.lock();
+        // The path filter lives in a subquery so a matching transaction
+        // still comes back with *all* its files: "which txn touched this
+        // path" must not silently hide that the txn touched three others.
+        let mut sql = String::from(
+            "SELECT id, author, intent, root, git_head, started_at, completed_at
+               FROM txns WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(root) = f.root {
+            args.push(Box::new(root.to_owned()));
+            sql.push_str(&format!(" AND root = ?{}", args.len()));
+        }
+        if let Some(author) = f.author {
+            args.push(Box::new(author.to_owned()));
+            sql.push_str(&format!(" AND author = ?{}", args.len()));
+        }
+        if let Some(since) = f.since {
+            args.push(Box::new(since.to_owned()));
+            sql.push_str(&format!(" AND started_at >= ?{}", args.len()));
+        }
+        if let Some(path) = f.path {
+            let path = path.trim_end_matches('/');
+            args.push(Box::new(path.to_owned()));
+            let exact = args.len();
+            args.push(Box::new(format!("{path}/%")));
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM txn_files f WHERE f.txn_id = txns.id
+                              AND (f.path = ?{exact} OR f.path LIKE ?{}))",
+                args.len()
+            ));
+        }
+        args.push(Box::new(f.limit as i64));
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
+
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let mut rows: Vec<TxnRow> = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok(TxnRow {
+                    id: r.get(0)?,
+                    author: r.get(1)?,
+                    intent: r.get(2)?,
+                    root: r.get(3)?,
+                    git_head: r.get(4)?,
+                    started_at: r.get(5)?,
+                    completed_at: r.get(6)?,
+                    files: Vec::new(),
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+
+        let mut files = conn
+            .prepare(
+                "SELECT path, old_version, new_version, lines_added, lines_removed
+                   FROM txn_files WHERE txn_id = ?1 ORDER BY rowid",
+            )
+            .map_err(db_err)?;
+        for row in &mut rows {
+            row.files = files
+                .query_map([row.id], |r| {
+                    Ok(TxnFileRow {
+                        path: r.get(0)?,
+                        old_version: r.get(1)?,
+                        new_version: r.get(2)?,
+                        lines_added: r.get(3)?,
+                        lines_removed: r.get(4)?,
+                    })
+                })
+                .map_err(db_err)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+        }
+        Ok(rows)
+    }
+
+    /// One transaction by id, files included. `revert`'s entry point.
+    pub fn txn(&self, id: i64) -> Result<Option<TxnRow>> {
+        let conn = self.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, author, intent, root, git_head, started_at, completed_at
+                   FROM txns WHERE id = ?1",
+                [id],
+                |r| {
+                    Ok(TxnRow {
+                        id: r.get(0)?,
+                        author: r.get(1)?,
+                        intent: r.get(2)?,
+                        root: r.get(3)?,
+                        git_head: r.get(4)?,
+                        started_at: r.get(5)?,
+                        completed_at: r.get(6)?,
+                        files: Vec::new(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some(mut row) = row else {
+            return Ok(None);
+        };
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, old_version, new_version, lines_added, lines_removed
+                   FROM txn_files WHERE txn_id = ?1 ORDER BY rowid",
+            )
+            .map_err(db_err)?;
+        row.files = stmt
+            .query_map([id], |r| {
+                Ok(TxnFileRow {
+                    path: r.get(0)?,
+                    old_version: r.get(1)?,
+                    new_version: r.get(2)?,
+                    lines_added: r.get(3)?,
+                    lines_removed: r.get(4)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(Some(row))
+    }
+
+    /// Attempts that never applied — the half #1049 calls higher-value:
+    /// "did my last edit fail, and why" beats "what did I successfully do".
+    pub fn failures(&self, f: &HistoryFilter<'_>) -> Result<Vec<FailureRow>> {
+        let conn = self.lock();
+        let mut sql = String::from(
+            "SELECT id, author, intent, root, paths, code, message,
+                    expected_version, actual_version, failed_at
+               FROM txn_failures WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(root) = f.root {
+            args.push(Box::new(root.to_owned()));
+            sql.push_str(&format!(" AND root = ?{}", args.len()));
+        }
+        if let Some(author) = f.author {
+            args.push(Box::new(author.to_owned()));
+            sql.push_str(&format!(" AND author = ?{}", args.len()));
+        }
+        if let Some(since) = f.since {
+            args.push(Box::new(since.to_owned()));
+            sql.push_str(&format!(" AND failed_at >= ?{}", args.len()));
+        }
+        // `paths` is a joined string, so SQL can only prefilter; the exact
+        // match happens below. Over-fetch so the filter cannot silently
+        // return a short page.
+        let limit = if f.path.is_some() {
+            args.push(Box::new(format!("%{}%", f.path.unwrap_or_default())));
+            sql.push_str(&format!(" AND paths LIKE ?{}", args.len()));
+            f.limit.saturating_mul(4).saturating_add(32)
+        } else {
+            f.limit
+        };
+        args.push(Box::new(limit as i64));
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
+
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok(FailureRow {
+                    id: r.get(0)?,
+                    author: r.get(1)?,
+                    intent: r.get(2)?,
+                    root: r.get(3)?,
+                    paths: r
+                        .get::<_, String>(4)?
+                        .split(", ")
+                        .map(str::to_owned)
+                        .collect(),
+                    code: r.get(5)?,
+                    message: r.get(6)?,
+                    expected_version: r.get(7)?,
+                    actual_version: r.get(8)?,
+                    failed_at: r.get(9)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.paths.iter().any(|p| f.path_matches(p)))
+            .take(f.limit)
+            .collect())
+    }
+
+    /// Friction reports. `root`/`path` do not apply — a report is about the
+    /// contract, not about a file — so those filters are ignored here
+    /// rather than silently emptying the result.
+    pub fn feedback(&self, f: &HistoryFilter<'_>) -> Result<Vec<FeedbackRow>> {
+        let conn = self.lock();
+        let mut sql = String::from(
+            "SELECT id, author, category, summary, detail, context, created_at
+               FROM feedback WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(author) = f.author {
+            args.push(Box::new(author.to_owned()));
+            sql.push_str(&format!(" AND author = ?{}", args.len()));
+        }
+        if let Some(since) = f.since {
+            args.push(Box::new(since.to_owned()));
+            sql.push_str(&format!(" AND created_at >= ?{}", args.len()));
+        }
+        args.push(Box::new(f.limit as i64));
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
+
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok(FeedbackRow {
+                    id: r.get(0)?,
+                    author: r.get(1)?,
+                    category: r.get(2)?,
+                    summary: r.get(3)?,
+                    detail: r.get(4)?,
+                    context: r.get(5)?,
+                    created_at: r.get(6)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// File a friction report. Text arrives already redacted — the caller
+    /// owns that, because the caller knows it is free text (D-5).
+    pub fn add_feedback(
+        &self,
+        author: &str,
+        category: &str,
+        summary: &str,
+        detail: Option<&str>,
+        context: Option<&str>,
+    ) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO feedback (author, category, summary, detail, context, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![author, category, summary, detail, context, now()],
+        )
+        .map_err(db_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Where each record kind actually begins. Computed, never hardcoded:
+    /// the boundary differs per host and moves as old rows are added.
+    pub fn coverage(&self) -> Result<Coverage> {
+        let conn = self.lock();
+        let first = |sql: &str| -> Result<Option<String>> {
+            conn.query_row(sql, [], |r| r.get::<_, Option<String>>(0))
+                .optional()
+                .map(Option::flatten)
+                .map_err(db_err)
+        };
+        Ok(Coverage {
+            txns_from: first("SELECT min(started_at) FROM txns")?,
+            failures_from: first("SELECT min(failed_at) FROM txn_failures")?,
+            feedback_from: first("SELECT min(created_at) FROM feedback")?,
+        })
+    }
 }
 
 /// Columns added after a table shipped. `CREATE TABLE IF NOT EXISTS` never
@@ -248,6 +643,7 @@ impl TxnRecorder for Journal {
             .map(|f| root.path.join(&f.path))
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .and_then(|dir| git_head_for(&dir));
+        let intent = intent.map(redact_note);
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(db_err)?;
         tx.execute(
@@ -337,11 +733,11 @@ impl TxnRecorder for Journal {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 r.author,
-                r.intent,
+                r.intent.map(redact_note),
                 r.root.name,
                 r.paths.join(", "),
                 r.error.code.to_string(),
-                r.error.message,
+                redact_note(&r.error.message),
                 field("expected_version"),
                 field("actual_version"),
                 now(),
@@ -356,6 +752,20 @@ impl TxnRecorder for Journal {
 
 fn now() -> String {
     humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
+}
+
+/// Free text bound for the audit trail — an agent-supplied `intent`, an
+/// error message — with secret-shaped tokens replaced.
+///
+/// Sprint 009 is what makes this necessary: before it, `intent` was
+/// write-only and its plaintext went no further than a 0600 SQLite file;
+/// `journal` now serves it back, which is exactly the "retained blob
+/// becomes a served blob" transition 008's D-11 gate is about. Redacting
+/// at the *store* keeps the blast radius where 008 left it, and the read
+/// path redacts again so rows already written by pre-009 kaed on the live
+/// hosts are covered too.
+fn redact_note(s: impl AsRef<str>) -> String {
+    crate::secrets::redact_free_text(s.as_ref())
 }
 
 /// The `-wal`/`-shm` files SQLite writes alongside the database. They hold

@@ -37,22 +37,22 @@
 
 ## Next
 
-- **History tools:** `journal`, `diff`, `revert` — including a read path
-  for the `txn_failures` 002 started writing.
-
-  > **Decide the secrets model first.** A redacted read surface is worth
-  > nothing if `journal.db` holds plaintext and these tools serve it. #909
-  > settled blob retention *without* secrets-aware editing in view, so that
-  > decision does not cover this. See
-  > [brainstorm-secrets-editing.md](brainstorm-secrets-editing.md) — take
-  > the call, then build these. Shipping the leak and the guard in the same
-  > quarter is the failure mode.
 - **Structure:** tree-sitter `outline` + `node_replace` + `check` parse
   diagnostics (rust, markdown, toml first).
-- **`feedback` tool** — then act on it: first contract revision driven by
-  real agent friction reports.
+- **Act on the feedback channel** — 009 built it; the roadmap's actual
+  deliverable is the half after: the first contract revision driven by a
+  real agent friction report. An unread channel is worse than none,
+  because it looks like a channel.
+- **A read log** — the gap 009 accepted deliberately (its D-2) rather than
+  inherited. Reads are not journaled at all, so the question this design
+  most wants answered — do refusals push agents to ssh? — is one the
+  journal structurally cannot answer, and `journal`'s `coverage` block
+  says so in every response. Reads vastly outnumber writes, so this
+  reopens #909's retention decision; that is why it is not free.
 - **Remaining edit ops:** `insert`, `delete`, `rename`; `window`-mode and
-  `numbered` reads if not already in 001.
+  `numbered` reads if not already in 001. **`delete` now has a caller
+  waiting**: `revert` cannot undo a transaction that created a file
+  without it, and refuses with that reason named.
 - **Auth-layer metrics:** per-identity 401 and grace-token counters. 002
   logs both at `warn`; the journal will never see them (401s are rejected
   before the transaction layer). Pairs with the conflict rate from #910 as
@@ -83,6 +83,36 @@
 
 ## Done
 
+- **Sprint 009 — history tools and the friction-triggered feedback
+  channel** (2026-08-07). R6's promise stopped being redeemable only by
+  ssh: `journal` merges applied transactions, failed attempts and friction
+  reports into one time-ordered stream (#1049); `diff` reconstructs any
+  version the blob store still retains; `revert` undoes a transaction *as*
+  a transaction, through the same version checks, and refuses — naming the
+  reason — where kaed cannot honestly undo. `feedback` re-shaped per
+  #1046: one required field, and the invitation rides the errors that are
+  plausibly kaed's fault rather than standing around being ignored. Every
+  `journal` response states what the history cannot see; **reads stay
+  unjournaled by explicit decision** (D-2), disclosed rather than
+  inherited. The 008 gate held, and the gate test earned its keep — it
+  caught a live leak nobody had reasoned about: agent-supplied `intent`
+  was free text that 008's content-only redaction never covered, and 009
+  was the sprint that turned it from write-only into served. Record:
+  `sprints/009-history-and-feedback/`.
+- **Sprint 008 — the secrets model** (2026-08-07). Classification instead
+  of denial: `.env`-shaped files read redacted, edit through typed env
+  ops, and every derived surface — diff, conflict delta, search hits,
+  journal blobs — redacted with them. Record:
+  `sprints/008-secrets-model/`.
+- **Sprint 007 — host-qualified addressing and the declared fleet**
+  (2026-08-07). Roots became `host:root` (R8), the fleet is declared in
+  config and reported by `roots`, and `search`/`list` learned to explain
+  an empty result. Record: `sprints/007-host-qualified-addressing/`.
+- **Sprint 006 — the first journal evidence pass** (2026-08-06). What
+  agents had actually done with kaed, measured rather than assumed —
+  including the `search` zero that produced a wrong conclusion (#1066).
+  Record: `sprints/006-journal-evidence-pass/`;
+  `docs/agent-usage-report-2026-08-06.md`.
 - **Sprint 005 — the fleet deploy goes store-native** (2026-08-06). `just
   publish` ships a versioned *deploy bundle* to the homelab package store —
   binary, `install.sh`, unit file, config template, `new-token.sh`, one

@@ -170,6 +170,66 @@ impl KaedError {
     }
 }
 
+/// What a `feedback` prompt says when it rides an error (D-5, #1046).
+const FEEDBACK_ASK: &str = "Was this refusal actionable? If kaed just cost you a detour — or you are about to \
+     route around it — say so in one sentence: feedback(summary: \"…\"). It lands in this \
+     host's journal next to the failure above, and it is the only way this contract \
+     learns.";
+
+impl KaedError {
+    /// Whether this failure is plausibly *kaed's* fault, and so worth
+    /// inviting a friction report on (D-5).
+    ///
+    /// A tool an agent must remember to call gets called by the agents
+    /// that were already having a good time; the report worth having is
+    /// from the session that hit a wall and gave up. So the invitation
+    /// rides the wall.
+    ///
+    /// Narrow on purpose. `invalid_input` is excluded — high-volume,
+    /// schema-shaped, and its message already names the valid fields — as
+    /// are `ambiguous_anchor` and `anchor_not_found`, whose `data` already
+    /// carries the fix. A `version_conflict` qualifies only when kaed had
+    /// no delta to give: a conflict *with* one is the contract working,
+    /// one without is the retention window failing an agent.
+    fn invites_feedback(&self) -> bool {
+        match self.code {
+            ErrorCode::Denied | ErrorCode::TooLarge | ErrorCode::Internal => true,
+            ErrorCode::VersionConflict => self
+                .data
+                .as_ref()
+                .and_then(|d| d.get("delta"))
+                .and_then(Value::as_str)
+                .is_none_or(|delta| delta.starts_with("(content for the expected version")),
+            _ => false,
+        }
+    }
+
+    /// Attach the friction invitation, if this error warrants one. Applied
+    /// once at the MCP boundary so every tool gets it and none has to
+    /// remember to — the same reasoning as redaction living at the store
+    /// boundary rather than per tool.
+    pub fn with_feedback_invite(mut self) -> Self {
+        if !self.invites_feedback() {
+            return self;
+        }
+        let invite = serde_json::json!({
+            "ask": FEEDBACK_ASK,
+            "tool": "feedback",
+            "required": ["summary"],
+        });
+        match &mut self.data {
+            Some(Value::Object(obj)) => {
+                obj.insert("feedback_invite".into(), invite);
+            }
+            None => self.data = Some(serde_json::json!({ "feedback_invite": invite })),
+            // `data` is a non-object (nothing produces one today); leave it
+            // rather than silently replacing an error's payload.
+            Some(_) => {}
+        }
+        self
+    }
+}
+
 /// `data` payload for `version_conflict`: enough for the agent to re-anchor
 /// and retry without re-reading the file.
 #[derive(Debug, Serialize)]
@@ -249,5 +309,70 @@ mod tests {
     fn io_not_found_maps_to_not_found() {
         let io = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
         assert_eq!(KaedError::from(io).code, ErrorCode::NotFound);
+    }
+
+    // ------------------------------------------- the friction prompt (D-5)
+
+    fn invited(e: KaedError) -> bool {
+        let v = serde_json::to_value(e.with_feedback_invite()).unwrap();
+        v["data"]["feedback_invite"].is_object()
+    }
+
+    #[test]
+    fn a_refusal_invites_a_friction_report_without_losing_its_own_data() {
+        let e = KaedError::refused(
+            ".ssh/id_ed25519",
+            "**/.ssh/**",
+            RefusalReason::ServerDenylist,
+            "a human must change the config",
+        )
+        .with_feedback_invite();
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["data"]["reason"], "server_denylist");
+        assert!(v["data"]["hint"].is_string(), "the hint survives");
+        assert!(v["data"]["feedback_invite"]["ask"].is_string());
+    }
+
+    #[test]
+    fn an_error_with_no_data_still_gets_the_invitation() {
+        assert!(invited(KaedError::too_large("64 MB exceeds the budget")));
+        assert!(invited(KaedError::internal("the disk went away")));
+    }
+
+    /// The narrowness is the design: prompting on everything is noise, and
+    /// noise is how a feedback channel dies.
+    #[test]
+    fn malformed_input_and_self_explaining_errors_are_not_prompted() {
+        assert!(!invited(KaedError::invalid_input(
+            "unknown field `old_string`"
+        )));
+        assert!(!invited(KaedError::anchor_not_found("src/txn.rs")));
+        assert!(!invited(KaedError::ambiguous_anchor(AmbiguousAnchorData {
+            path: "a.rs".into(),
+            occurrences: vec![3, 41],
+        })));
+        assert!(!invited(KaedError::not_found("no such file")));
+    }
+
+    /// A conflict *with* a usable delta is the contract working as
+    /// designed; one where the blob had expired is the retention window
+    /// failing an agent, and that is worth hearing about (#1046).
+    #[test]
+    fn a_version_conflict_is_prompted_only_when_the_delta_was_withheld() {
+        let helpful = KaedError::version_conflict(VersionConflictData {
+            path: "f.txt".into(),
+            expected_version: "a".into(),
+            actual_version: "b".into(),
+            delta: "@@ -1 +1 @@\n-first\n+second\n".into(),
+        });
+        assert!(!invited(helpful));
+
+        let useless = KaedError::version_conflict(VersionConflictData {
+            path: "f.txt".into(),
+            expected_version: "a".into(),
+            actual_version: "b".into(),
+            delta: "(content for the expected version is not retained; re-read the file)".into(),
+        });
+        assert!(invited(useless));
     }
 }

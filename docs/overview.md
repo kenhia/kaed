@@ -161,14 +161,14 @@ whom, so a human's edits and several agents' edits stay mutually visible.
 
 ## Where it is now
 
-**Early beta.** Six tools — `roots`, `stat`, `list`, `read`, `search`, `edit`
-— running on a small fleet of hosts, dogfooded daily, with the full
-verified-write loop working end to end from a remote agent. Roots are
-host-qualified (`kai:src`), and `roots` also reports the **declared fleet**:
-which hosts should run kaed, including the ones deliberately without an
-instance.
+**Early beta.** Ten tools — `roots`, `stat`, `list`, `read`, `search`, `edit`,
+`journal`, `diff`, `revert`, `feedback` — running on a small fleet of hosts,
+dogfooded daily, with the full verified-write loop working end to end from a
+remote agent. Roots are host-qualified (`kai:src`), and `roots` also reports
+the **declared fleet**: which hosts should run kaed, including the ones
+deliberately without an instance.
 
-Four sprints in:
+The sprints so far:
 
 - **001 — walking skeleton.** The six tools, the R1–R4 semantics, atomic
   apply, journal writes, bearer auth over streamable HTTP. Deployed and
@@ -185,20 +185,38 @@ Four sprints in:
   checksum-verified release instead of building from a checkout, so a host
   needs neither a clone nor a Rust toolchain — and the build verified on one
   host is byte-for-byte the one the next host runs.
+- **006 — the first evidence pass.** What agents had actually done with kaed,
+  read out of the journal rather than guessed: sustained use, `intent`
+  populated on every transaction unprompted, and two real failures both
+  recovered from the error payload alone. It also found a `search` call that
+  returned a silently empty result and produced a wrong conclusion — which
+  became the next sprint's work.
+- **007 — host-qualified addressing.** Root names became `host:root`, so an
+  agent's vocabulary is the same whether it is talking to one instance or a
+  fleet. `search` and `list` learned to explain an empty result instead of
+  returning a zero indistinguishable from a real no-match.
+- **008 — the secrets model.** Secret-bearing files became *classified*
+  rather than denied: redacted reads, typed dotenv edits, and every derived
+  surface redacted with them.
+- **009 — history tools and the feedback channel.** The journal became
+  readable through the contract, and kaed learned to ask for a friction
+  report at the moment it causes friction.
 
 ## Where it is going
 
 Roughly in order, with the reasoning in
 [`sprints/planning/roadmap.md`](../sprints/planning/roadmap.md):
 
-- **History tools** — `journal`, `diff`, `revert`. The data is already being
-  written; nothing reads it yet.
 - **Structure** — tree-sitter `outline`, node-targeted edits, and parse
   diagnostics returned in the edit response (so "did I break the syntax?" is
   answered by the write, like everything else).
-- **A `feedback` tool** — and then acting on it. The first contract revision
-  driven by a friction report an agent filed itself is the real test of
-  whether this design loop works.
+- **Acting on the feedback.** The channel exists now; the real test is the
+  first contract revision driven by a friction report an agent filed itself.
+  An unread channel is worse than none, because it looks like a channel.
+- **A read log.** Only writes are journaled today, so the question this whole
+  design most wants answered — does a refusal push an agent to reach for ssh
+  instead? — is one the journal structurally cannot answer. Every `journal`
+  response says so; closing it means reopening how much history to retain.
 - **The dogfood report** — a written comparison of kaed against the
   ssh and mount approaches on real editing tasks: round-trips, failures, token
   cost. The evidence for whether the bet paid off. Until that exists, "kaed is

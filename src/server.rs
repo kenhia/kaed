@@ -14,6 +14,7 @@
 use crate::config::{self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use crate::errors::KaedError;
 use crate::fsops::{self, ReadMode};
+use crate::history::{self, FeedbackCategory, JournalQuery, RecordKind};
 use crate::journal::Journal;
 use crate::search;
 use crate::txn::{self, BaseVersion, EditOp, EditRequest};
@@ -44,7 +45,14 @@ const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 /// `secrets` (008): classified files are served redacted and take env ops.
 /// A host without it would refuse env ops at deserialization, so a
 /// mid-upgrade fleet needs the flag to route by.
-const ROOT_CAPABILITIES: &[&str] = &["stat", "list", "read", "search", "edit", "secrets"];
+///
+/// `history` (009): `journal`/`diff`/`revert`. `feedback` is listed too
+/// even though it addresses no root — an agent asking "can I tell this
+/// host something went wrong" reads this list, and answering per-root is
+/// cheaper than a second discovery mechanism (`roots` is the only one).
+const ROOT_CAPABILITIES: &[&str] = &[
+    "stat", "list", "read", "search", "edit", "secrets", "history", "feedback",
+];
 
 /// The authenticated author identity, set by the auth middleware and read
 /// by mutating tools for journal attribution.
@@ -375,6 +383,65 @@ pub struct EditParams {
     pub drop_keys: Vec<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JournalParams {
+    /// Filter to one root, as *journalled*. Optional: history is host-wide
+    /// and legitimately names roots this host no longer serves, so an
+    /// unresolvable value filters rather than fails.
+    pub root: Option<String>,
+    /// Root-relative path — exact, or a directory whose subtree matched.
+    pub path: Option<String>,
+    /// Journalled identity, e.g. `claude`.
+    pub author: Option<String>,
+    /// RFC 3339 lower bound on the record's time.
+    pub since: Option<String>,
+    /// Which record kinds to return; all three by default.
+    #[serde(default)]
+    pub kind: Vec<RecordKind>,
+    /// Max entries (default 20, capped at 200).
+    pub max: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DiffParams {
+    pub root: String,
+    pub path: String,
+    /// A 16-hex `version`, a `txn_id` (the state that transaction
+    /// produced), or `"current"`.
+    pub from: String,
+    /// Defaults to `"current"`.
+    pub to: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RevertParams {
+    pub root: String,
+    /// The transaction to undo, from `journal`.
+    pub txn_id: i64,
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Why. Journaled alongside the automatic "revert of txn N".
+    pub intent: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackParams {
+    /// One sentence. The only required field, deliberately: anything that
+    /// costs a thinking step loses to finishing the task.
+    pub summary: String,
+    /// Defaults to `friction`.
+    #[serde(default)]
+    pub category: FeedbackCategory,
+    /// Anything longer — what you tried, what you did instead.
+    pub detail: Option<String>,
+    /// What it was about: a txn id, an error code, the call you made.
+    pub context: Option<String>,
+}
+
 #[derive(Serialize, JsonSchema)]
 struct RootsResult {
     /// The instance answering this call. Every root name below is prefixed
@@ -597,11 +664,7 @@ impl KaedServer {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(p): Parameters<EditParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let author = parts
-            .extensions
-            .get::<Author>()
-            .cloned()
-            .ok_or_else(|| ErrorData::internal_error("no author on request", None))?;
+        let author = author_of(&parts)?;
         let state = self.state.clone();
         run(move || {
             let root = state.root(&p.root)?;
@@ -617,6 +680,113 @@ impl KaedServer {
         })
         .await
     }
+
+    // -------------------------------------------------------- history (R6)
+
+    #[tool(
+        description = "Read this host's durable history: applied write transactions, failed write attempts, and friction reports, merged newest-first. `root` is an optional FILTER, not an address — omit it for everything this host did. Every response carries `coverage`, which states what this history cannot see (reads are never journaled) and when failure records actually begin, so an empty window is never mistaken for a quiet one. Rows naming a root this host no longer serves are labelled `historical` rather than rewritten."
+    )]
+    async fn journal(
+        &self,
+        Parameters(p): Parameters<JournalParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            history::journal(
+                &state.journal,
+                &state.roots,
+                &state.host,
+                &JournalQuery {
+                    root: p.root.as_deref(),
+                    path: p.path.as_deref(),
+                    author: p.author.as_deref(),
+                    since: p.since.as_deref(),
+                    kinds: p.kind,
+                    max: p.max.unwrap_or(history::DEFAULT_MAX_ENTRIES),
+                },
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Diff a file between two states. Each of `from`/`to` is a 16-hex `version`, a `txn_id` (the state that transaction produced — `journal` gives you a file's old_version and new_version if you want what one transaction did), or \"current\" (the default for `to`). Content comes from the journal's blob store, whose retention is finite: a version past the window is named but not renderable, and the error says so. Classified files diff as redacted renderings, always."
+    )]
+    async fn diff(
+        &self,
+        Parameters(p): Parameters<DiffParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let from = history::parse_side(&p.from)?;
+            let to = history::parse_side(p.to.as_deref().unwrap_or("current"))?;
+            history::diff(&root, &p.path, &from, &to, &state.journal, &state.limits)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Undo a journaled transaction by applying its pre-image as a NEW transaction — history is never rewritten, and the revert is itself journaled and itself revertible. It goes through the same versioning contract as any edit: if a file moved since, you get version_conflict with a delta, not a force-overwrite. Refuses, with a reason, when the transaction ran under a root this host no longer serves, when it created a file (undoing a create needs a delete op kaed does not have yet), or when the file is classified (its journaled pre-image is a redacted rendering, so kaed does not hold the bytes to restore). Supports dry_run."
+    )]
+    async fn revert(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<RevertParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = author_of(&parts)?;
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            history::revert(
+                &root,
+                &history::RevertRequest {
+                    txn_id: p.txn_id,
+                    dry_run: p.dry_run,
+                    intent: p.intent.as_deref(),
+                    author: &author.0,
+                },
+                &state.journal,
+                &state.limits,
+                &state.host,
+                &state.roots,
+            )
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Tell kaed it got in your way. One required field: `summary`, one sentence. Call it the moment something costs you a detour — a refusal with no way forward, an error whose data was not enough, a call that succeeded and gave you a wrong answer — and especially before you route around kaed via ssh, because that is the failure this channel exists to catch and the journal cannot see it. Filed into this host's journal beside the transactions and failures it is about; read it back with `journal`."
+    )]
+    async fn feedback(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<FeedbackParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = author_of(&parts)?;
+        let state = self.state.clone();
+        run(move || {
+            history::feedback(
+                &state.journal,
+                &author.0,
+                p.category,
+                &p.summary,
+                p.detail.as_deref(),
+                p.context.as_deref(),
+            )
+        })
+        .await
+    }
+}
+
+/// The identity the auth middleware bound to this request. Every write —
+/// and every friction report — is attributed (R6); no anonymous mutation.
+fn author_of(parts: &http::request::Parts) -> Result<Author, ErrorData> {
+    parts
+        .extensions
+        .get::<Author>()
+        .cloned()
+        .ok_or_else(|| ErrorData::internal_error("no author on request", None))
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -665,7 +835,17 @@ impl ServerHandler for KaedServer {
              is absent — `glob` matches root-relative paths, so it is not \
              re-anchored by `path`. \
              Every edit is journaled under your identity; pass `intent` so \
-             successors understand it."
+             successors understand it. Read that history back with \
+             `journal` — it merges applied transactions, failed attempts \
+             and friction reports, and its `coverage` block says what it \
+             cannot see. `diff` reconstructs any version the journal still \
+             retains; `revert` undoes a transaction as a new one. \
+             And when kaed gets in your way — a refusal with no way \
+             forward, an error whose data was not enough, a call that \
+             succeeded and answered wrong — call `feedback` with a \
+             one-sentence `summary`. Especially before you give up and use \
+             ssh instead: that is the failure this exists to catch, and it \
+             is the one the journal can never see on its own."
                 .into(),
         );
         info
@@ -674,6 +854,11 @@ impl ServerHandler for KaedServer {
 
 /// Run a blocking kaed operation and shape the outcome per R4: success and
 /// agent-visible failure are both tool results; `Err` is infrastructure only.
+///
+/// This is also where the friction prompt is attached (D-5): one place, so
+/// every tool gets it and no tool has to remember to. The report worth
+/// having comes from the session that hit a wall, and this is the only
+/// moment kaed can ask for it.
 async fn run<T: Serialize + Send + 'static>(
     f: impl FnOnce() -> Result<T, KaedError> + Send + 'static,
 ) -> Result<CallToolResult, ErrorData> {
@@ -684,7 +869,7 @@ async fn run<T: Serialize + Send + 'static>(
         Ok(v) => ok(serde_json::to_value(v)
             .map_err(|e| ErrorData::internal_error(format!("serializing result: {e}"), None))?),
         Err(e) => Ok(CallToolResult::structured_error(
-            serde_json::to_value(&e).map_err(|se| {
+            serde_json::to_value(e.with_feedback_invite()).map_err(|se| {
                 ErrorData::internal_error(format!("serializing error: {se}"), None)
             })?,
         )),
