@@ -13,6 +13,7 @@
 
 use crate::config::{self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use crate::errors::KaedError;
+use crate::fleet;
 use crate::fsops::{self, ReadMode};
 use crate::history::{self, FeedbackCategory, JournalQuery, RecordKind};
 use crate::journal::Journal;
@@ -22,14 +23,19 @@ use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::tool::{Extension, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ServerCapabilities,
+    ServerInfo,
+};
+use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
@@ -63,15 +69,25 @@ pub struct AppState {
     /// This instance's fleet name; the prefix on every root it serves.
     pub host: String,
     pub roots: Vec<ResolvedRoot>,
-    /// The declared fleet minus this host. `None` = no `[peers]` table at
-    /// all, which is the `never-declared` state and is reported as such.
-    pub peers: Option<Vec<Peer>>,
+    /// The declared fleet plus everything needed to route to it (010):
+    /// sessions, per-author peer credentials, observed reachability.
+    /// `declared() == None` is still the `never-declared` state.
+    pub fleet: Arc<fleet::Peers>,
     pub limits: Limits,
     pub journal: Journal,
 }
 
 impl AppState {
     fn root(&self, name: &str) -> Result<ResolvedRoot, KaedError> {
+        if fleet::is_pattern(name) {
+            // Patterns are search-only (D-5): search is read-only and its
+            // merge has an honest truncation story; a pattern `edit` has no
+            // honest atomicity story at all.
+            return Err(KaedError::invalid_input(format!(
+                "root {name:?} is a pattern; root patterns (`*:*`, `kai:*`, `*:src`) \
+                 are only supported by `search`"
+            )));
+        }
         if let Some(root) = self.roots.iter().find(|r| r.name == name) {
             return Ok(root.clone());
         }
@@ -133,7 +149,8 @@ impl AppState {
 
         // A different host. Whether that host is *supposed* to exist is
         // exactly the question #930 was filed about, so answer it here.
-        let Some(peers) = &self.peers else {
+        // (A routable peer never reaches this: `call_tool` proxies it.)
+        let Some(peers) = self.fleet.declared() else {
             return KaedError::not_found(format!(
                 "root {name:?} names host {host:?}, but this instance serves {:?} and \
                  declares no fleet — its config has no [peers] table, so kaed here \
@@ -174,9 +191,14 @@ impl AppState {
                     "host_status": p.status,
                     "since": p.since,
                 }))),
+                // A peer with a `url` is proxied before dispatch ever gets
+                // here (010), so reaching this arm means routing was never
+                // configured — the peer is declaration only.
                 PeerStatus::Active => KaedError::not_found(format!(
-                    "host {host:?} is in this host's declared fleet, but {} does not \
-                     proxy to peers yet (korg:1050) — connect to {host}'s own kaed",
+                    "host {host:?} is declared active in this host's fleet, but no \
+                     `url` is configured for it here, so kaed on {} cannot proxy to \
+                     it — connect to {host}'s own kaed, or add `url` under \
+                     [peers.{host}] in this host's config",
                     self.host
                 ))
                 .with_data(data(serde_json::json!({
@@ -197,14 +219,12 @@ impl AppState {
         }
     }
 
-    /// The declared fleet as `roots` reports it: this instance first, then
-    /// every peer. Only the first entry is `verified` — this sprint probes
-    /// nothing, and reporting a config-declared peer as observed-active
-    /// would be a fresh instance of the bug it is fixing (D-4).
-    fn fleet(&self) -> FleetInfo {
-        let mut hosts = vec![FleetHostInfo {
+    /// This instance's own entry in the `fleet` block: the one host a
+    /// response can always vouch for.
+    fn self_fleet_entry(&self) -> FleetHostInfo {
+        FleetHostInfo {
             host: self.host.clone(),
-            status: "active",
+            status: "active".into(),
             is_self: true,
             verified: true,
             version: Some(crate::version::FULL.to_string()),
@@ -213,24 +233,25 @@ impl AppState {
             note: None,
             since: None,
             url: None,
-        }];
-        for p in self.peers.iter().flatten() {
-            hosts.push(FleetHostInfo {
-                host: p.host.clone(),
-                status: p.status.as_str(),
-                is_self: false,
-                verified: false,
-                version: None,
-                roots: None,
-                reference: p.reference.clone(),
-                note: p.note.clone(),
-                since: p.since.clone(),
-                url: p.url.clone(),
-            });
+            probe: None,
         }
-        FleetInfo {
-            declared: self.peers.is_some(),
-            hosts,
+    }
+
+    /// A peer's fleet entry when it was NOT probed on this call: the
+    /// declaration, unverified, with `probe` saying why nothing was checked.
+    fn declared_fleet_entry(p: &Peer, probe: Option<Value>) -> FleetHostInfo {
+        FleetHostInfo {
+            host: p.host.clone(),
+            status: p.status.as_str().into(),
+            is_self: false,
+            verified: false,
+            version: None,
+            roots: None,
+            reference: p.reference.clone(),
+            note: p.note.clone(),
+            since: p.since.clone(),
+            url: p.url.clone(),
+            probe,
         }
     }
 }
@@ -442,16 +463,19 @@ pub struct FeedbackParams {
     pub context: Option<String>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct RootsResult {
-    /// The instance answering this call. Every root name below is prefixed
-    /// with it.
+    /// The instance answering this call. Local root names are prefixed
+    /// with it; peer roots carry their own hosts' prefixes.
     host: String,
-    roots: Vec<RootInfo>,
+    /// Local entries are [`RootInfo`]; peer entries are whatever the peer's
+    /// own `roots` reported, verbatim (D-3) — with `status`/`since`
+    /// overridden to `unreachable` when served from cache during an outage.
+    roots: Vec<Value>,
     fleet: FleetInfo,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct RootInfo {
     /// Host-qualified — pass this verbatim as `root`.
     name: String,
@@ -468,7 +492,7 @@ struct RootInfo {
 
 /// Which hosts should run kaed, and what is known about them — korg #930,
 /// answered in the response every MCP client already fetches.
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct FleetInfo {
     /// `false` when this host's config has no `[peers]` table: the fleet is
     /// **undeclared**, `hosts` is this instance alone, and a host's absence
@@ -478,17 +502,19 @@ struct FleetInfo {
     hosts: Vec<FleetHostInfo>,
 }
 
-#[derive(Serialize, JsonSchema)]
+#[derive(Serialize)]
 struct FleetHostInfo {
     host: String,
-    /// `active` | `deferred` | `unreachable`. For every entry but `self`
-    /// this is the *declaration*, not an observation — see `verified`.
-    status: &'static str,
+    /// `active` | `deferred` | `unreachable`. Observation when `verified`,
+    /// declaration otherwise.
+    status: String,
     /// True for the instance answering this call.
     #[serde(rename = "self")]
     is_self: bool,
-    /// Whether this instance checked, as opposed to reading config. Only
-    /// `self` is verified until peer mode lands (korg:1050).
+    /// Whether what you see was *observed by this call* (a live probe under
+    /// your own credential — 010) rather than read from config. An
+    /// observed-down host is `verified: true, status: "unreachable"`: the
+    /// check happened, that was its result.
     verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
@@ -501,11 +527,18 @@ struct FleetHostInfo {
     reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
-    /// When an `unreachable` host was last known good.
+    /// When an `unreachable` host was last known good — observed when this
+    /// process watched it go down, declared otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     since: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
+    /// What happened when this call tried to check: `{status: "ok"}`,
+    /// `{status: "failed", detail}`, or `{status: "skipped", detail}` (no
+    /// url, or no credential for the calling author). Absent on `self` and
+    /// on `deferred` peers, which are deliberately never probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probe: Option<Value>,
 }
 
 // ------------------------------------------------------------------ tools
@@ -513,26 +546,170 @@ struct FleetHostInfo {
 #[tool_router]
 impl KaedServer {
     #[tool(
-        description = "List the workspace roots this instance serves, and the declared fleet. Root names are host-qualified (`kai:src`) — pass one verbatim as `root`, with a root-relative `path`. `fleet` answers which hosts should run kaed and what is known about each: a host declared `deferred` is deliberately not running one (`ref` says why) and must not be \"fixed\"; `fleet.declared: false` means this host declares no fleet at all, so absence from the list means nothing."
+        description = "List the workspace roots this fleet serves, and what is known about each host. Root names are host-qualified (`kai:src`) — pass one verbatim as `root`, with a root-relative `path`. Peers with configured routing are probed live under YOUR identity: their roots appear here and are directly addressable (calls are proxied, journaled on the target under your name), and a declared host that is not answering appears as status `unreachable` with `since` — a fact to reason about, not a wiring failure. A host declared `deferred` is deliberately not running kaed (`ref` says why) and must not be \"fixed\"; `fleet.declared: false` means this host declares no fleet at all, so absence from the list means nothing."
     )]
-    async fn roots(&self) -> Result<CallToolResult, ErrorData> {
-        let roots: Vec<RootInfo> = self
-            .state
-            .roots
-            .iter()
-            .map(|r| RootInfo {
+    async fn roots(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = author_of(&parts)?;
+        let state = self.state.clone();
+
+        let mut root_entries: Vec<Value> = Vec::new();
+        for r in &state.roots {
+            let info = RootInfo {
                 name: r.name.clone(),
                 host: r.host.clone(),
                 path: r.path.display().to_string(),
                 description: r.description.clone(),
                 status: "active",
                 capabilities: ROOT_CAPABILITIES,
-            })
-            .collect();
+            };
+            root_entries.push(
+                serde_json::to_value(info).map_err(|e| {
+                    ErrorData::internal_error(format!("serializing roots: {e}"), None)
+                })?,
+            );
+        }
+
+        let mut hosts = vec![state.self_fleet_entry()];
+        let declared = state.fleet.declared().map(<[Peer]>::to_vec);
+        if let Some(peers) = &declared {
+            // Probe every routable peer in parallel, under the caller's own
+            // credential — the gateway never holds a shared identity (PD-4).
+            let mut probes = tokio::task::JoinSet::new();
+            for peer in peers {
+                if peer.status == PeerStatus::Deferred
+                    || peer.url.is_none()
+                    || state.fleet.token_for(&peer.host, &author.0).is_none()
+                {
+                    continue;
+                }
+                let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
+                probes.spawn(async move {
+                    let outcome = fleet.probe_roots(&peer, &author).await;
+                    (peer.host, outcome)
+                });
+            }
+            let mut outcomes: std::collections::HashMap<String, Result<Value, KaedError>> =
+                std::collections::HashMap::new();
+            while let Some(joined) = probes.join_next().await {
+                if let Ok((host, outcome)) = joined {
+                    outcomes.insert(host, outcome);
+                }
+            }
+
+            for peer in peers {
+                hosts.push(match outcomes.remove(&peer.host) {
+                    // Not probed: deferred stays a bare declaration; the
+                    // others say why nothing was checked.
+                    None if peer.status == PeerStatus::Deferred => {
+                        AppState::declared_fleet_entry(peer, None)
+                    }
+                    None if peer.url.is_none() => AppState::declared_fleet_entry(
+                        peer,
+                        Some(json!({"status": "skipped", "detail": "no url declared"})),
+                    ),
+                    None => AppState::declared_fleet_entry(
+                        peer,
+                        Some(json!({
+                            "status": "skipped",
+                            "detail": format!("no credential for author {:?}", author.0),
+                        })),
+                    ),
+                    Some(Ok(payload)) => {
+                        if peer.status == PeerStatus::Unreachable {
+                            tracing::warn!(
+                                peer = peer.host,
+                                "declared unreachable but answering — update [peers] \
+                                 in config.toml"
+                            );
+                        }
+                        let names: Vec<String> = payload
+                            .get("roots")
+                            .and_then(Value::as_array)
+                            .map(|rs| {
+                                rs.iter()
+                                    .filter_map(|r| r.get("name")?.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if let Some(rs) = payload.get("roots").and_then(Value::as_array) {
+                            // The peer's entries verbatim — each carries its
+                            // own capabilities, which is how the fleet
+                            // advertises the union, never the intersection.
+                            root_entries.extend(rs.iter().cloned());
+                        }
+                        FleetHostInfo {
+                            host: peer.host.clone(),
+                            status: "active".into(),
+                            is_self: false,
+                            verified: true,
+                            version: state.fleet.sight_of(&peer.host).version,
+                            roots: Some(names),
+                            reference: peer.reference.clone(),
+                            note: peer.note.clone(),
+                            since: None,
+                            url: peer.url.clone(),
+                            probe: Some(json!({"status": "ok"})),
+                        }
+                    }
+                    Some(Err(e)) if e.code == crate::errors::ErrorCode::NotFound => {
+                        // Did not answer: unreachable, observed. Cached
+                        // roots (if any) stay visible, marked as such —
+                        // the namespace outlives the outage (D-4).
+                        let sight = state.fleet.sight_of(&peer.host);
+                        let since = sight
+                            .down_since
+                            .map(fleet::rfc3339)
+                            .or_else(|| peer.since.clone());
+                        let names = sight.roots.as_ref().map(|rs| {
+                            rs.iter()
+                                .filter_map(|r| r.get("name")?.as_str().map(String::from))
+                                .collect()
+                        });
+                        for cached in sight.roots.iter().flatten() {
+                            let mut entry = cached.clone();
+                            if let Some(obj) = entry.as_object_mut() {
+                                obj.insert("status".into(), json!("unreachable"));
+                                obj.insert("since".into(), json!(since));
+                            }
+                            root_entries.push(entry);
+                        }
+                        FleetHostInfo {
+                            host: peer.host.clone(),
+                            status: "unreachable".into(),
+                            is_self: false,
+                            verified: true,
+                            version: sight.version,
+                            roots: names,
+                            reference: peer.reference.clone(),
+                            note: peer.note.clone(),
+                            since,
+                            url: peer.url.clone(),
+                            probe: Some(json!({"status": "failed", "detail": e.message})),
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // The host answered but the probe still failed
+                        // (credential rejected, protocol error): reachable,
+                        // just not checkable — the declaration stands.
+                        AppState::declared_fleet_entry(
+                            peer,
+                            Some(json!({"status": "failed", "detail": e.message})),
+                        )
+                    }
+                });
+            }
+        }
+
         ok(serde_json::to_value(RootsResult {
-            host: self.state.host.clone(),
-            roots,
-            fleet: self.state.fleet(),
+            host: state.host.clone(),
+            roots: root_entries,
+            fleet: FleetInfo {
+                declared: declared.is_some(),
+                hosts,
+            },
         })
         .map_err(|e| ErrorData::internal_error(format!("serializing roots: {e}"), None))?)
     }
@@ -627,12 +804,17 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Ripgrep-grade search. Each match carries its file's `version`, so search → edit is safe with no read in between (a stale hit becomes version_conflict, never a wrong edit)."
+        description = "Ripgrep-grade search. Each match carries its file's `version`, so search → edit is safe with no read in between (a stale hit becomes version_conflict, never a wrong edit). `root` also takes a PATTERN (`*:*`, `*:src`, `kai:*`) for fleet-wide search in one call: every matching root on every reachable host is searched in parallel under one `max_results` budget, matches gain a `root` tag, `fanout` reports each root's own files_searched/truncation (plus what the merge dropped), and hosts that could not be searched are listed in `hosts_unavailable` — never silently skipped."
     )]
     async fn search(
         &self,
+        Extension(parts): Extension<http::request::Parts>,
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        if fleet::is_pattern(&p.root) {
+            let author = author_of(&parts)?;
+            return self.fleet_search(author, p).await;
+        }
         let state = self.state.clone();
         run(move || {
             let root = state.root(&p.root)?;
@@ -779,6 +961,259 @@ impl KaedServer {
     }
 }
 
+impl KaedServer {
+    /// Is this call addressed to a root another host serves, with routing
+    /// configured for it? Decided on the RAW argument (D-1): the typed
+    /// param structs never see a proxied payload, so a newer peer's extra
+    /// fields pass through instead of being rejected by an older gateway's
+    /// schema.
+    fn remote_target(&self, request: &CallToolRequestParams) -> Option<(Peer, String)> {
+        let root = request.arguments.as_ref()?.get("root")?.as_str()?;
+        let (host, _) = root.split_once(':')?;
+        if host == self.state.host {
+            return None;
+        }
+        let peer = self.state.fleet.routable(host)?.clone();
+        Some((peer, root.to_string()))
+    }
+
+    async fn proxy_to_peer(
+        &self,
+        peer: Peer,
+        root: String,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+            return Err(ErrorData::internal_error("no http parts on request", None));
+        };
+        let author = author_of(parts)?;
+        tracing::debug!(
+            tool = %request.name,
+            root,
+            peer = peer.host,
+            author = author.0,
+            "proxying to peer"
+        );
+        match self
+            .state
+            .fleet
+            .call(
+                &peer,
+                &author.0,
+                &request.name,
+                request.arguments,
+                Some(&root),
+            )
+            .await
+        {
+            Ok(result) => Ok(result),
+            Err(e) => kaed_error_result(e),
+        }
+    }
+
+    /// Fleet-wide search (D-5): expand the root pattern over this host's
+    /// roots plus every reachable peer's (live probe, caller's credential),
+    /// search each concrete root in parallel, merge under one budget with
+    /// per-root reporting.
+    async fn fleet_search(
+        &self,
+        author: Author,
+        p: SearchParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        let max = p
+            .max_results
+            .unwrap_or(state.limits.search_max_results)
+            .min(SEARCH_MAX_RESULTS_CEILING);
+        let matcher = match globset::Glob::new(&p.root) {
+            Ok(g) => g.compile_matcher(),
+            Err(e) => {
+                return kaed_error_result(KaedError::invalid_input(format!(
+                    "root pattern {:?} is not a valid glob: {e}",
+                    p.root
+                )));
+            }
+        };
+
+        let local: Vec<ResolvedRoot> = state
+            .roots
+            .iter()
+            .filter(|r| matcher.is_match(&r.name))
+            .cloned()
+            .collect();
+        let mut known: Vec<String> = state.roots.iter().map(|r| r.name.clone()).collect();
+        let mut unavailable: Vec<Value> = Vec::new();
+        let mut remote: Vec<(Peer, String)> = Vec::new();
+
+        if let Some(peers) = state.fleet.declared() {
+            let mut probes = tokio::task::JoinSet::new();
+            for peer in peers {
+                if peer.status == PeerStatus::Deferred {
+                    // Deliberately without an instance: listed so "the fleet
+                    // was searched" is never silently narrower than the
+                    // fleet, but no probe — there is nothing to probe.
+                    unavailable.push(json!({
+                        "host": peer.host,
+                        "status": "deferred",
+                        "ref": peer.reference,
+                    }));
+                    continue;
+                }
+                if peer.url.is_none() {
+                    unavailable.push(json!({"host": peer.host, "status": "no_url"}));
+                    continue;
+                }
+                if state.fleet.token_for(&peer.host, &author.0).is_none() {
+                    unavailable.push(json!({
+                        "host": peer.host,
+                        "status": "no_credential",
+                        "author": author.0,
+                    }));
+                    continue;
+                }
+                let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
+                probes.spawn(async move {
+                    let outcome = fleet.probe_roots(&peer, &author).await;
+                    (peer, outcome)
+                });
+            }
+            while let Some(joined) = probes.join_next().await {
+                let Ok((peer, outcome)) = joined else {
+                    continue;
+                };
+                match outcome {
+                    Ok(payload) => {
+                        for name in payload
+                            .get("roots")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|r| r.get("name")?.as_str().map(String::from))
+                        {
+                            if matcher.is_match(&name) {
+                                remote.push((peer.clone(), name.clone()));
+                            }
+                            known.push(name);
+                        }
+                    }
+                    Err(e) => {
+                        let since = state
+                            .fleet
+                            .sight_of(&peer.host)
+                            .down_since
+                            .map(fleet::rfc3339);
+                        unavailable.push(json!({
+                            "host": peer.host,
+                            "status": "unreachable",
+                            "since": since,
+                            "detail": e.message,
+                        }));
+                    }
+                }
+            }
+        }
+        // Stable order: this host's roots first, then peers as declared.
+        remote.sort_by(|a, b| (&a.0.host, &a.1).cmp(&(&b.0.host, &b.1)));
+
+        let mut searches = tokio::task::JoinSet::new();
+        let base_remote_idx = local.len();
+        for (idx, root) in local.into_iter().enumerate() {
+            let (pattern, glob, path) = (p.pattern.clone(), p.glob.clone(), p.path.clone());
+            let (regex, context, limits) = (p.regex, p.context, state.limits);
+            searches.spawn_blocking(move || {
+                let outcome = search::search(
+                    &root,
+                    &search::SearchParams {
+                        pattern: &pattern,
+                        regex,
+                        glob: glob.as_deref(),
+                        path: &path,
+                        context,
+                        max_results: max,
+                    },
+                    &limits,
+                )
+                .map_err(KaedError::with_feedback_invite);
+                let json_of = |v: Result<search::SearchResult, KaedError>| match v {
+                    Ok(out) => Ok(serde_json::to_value(out).unwrap_or_default()),
+                    Err(e) => Err(serde_json::to_value(e).unwrap_or_default()),
+                };
+                (idx, root.host.clone(), root.name.clone(), json_of(outcome))
+            });
+        }
+        for (offset, (peer, name)) in remote.into_iter().enumerate() {
+            let fleet = state.fleet.clone();
+            let author = author.0.clone();
+            let mut args = serde_json::Map::new();
+            args.insert("root".into(), json!(name));
+            args.insert("pattern".into(), json!(p.pattern));
+            args.insert("regex".into(), json!(p.regex));
+            if let Some(g) = &p.glob {
+                args.insert("glob".into(), json!(g));
+            }
+            if !p.path.is_empty() {
+                args.insert("path".into(), json!(p.path));
+            }
+            args.insert("context".into(), json!(p.context));
+            args.insert("max_results".into(), json!(max));
+            searches.spawn(async move {
+                let outcome = match fleet
+                    .call(&peer, &author, "search", Some(args), Some(&name))
+                    .await
+                {
+                    Ok(result) => {
+                        let payload = result.structured_content.unwrap_or_default();
+                        if result.is_error == Some(true) {
+                            Err(payload)
+                        } else {
+                            Ok(payload)
+                        }
+                    }
+                    Err(e) => {
+                        Err(serde_json::to_value(e.with_feedback_invite()).unwrap_or_default())
+                    }
+                };
+                (base_remote_idx + offset, peer.host, name, outcome)
+            });
+        }
+
+        let mut pieces: Vec<(usize, fleet::SearchFanout)> = Vec::new();
+        while let Some(joined) = searches.join_next().await {
+            let Ok((idx, host, root, outcome)) = joined else {
+                continue;
+            };
+            pieces.push((
+                idx,
+                fleet::SearchFanout {
+                    root,
+                    host,
+                    outcome,
+                },
+            ));
+        }
+        pieces.sort_by_key(|(idx, _)| *idx);
+        let fanout = pieces.into_iter().map(|(_, f)| f).collect();
+
+        ok(fleet::merge_search(
+            &p.root,
+            fanout,
+            unavailable,
+            max,
+            &known,
+        ))
+    }
+}
+
+/// Serialize a `KaedError` into the R4 `isError` tool result, friction
+/// invitation attached — the one shape every failure leaves through.
+fn kaed_error_result(e: KaedError) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::structured_error(
+        serde_json::to_value(e.with_feedback_invite())
+            .map_err(|se| ErrorData::internal_error(format!("serializing error: {se}"), None))?,
+    ))
+}
+
 /// The identity the auth middleware bound to this request. Every write —
 /// and every friction report — is attributed (R6); no anonymous mutation.
 fn author_of(parts: &http::request::Parts) -> Result<Author, ErrorData> {
@@ -791,6 +1226,25 @@ fn author_of(parts: &http::request::Parts) -> Result<Author, ErrorData> {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KaedServer {
+    /// Hand-written so peer routing happens on the RAW argument object,
+    /// before any typed dispatch (D-1) — `#[tool_handler]` generates this
+    /// only when absent, so the router plumbing is otherwise unchanged. A
+    /// call addressing a routable peer's root is forwarded verbatim and its
+    /// result returned verbatim; everything else dispatches locally exactly
+    /// as before.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if let Some((peer, root)) = self.remote_target(&request) {
+            let result = self.proxy_to_peer(peer, root, request, &context).await?;
+            return Ok(result.into());
+        }
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
@@ -845,7 +1299,21 @@ impl ServerHandler for KaedServer {
              succeeded and answered wrong — call `feedback` with a \
              one-sentence `summary`. Especially before you give up and use \
              ssh instead: that is the failure this exists to catch, and it \
-             is the one the journal can never see on its own."
+             is the one the journal can never see on its own. \
+             This instance may also be a gateway to its fleet: `roots` can \
+             list roots served by OTHER hosts (e.g. `kubs0:src`), and you \
+             address them exactly like local ones — the call is proxied \
+             under your own identity and journaled on that host under your \
+             name, errors passing through verbatim. A fleet host that is \
+             not answering shows up as status `unreachable` with `since`: \
+             that is data to report, not a wiring failure to debug. \
+             `search` also takes a root pattern (`*:*`, `*:src`, `kai:*`) \
+             for fleet-wide search in one call — one budget, per-root \
+             results in `fanout`, unsearchable hosts in \
+             `hosts_unavailable`, never silently skipped. `journal` with a \
+             peer's root as filter reads THAT host's journal. If the \
+             gateway itself is down, every host's own kaed URL keeps \
+             working — direct connection is the documented fallback."
                 .into(),
         );
         info
@@ -868,11 +1336,7 @@ async fn run<T: Serialize + Send + 'static>(
     match outcome {
         Ok(v) => ok(serde_json::to_value(v)
             .map_err(|e| ErrorData::internal_error(format!("serializing result: {e}"), None))?),
-        Err(e) => Ok(CallToolResult::structured_error(
-            serde_json::to_value(e.with_feedback_invite()).map_err(|se| {
-                ErrorData::internal_error(format!("serializing error: {se}"), None)
-            })?,
-        )),
+        Err(e) => kaed_error_result(e),
     }
 }
 
@@ -882,20 +1346,27 @@ fn ok(value: serde_json::Value) -> Result<CallToolResult, ErrorData> {
 
 // ------------------------------------------------------------------- auth
 
-/// The live identity table. Swappable behind a lock so SIGHUP can install
-/// new tokens without restarting: the restart is what drops every live
-/// session, and it does so whether or not tokens are involved (#914).
+/// The live credential tables — inbound identities and outbound peer
+/// tokens — swappable behind locks so SIGHUP can install new tokens without
+/// restarting: the restart is what drops every live session, and it does so
+/// whether or not tokens are involved (#914; extended to peer credentials
+/// in 010, D-2).
 pub struct AuthState {
     identities: RwLock<Vec<Identity>>,
     /// Where the tokens live, so a reload can go back and re-read them.
     spec: BTreeMap<String, AuthEntry>,
+    /// The outbound half: this instance's credentials *for its peers*,
+    /// shared with `fleet::Peers` so proxy sessions see rotations.
+    peer_tokens: Arc<fleet::PeerTokens>,
+    peers_spec: Vec<Peer>,
 }
 
 impl AuthState {
-    /// Re-read every token from its file. Env-var tokens come back
-    /// unchanged — a process cannot re-read its own `EnvironmentFile`, so
-    /// those still need a restart.
+    /// Re-read every token — inbound and peer — from its file. Env-var
+    /// tokens come back unchanged — a process cannot re-read its own
+    /// `EnvironmentFile`, so those still need a restart.
     pub fn reload(&self) {
+        self.peer_tokens.reload(&self.peers_spec);
         let fresh = config::resolve_identities(&self.spec);
         if fresh.is_empty() {
             tracing::error!("reload resolved no identities; keeping the current set");
@@ -1019,16 +1490,29 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
         );
     }
 
+    // Peer credentials resolve once here and re-resolve on SIGHUP; the
+    // same Arc feeds both the reload handle and the routing layer, so a
+    // rotation is visible to in-flight session checkout immediately.
+    let peers_spec: Vec<Peer> = resolved.peers.clone().unwrap_or_default();
+    let peer_tokens = Arc::new(fleet::PeerTokens::new(config::resolve_peer_tokens(
+        &peers_spec,
+    )));
     let state = Arc::new(AppState {
-        host: resolved.host,
+        host: resolved.host.clone(),
         roots: resolved.roots,
-        peers: resolved.peers,
+        fleet: Arc::new(fleet::Peers::new(
+            resolved.host,
+            resolved.peers,
+            peer_tokens.clone(),
+        )),
         limits: resolved.limits,
         journal,
     });
     let auth = Arc::new(AuthState {
         identities: RwLock::new(resolved.identities),
         spec: resolved.auth,
+        peer_tokens,
+        peers_spec,
     });
 
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];

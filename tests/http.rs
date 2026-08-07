@@ -60,29 +60,21 @@ async fn start_server_with(
         // korg #930 turns on are exercised end to end and not just in unit
         // tests of the config parser.
         peers: Some(vec![
+            // No `url` on the active peer: these tests exercise the three
+            // *declared* states; routing to a live peer is tests/gateway.rs.
             Peer {
-                host: "peer-active".into(),
-                status: PeerStatus::Active,
                 reference: None,
                 note: None,
-                since: None,
-                url: Some("https://peer-active.example:4870/mcp".into()),
+                ..Peer::declared("peer-active", PeerStatus::Active)
             },
             Peer {
-                host: "peer-deferred".into(),
-                status: PeerStatus::Deferred,
                 reference: Some("korg:929".into()),
                 note: Some("broad-access design not settled".into()),
-                since: None,
-                url: None,
+                ..Peer::declared("peer-deferred", PeerStatus::Deferred)
             },
             Peer {
-                host: "peer-down".into(),
-                status: PeerStatus::Unreachable,
-                reference: None,
-                note: None,
                 since: Some("2026-08-07".into()),
-                url: None,
+                ..Peer::declared("peer-down", PeerStatus::Unreachable)
             },
         ]),
         identities,
@@ -501,7 +493,7 @@ async fn roots_answers_which_hosts_should_run_kaed() -> anyhow::Result<()> {
 
     let active = by_host("peer-active");
     assert_eq!(active["status"], "active");
-    // declared, not observed: this sprint proxies nothing and probes nothing
+    // declared with no url: nothing to probe, so never reported as observed
     assert_eq!(active["verified"], false);
 
     let _ = client.cancel().await;
@@ -567,7 +559,7 @@ async fn a_wrong_root_name_gets_the_remedy_that_belongs_to_it() -> anyhow::Resul
     assert_eq!(down["data"]["reason"], "host_unreachable");
     assert_eq!(down["data"]["since"], "2026-08-07");
 
-    // declared and up, but this instance does not proxy yet
+    // declared active but with no `url` here: routing was never configured
     assert_eq!(
         stat("peer-active:src").await["data"]["reason"],
         "peer_routing_unavailable"

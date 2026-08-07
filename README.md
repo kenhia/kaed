@@ -46,11 +46,11 @@ Ten tools over streamable HTTP with per-agent bearer auth:
 
 | tool | what it does |
 |---|---|
-| `roots` | the workspace roots this host serves, plus the declared fleet |
+| `roots` | the workspace roots this fleet serves — peers probed live, an unreachable host reported as data |
 | `stat` | metadata + content version — the cheap staleness probe |
 | `list` | directory entries, gitignore-aware, paginated |
 | `read` | whole file, a line range, or a window around a line or unique anchor |
-| `search` | ripgrep-grade, every hit carrying its file's version |
+| `search` | ripgrep-grade, every hit carrying its file's version; root patterns (`*:*`) search the whole fleet in one call |
 | `edit` | anchor/range replace + create + typed dotenv ops; multi-file, atomic, `dry_run` |
 | `journal` | what happened here: applied writes, failed attempts and friction reports, merged |
 | `diff` | any two states of a file — a version, a transaction, or the working tree |
@@ -90,6 +90,15 @@ conflict deltas, search hits and journal blobs are redacted too; destroying
 a value must be declared (`drop_keys`); and a gitignore-shaped
 `.kaedignore` (or an in-file `# kaedignore` marker) opts paths out of kaed
 entirely. There is deliberately no reveal operation.
+
+Any instance can also be its fleet's **gateway**: declare peers with URLs
+and per-identity tokens, and calls addressing another host's roots are
+proxied there — as the caller, never as a shared "gateway" identity, so
+journal attribution on the target is identical to a direct call. Errors pass
+through verbatim (a `version_conflict` delta survives the hop), a peer that
+stops answering becomes `status: "unreachable", since: …` — data, not a
+connection failure — and each host's own URL keeps working as the fallback.
+See "Gateway mode" in [docs/setup.md](docs/setup.md).
 
 **Deliberately absent:** no exec/shell tool, and no git tool. An agent that
 can already run commands does not need kaed to run them, and keeping them out

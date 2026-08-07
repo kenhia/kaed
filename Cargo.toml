@@ -25,7 +25,15 @@ grep-searcher = "0.1.17"
 http = "1.5.0"
 humantime = "2.4.0"
 ignore = "0.4.31"
-rmcp = { version = "3.1.0", features = ["transport-streamable-http-server"] }
+rmcp = { version = "3.1.0", features = [
+    "transport-streamable-http-server",
+    # the gateway half (010): each instance is also an MCP *client* to its
+    # declared peers; `reqwest` (the rmcp feature) brings rustls + the
+    # platform verifier so https:// peer URLs on the tailnet just work
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }

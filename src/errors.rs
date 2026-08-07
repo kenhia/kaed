@@ -23,6 +23,12 @@ pub enum ErrorCode {
     IsBinary,
     ParseUnavailable,
     Internal,
+    /// A call routed to a root whose host lacks that capability — reserved
+    /// by the contract since 007, live since peer mode (010). The fleet
+    /// advertises the *union* of capabilities, so a mid-upgrade fleet can
+    /// route a call to a host that does not know the tool yet; this code is
+    /// that honesty at call time.
+    UnsupportedCapability,
 }
 
 impl fmt::Display for ErrorCode {
@@ -134,6 +140,10 @@ impl KaedError {
 
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::Internal, message)
+    }
+
+    pub fn unsupported_capability(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::UnsupportedCapability, message)
     }
 
     pub fn version_conflict(data: VersionConflictData) -> Self {
@@ -275,6 +285,7 @@ mod tests {
             (ErrorCode::IsBinary, "is_binary"),
             (ErrorCode::ParseUnavailable, "parse_unavailable"),
             (ErrorCode::Internal, "internal"),
+            (ErrorCode::UnsupportedCapability, "unsupported_capability"),
         ] {
             assert_eq!(code.to_string(), wire);
         }
