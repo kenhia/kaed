@@ -49,7 +49,9 @@ agent-filed feedback. Nothing here is frozen.
   `{code, message, data}`. Codes: `not_found`, `outside_root`, `denied`,
   `version_conflict`, `ambiguous_anchor`, `anchor_not_found`,
   `invalid_input`, `too_large`, `is_binary`, `parse_unavailable`,
-  `internal`. `data` makes the error actionable: `version_conflict`
+  `internal`, and `unsupported_capability` (reserved for peer mode:
+  a call against a root whose host lacks that capability).
+  `data` makes the error actionable: `version_conflict`
   carries `{expected_version, actual_version, delta}` (a compact diff of
   what changed since the agent last looked); `ambiguous_anchor` carries the
   candidate line numbers; `denied` carries `{path, rule}`.
@@ -71,6 +73,22 @@ agent-filed feedback. Nothing here is frozen.
   optional agent-supplied `intent` string, git HEAD of the enclosing repo
   if any.
 
+- **R8 — root names are host-qualified.** A root is named `host:root` —
+  `kai:src`, never `src`. `root` was always the indirection every tool
+  addresses through, so this is a naming change and not a schema change:
+  no signature moves, and a client wired directly to one host already
+  speaks the vocabulary peer mode (korg:1050) will route on. The
+  unqualified form is **not** accepted as an alias — one root, one
+  spelling — but a `not_found` on it names the qualified replacement
+  rather than shrugging.
+
+  Corollary: root names are also **durable**, and history outlives them.
+  A journal row records the root name in force when it was written, so a
+  rename leaves rows naming roots that no longer resolve. Those rows are
+  true and are neither rewritten nor aliased back into existence: history
+  tools mark such a transaction **historical** with a structured reason,
+  and `revert` refuses it saying why. (Added sprint 007; see D-6 there.)
+
 Paths are always relative to a configured **workspace root** (see `roots`).
 Absolute paths and `..`-escapes are `outside_root` errors. Line numbers are
 1-based, ranges inclusive. v0 assumes UTF-8 text files; binary files can be
@@ -81,10 +99,59 @@ Absolute paths and `..`-escapes are `outside_root` errors. Line numbers are
 ### Discovery & reading
 
 #### `roots`
-List configured workspace roots.
+What this instance serves, and which hosts are supposed to.
 - **In:** —
-- **Out:** `{ roots: [{name, path, description?}] }`
-- Every other tool takes a `root` (name) + relative `path`.
+- **Out:**
+  ```jsonc
+  {
+    "host": "kai",
+    "roots": [
+      {"name": "kai:src", "host": "kai", "path": "/home/ken/src",
+       "description": "code repos", "status": "active",
+       "capabilities": ["stat", "list", "read", "search", "edit"]}
+    ],
+    "fleet": {
+      "declared": true,
+      "hosts": [
+        {"host": "kai", "status": "active", "self": true, "verified": true,
+         "version": "0.1.0 (…)", "roots": ["kai:src", "kai:scratch"]},
+        {"host": "kubs0", "status": "active", "self": false, "verified": false,
+         "url": "https://kubs0.<tailnet>:4870/mcp"},
+        {"host": "kubsdb", "status": "deferred", "self": false, "verified": false,
+         "ref": "korg:929", "note": "broad-access design not settled"}
+      ]
+    }
+  }
+  ```
+- Every other tool takes a `root` (the qualified `name`) + relative `path`.
+- **`roots` is the only discovery tool.** No `list_available_targets`: two
+  mechanisms answering one question is worse for an agent than either alone.
+- `capabilities` is per-root and is the **union** across a fleet, never the
+  intersection — an intersection silently hides working features on the
+  most-updated host. Calling a root that lacks one gets
+  `unsupported_capability` (reserved; nothing lacks one on a single
+  instance).
+- **`fleet` answers "which hosts should run kaed, and do they"** without
+  reading project history. Three states stay distinguishable, because
+  collapsing any two is the confusion this was built for:
+  - `deferred` — deliberately without an instance. Always carries `ref`.
+    **Not a broken deploy; do not install one to "fix" it.**
+  - `unreachable` — should be serving, is not. Always carries `since`.
+  - never-declared — simply absent from `hosts`.
+- `verified` separates **declared** from **observed**: only the instance
+  answering the call is verified. A config-declared peer reported as plain
+  `active` would assert something nobody checked.
+- `declared: false` means the host has no `[peers]` declaration at all. Then
+  `hosts` is this instance alone and an absence means *nothing* — it is not
+  evidence of a deferral, and not evidence against one.
+- The same three states are reachable from the **error** path, which is
+  where an agent that assumed rather than asked actually lands: a bad `root`
+  returns `not_found` with `data.reason` of `host_deferred` (plus `ref`),
+  `host_unreachable` (plus `since`), `peer_routing_unavailable`,
+  `host_never_declared`, `fleet_undeclared`, `unqualified_root` (plus
+  `did_you_mean`) or `unknown_root`. The payload names both machines
+  explicitly — `this_host` (the instance answering) and `target_host` (the
+  one the root named) — never a bare `host`.
 
 #### `stat`
 - **In:** `{root, path}`
@@ -96,10 +163,14 @@ List configured workspace roots.
 #### `list`
 - **In:** `{root, path?, glob?, depth? (default 1), max? }`
 - **Out:** `{entries: [{path, kind, size}], truncated, next_offset?,
-  denied_hidden?}`
+  entries_scanned, reason?, denied_hidden?}`
 - Respects `.gitignore` by default (`ignored: true` to include).
 - `denied_hidden` counts entries the deny list removed (R7); a hidden
   directory counts once, subtree included. Absent when zero.
+- `entries_scanned` is what the walk produced *before* `glob` — always
+  present, including zero. See `search` for why.
+- `reason` (see `search`) when nothing matched at all. Absent for an empty
+  page past the end: that is already explained by `next_offset`.
 
 #### `read`
 - **In:** `{root, path, range?: {start, end}, window?: {line | anchor,
@@ -125,11 +196,27 @@ List configured workspace roots.
 - **In:** `{root, pattern, regex? (default true), glob?, path?,
   context? (default 2), max_results? (default 50)}`
 - **Out:** `{matches: [{path, version, line, col, text, before[],
-  after[]}], truncated, total?, denied_hidden?}`
+  after[]}], truncated, total?, files_searched, reason?, denied_hidden?}`
 - Ripgrep-grade server-side search. Each match carries its file's
   `version`, so a hit is directly addressable: search → edit with no read
   in between, safely (a stale hit becomes `version_conflict`, not a wrong
   edit).
+- **`files_searched` is always present, including zero.** `0 matches in 41
+  files` and `0 matches in 0 files` are different answers, and until they
+  were distinguishable a scoping mistake was outcome-identical to a genuine
+  no-match — the same class of world-model corruption R3 forbids for
+  truncation and R7 for filtering. `denied_hidden` is its sibling.
+- `reason: {code, hint}` when the emptiness is more likely the caller's than
+  the tree's. `hint` is built from the call's own `glob` and `path`, so it
+  names the fix rather than restating the rule:
+  - `glob_matched_no_files` — **`glob` matches root-relative paths and is
+    not re-anchored by `path`.** With `path: "ai/kaed"`, a bare
+    `glob: "README.md"` can only match at the root's top level. This one
+    cost a wrong conclusion in sprint 006 before it was a rule.
+  - `no_files_under_path` — the walk produced nothing (empty, or all
+    gitignored).
+  - `all_files_skipped` — files matched but every one was binary, over
+    `max_file_bytes`, or unreadable.
 
 ### Mutation
 
@@ -217,7 +304,10 @@ One tool, transactional, all addressing modes.
 ## Worked example — the core loop
 
 ```text
-1. search {pattern: "fn apply_txn", root: "kai-home", path: "src/ai/kaed"}
+0. roots
+     → kai:src (active), kai:scratch (active)
+       fleet: kai active(self) · kubs0 active(declared) · kubsdb deferred korg:929
+1. search {pattern: "fn apply_txn", root: "kai:src", path: "ai/kaed"}
      → match in src/txn.rs line 41, version 9f3ac2d41b7e5860
 2. read {path: "src/txn.rs", window: {line: 41, context: 20}}
      → 40 lines, version 9f3ac2d41b7e5860  (still current)
@@ -236,6 +326,20 @@ And the conflict path, which is the point of it all:
                delta: "@@ −38,4 +38,9 @@ …"}   ← what changed since you looked
 4'. agent inspects delta — usually re-anchors and retries in one step,
     without re-reading the file.
+```
+
+And the zero that used to lie (R8's sibling, korg #1066):
+
+```text
+1''. search {pattern: "journal", root: "kai:src", path: "ai/kaed",
+             glob: "README.md"}
+       → matches: [], files_searched: 0
+         reason: {code: "glob_matched_no_files",
+                  hint: "…`glob` is matched against ROOT-relative paths and is
+                         not re-anchored by `path` … try "ai/kaed/README.md"
+                         or "**/README.md""}
+2''. agent retries with the suggested glob. Before this, step 1'' returned a
+     bare empty list and the agent concluded the string appears nowhere.
 ```
 
 ## Deliberate v0 exclusions

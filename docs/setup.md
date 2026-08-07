@@ -162,8 +162,14 @@ bind = "127.0.0.1:4870"
 # Host header values to accept beyond loopback. If a proxy fronts kaed, the
 # proxy's hostname MUST be here — see the gotcha below.
 allowed_hosts = []
+# This instance's name in the fleet, and the prefix on every root name it
+# serves. Defaults to the short system hostname; set it only if this host
+# goes by another name.
+# host = "myhost"
 
 # Roots are the only paths kaed can reach. Name them explicitly and narrowly.
+# Declare the LOCAL name; kaed serves it host-qualified, so `src` below is
+# addressed as `myhost:src`.
 [[roots]]
 name = "src"
 path = "/home/you/src"
@@ -173,6 +179,14 @@ description = "code repos"
 name = "scratch"
 path = "/home/you/scratch"
 description = "scratch space"
+
+# Optional: the declared fleet — every OTHER host that should, or
+# deliberately should not, run kaed. Omit the table entirely and kaed says
+# so (`fleet.declared: false`) rather than implying this host is all there
+# is. See "Declaring the fleet" below.
+# [peers.otherhost]
+# status = "active"
+# url    = "https://otherhost.example.ts.net:4870/mcp"
 
 [auth]
 # One entry per agent identity; the name is recorded on every journal entry.
@@ -208,13 +222,57 @@ The deny list is the second layer, not the first. It catches what slips
 own config and journal directories no matter what. It is not a substitute for
 drawing the roots narrowly.
 
+### Root names are host-qualified
+
+You declare `name = "src"`; kaed serves it as `myhost:src`, and that is what
+tools take as `root`. The unqualified form is not accepted — one root, one
+spelling — but passing it gets an error naming the replacement, not a bare
+"unknown root".
+
+This costs nothing on one host and is what makes a fleet addressable later
+without renaming anything: `root` was always the indirection every tool
+already went through.
+
+### Declaring the fleet
+
+If you run kaed on more than one machine, `[peers]` is where you say so —
+and, more usefully, where you say which machines are **deliberately without
+an instance**:
+
+```toml
+[peers.buildbox]
+status = "active"
+url    = "https://buildbox.example.ts.net:4870/mcp"
+
+[peers.dbhost]
+status = "deferred"
+ref    = "issue-929"
+note   = "broad-access design not settled; sits next to the datastore"
+```
+
+`roots` returns this to every client, so an agent that finds no kaed on
+`dbhost` learns it is a decision rather than a broken rollout — which is the
+mistake that put this here. Statuses carry their own evidence: `deferred`
+requires `ref`, `unreachable` requires `since`, and kaed refuses to start
+without them.
+
+Leave `[peers]` out and kaed reports `fleet.declared: false` — honest about
+claiming nothing, so a host's absence proves nothing either way. Write it,
+and absence starts to mean something.
+
+kaed does **not** probe peers: every entry but this host's own is reported
+`verified: false`. A declaration is not an observation, and reporting one as
+the other is the bug this feature exists to prevent.
+
 ### Config reference
 
 | Key | Meaning |
 |---|---|
 | `server.bind` | Listen address. Keep it on loopback unless you know why not. |
 | `server.allowed_hosts` | Extra `Host` header values accepted beyond loopback. **Required when proxied.** |
-| `roots[]` | `name`, `path`, optional `description`. `path` may use `~/`. Canonicalized at startup; duplicates and denied roots are refused. |
+| `server.host` | This instance's fleet name and the prefix on every root name. Defaults to the short system hostname; startup fails if neither yields one. |
+| `roots[]` | `name` (local, no `:` or `/`), `path`, optional `description`. `path` may use `~/`. Canonicalized at startup; duplicates and denied roots are refused. |
+| `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. Omit the whole table to declare nothing. |
 | `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. |
 | `auth.<identity>.token_env` | Alternative: an env var. Works, but **cannot be reloaded** — see [rotation](#rotating-a-token). |
 | `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. |
@@ -230,10 +288,11 @@ drawing the roots narrowly.
 kaed check-config
 ```
 
-This prints the resolved roots, which identities resolved a token, the limits,
-the journal path, and **every deny rule in force**. It exits non-zero on
-anything invalid. Read the deny list it prints — that is the real one, not the
-one you think you wrote.
+This prints the host name it resolved, the resolved roots (host-qualified, as
+tools will address them), the declared fleet, which identities resolved a
+token, the limits, the journal path, and **every deny rule in force**. It
+exits non-zero on anything invalid. Read the deny list it prints — that is the
+real one, not the one you think you wrote.
 
 ## 4. Run it as a service
 
@@ -490,8 +549,11 @@ seeing what torn states actually look like.
 | `denied` on a path you expected to read | The deny list. Run `kaed check-config` to see every active rule. This is permanent — no path correction will work. |
 | `outside_root` | The path escapes its root, or is absolute. Paths are always root-relative. |
 | `list`/`search` results look short | Check `denied_hidden` in the response — entries were filtered by the deny list. |
+| `search` found nothing and you expected hits | Check `files_searched`. Zero means your `glob`/`path` selected nothing, not that the pattern is absent — `glob` matches **root-relative** paths and is not re-anchored by `path`. The `reason` in the response names the fix. |
+| `not_found` on a root you are sure exists | Root names are host-qualified: `myhost:src`, not `src`. The error carries `data.did_you_mean`. |
+| `not_found` naming another host | Read `data.reason`. `host_deferred` means that host deliberately has no instance (`data.ref` says why) — do not install one. `host_never_declared` means this host's config says nothing about it. |
 | Identity missing from `check-config` | Token file unreadable or empty. kaed warns and disables that identity rather than failing to start. |
-| Service won't start | `kaed check-config` first; it fails loudly on bad roots, duplicate names, roots inside denied areas, and malformed `[auth]` entries. |
+| Service won't start | `kaed check-config` first; it fails loudly on bad roots, duplicate names, roots inside denied areas, malformed `[auth]` entries, and `[peers]` statuses missing their required `ref`/`since`. |
 
 ---
 

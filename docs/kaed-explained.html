@@ -887,7 +887,11 @@ figcaption {
       <h2>One instance per machine, no coordination</h2>
       <p class="dim">
         Each host runs its own daemon with its own roots, its own journal, and
-        its own tokens. Nothing is shared, so nothing has to agree.
+        its own tokens. Nothing is shared, so nothing has to agree. Roots are
+        named for the machine that serves them — <code>kai:src</code> — and
+        each daemon also states which hosts are <em>supposed</em> to be
+        running one, so a machine deliberately left out never looks like a
+        rollout that failed.
       </p>
     </div>
 
@@ -899,18 +903,18 @@ figcaption {
       </div>
       <div class="host host--live">
         <span class="name">kai</span>
-        <span class="role">Primary homelab host. Two roots, one identity, dogfooded daily.</span>
+        <span class="role">Primary homelab host. Two roots — <code>kai:src</code>, <code>kai:scratch</code> — one identity, dogfooded daily.</span>
+        <span class="state">live</span>
+      </div>
+      <div class="host host--live">
+        <span class="name">kubs0</span>
+        <span class="role">Second host, installed from the same published bundle rather than a hand-built one. No checkout on it at all.</span>
         <span class="state">live</span>
       </div>
       <div class="host host--planned">
-        <span class="name">kubs0</span>
-        <span class="role">Second host. Waiting on a repeatable install rather than a hand-built one.</span>
-        <span class="state">planned</span>
-      </div>
-      <div class="host host--planned">
         <span class="name">kubsdb</span>
-        <span class="role">Database host. Same story, narrower roots.</span>
-        <span class="state">planned</span>
+        <span class="role">Database host — deliberately <em>without</em> an instance until broad access next to live data is a decision rather than a default. That is why the fleet is declared, not inferred.</span>
+        <span class="state">deferred by design</span>
       </div>
     </div>
   </div>
@@ -925,7 +929,7 @@ figcaption {
       <p class="dim">
         Six tools — <code>roots</code>, <code>stat</code>, <code>list</code>,
         <code>read</code>, <code>search</code>, <code>edit</code> — working
-        end to end from a remote agent, on one host, used every day by the
+        end to end from a remote agent, on two hosts, used every day by the
         person who wrote it and essentially nobody else.
       </p>
     </div>

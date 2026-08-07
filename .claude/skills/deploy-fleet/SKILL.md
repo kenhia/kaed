@@ -18,10 +18,21 @@ anyway when kubs0's clone was deleted.
 
 ## The fleet
 
-| Host | Roots | Notes |
+**Ask the host, don't trust this table.** Since sprint 007 each daemon
+declares the fleet itself, so the authoritative answer is one command on any
+host that is up:
+
+```sh
+ssh <host> '~/.local/bin/kaed check-config' | sed -n '/^fleet:/,/^identities:/p'
+```
+
+`roots` returns the same thing to any connected agent. The table below is a
+convenience copy and is allowed to be wrong; the daemon is not.
+
+| Host | Roots (host-qualified since 007) | Notes |
 |---|---|---|
-| `kai` | `src`, `scratch` | the build/publish host — the only clone |
-| `kubs0` | `src`, `k-homelab` | `secrets/` denied; **no checkout** |
+| `kai` | `kai:src`, `kai:scratch` | the build/publish host — the only clone |
+| `kubs0` | `kubs0:src`, `kubs0:k-homelab` | `secrets/` denied; **no checkout** |
 
 **kubsdb is deliberately NOT in the fleet** — deferred, korg #929. If you find
 no kaed there, that is correct and expected, not a broken rollout. Do not
@@ -29,10 +40,11 @@ no kaed there, that is correct and expected, not a broken rollout. Do not
 host whose roots would sit next to `/datastore/*` and `/gratch`. (kubsdb
 *hosts* the store; that is a different thing from running kaed.)
 
-> This table is the third place the fleet is written down (the others are
-> klams and `sprints/004-fleet-deploy/deploy.md`). **korg #930** is about
-> collapsing those into one declared-vs-observed source; when it lands, this
-> section should read from that instead of restating it.
+> **Post-007 deploy step:** `install.sh` never rewrites an existing config, so
+> it will not add the `[peers]` block that makes the above true on the host.
+> It warns when one is missing. A host with no `[peers]` reports
+> `fleet.declared: false` — honest, but it means #930 is only half-closed
+> there. Add the block by hand after upgrading a host that lacks it.
 
 ## Publish from clean, committed `main` — never a branch
 

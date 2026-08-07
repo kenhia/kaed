@@ -36,6 +36,16 @@ pub struct SearchMatch {
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
     pub truncated: bool,
+    /// Files actually opened and searched, after `path`, `glob`, the deny
+    /// list, and the binary/size skips. **Always present, including zero**:
+    /// `0 matches in 41 files` and `0 matches in 0 files` were byte-identical
+    /// answers until korg #1066, and the second one is a scoping mistake
+    /// rather than evidence of anything.
+    pub files_searched: usize,
+    /// Why an empty result is empty, when it is more likely to be the
+    /// caller's `glob`/`path` than the truth about the tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<fsops::EmptyReason>,
     /// Files the deny list kept out of the search entirely. Omitted when
     /// zero — "no matches" and "no matches in what I was allowed to read"
     /// are different answers.
@@ -117,6 +127,10 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
 
     let mut matches = Vec::new();
     let mut truncated = false;
+    let mut tally = fsops::ScopeTally {
+        candidates: files.len(),
+        ..Default::default()
+    };
     'files: for abs in &files {
         let rel = abs
             .strip_prefix(&root.path)
@@ -128,6 +142,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         {
             continue;
         }
+        tally.kept += 1;
         let Ok(meta) = std::fs::metadata(abs) else {
             continue;
         };
@@ -140,6 +155,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         if fsops::looks_binary(&bytes) {
             continue;
         }
+        tally.opened += 1;
         let mut sink = CollectSink {
             matcher: &matcher,
             rel: &rel,
@@ -160,8 +176,13 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
     }
 
     Ok(SearchResult {
+        reason: matches
+            .is_empty()
+            .then(|| tally.explain(p.glob, p.path))
+            .flatten(),
         matches,
         truncated,
+        files_searched: tally.opened,
         denied_hidden: denied_hidden.load(std::sync::atomic::Ordering::Relaxed),
     })
 }
@@ -411,6 +432,91 @@ mod tests {
         let r = search(&root, &params("absent_zzz"), &Limits::default()).unwrap();
         assert!(r.matches.is_empty());
         assert!(!r.truncated);
+        // A genuine no-match: files were read, so there is nothing to explain.
+        assert_eq!(r.files_searched, 1);
+        assert!(r.reason.is_none());
+    }
+
+    /// korg #1066, reproduced as it actually happened: a `path`-scoped
+    /// search with a bare `glob` that can only match at the root's top
+    /// level. The two zeros must stop being the same answer.
+    #[test]
+    fn a_glob_that_cannot_match_under_path_says_so_instead_of_returning_a_bare_zero() {
+        let (dir, root) = setup();
+        write(
+            dir.path(),
+            "ai/kaed/README.md",
+            "the journal records edits\n",
+        );
+        write(dir.path(), "ai/kaed/src/main.rs", "fn main() {}\n");
+
+        let trap = search(
+            &root,
+            &SearchParams {
+                path: "ai/kaed",
+                glob: Some("README.md"),
+                ..params("journal")
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(trap.matches.is_empty());
+        assert_eq!(trap.files_searched, 0, "nothing was opened at all");
+        let reason = trap.reason.expect("a zero this shape must explain itself");
+        assert_eq!(reason.code, "glob_matched_no_files");
+        // The hint names the fix, not the rule.
+        assert!(reason.hint.contains("ai/kaed/README.md"), "{}", reason.hint);
+        assert!(reason.hint.contains("**/README.md"), "{}", reason.hint);
+
+        // …and the fix the hint suggests actually works.
+        let fixed = search(
+            &root,
+            &SearchParams {
+                path: "ai/kaed",
+                glob: Some("**/README.md"),
+                ..params("journal")
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(fixed.matches.len(), 1);
+        assert_eq!(fixed.files_searched, 1);
+        assert!(fixed.reason.is_none());
+    }
+
+    #[test]
+    fn an_empty_subtree_is_distinguishable_from_an_unmatched_glob() {
+        let (dir, root) = setup();
+        std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+        write(dir.path(), "other/f.txt", "hit\n");
+        let r = search(
+            &root,
+            &SearchParams {
+                path: "empty",
+                ..params("hit")
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(r.files_searched, 0);
+        assert_eq!(r.reason.unwrap().code, "no_files_under_path");
+    }
+
+    #[test]
+    fn a_match_set_emptied_by_binary_and_size_skips_says_which() {
+        let (dir, root) = setup();
+        std::fs::write(dir.path().join("b.bin"), b"needle\x00").unwrap();
+        let r = search(
+            &root,
+            &SearchParams {
+                glob: Some("*.bin"),
+                ..params("needle")
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(r.files_searched, 0);
+        assert_eq!(r.reason.unwrap().code, "all_files_skipped");
     }
 
     #[test]

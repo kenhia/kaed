@@ -25,11 +25,14 @@
   counts as broad when `/datastore/postgresql` and `/datastore/korg/korg.env`
   sit side by side under a lexical deny matcher, and whether editing a host
   copy whose source of truth is a repo elsewhere is kaed's problem at all.
-- **Fleet deployed-ness is not discoverable** (#930) — a deliberately
-  deferred host looks exactly like a failed rollout, and an agent with ssh
-  concluded precisely that. Wants declared-vs-observed, not just declared.
-  Was sequenced behind #926, which has now closed, so it is unblocked — and
-  005 gave it a second observable: what the store's `latest` says, versus
+- **Fleet deployed-ness is not discoverable** (#930) — **mostly closed by
+  007, deliberately left open.** Root names are host-qualified, the fleet is
+  declared in `config.toml [peers]` (PD-5), and `roots` plus the root-lookup
+  errors both name a `deferred` host and its reasoning. What remains is the
+  *observed* half: kaed declares but does not probe, so every peer entry
+  reports `verified: false`. Probing arrives with peer mode (#1050); until
+  then this is declared-vs-nothing, not declared-vs-observed. 005 gave it a
+  second observable worth folding in — what the store's `latest` says versus
   what each host reports.
 
 ## Next

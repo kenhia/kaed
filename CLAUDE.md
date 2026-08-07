@@ -45,13 +45,21 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai and kubs0).
 
-**Status: v0 live on kai + kubs0** (sprints 001–006, 2026-08-06):
+**Status: v0 live on kai + kubs0** (sprints 001–007, 2026-08-07):
 `roots`/`stat`/`list`/`read`/`search`/`edit` over streamable HTTP with
 bearer auth; journal records successes *and* failures; history read tools
 not yet. **kubsdb deliberately has no instance** (korg #929) — if you find
 none there, that is correct, not a broken rollout. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
+
+**Root names are host-qualified since 007** — `kai:src`, never `src`, and
+the unqualified form is refused rather than aliased. `roots` also returns
+the declared fleet from `config.toml [peers]`, which is where the kubsdb
+answer above now lives on the host itself (PD-5). `config.toml` is
+*installed*, not cloned, so `install.sh` will not add `[peers]` to a config
+that already exists — it warns instead, and adding the block is a
+deliberate post-deploy step per host.
 
 The design lives in `sprints/planning/` — read `summary.md` first, then
 `mcp-contract.md` before touching server code. 002's changes are already
@@ -105,3 +113,10 @@ fails, and what the journal structurally cannot tell you — see
   needs one too — see `src/deny.rs` and R7 in the contract.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
+- **`search`/`list`: `glob` is matched against ROOT-relative paths and is
+  not re-anchored by `path`** (korg #1066). With `path: "ai/kaed"`, a bare
+  `glob: "README.md"` matches nothing — use `ai/kaed/README.md` or
+  `**/README.md`. Since 007 both tools report `files_searched` /
+  `entries_scanned` and a structured `reason`, so a zero of this shape
+  explains itself; before that it was indistinguishable from a real
+  no-match, and it produced a wrong conclusion in sprint 006.

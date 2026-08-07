@@ -11,7 +11,7 @@
 //! rides the request extensions into tool handlers, so every journal
 //! entry is attributed. No anonymous mutation.
 
-use crate::config::{self, AuthEntry, Identity, Limits, Resolved, ResolvedRoot};
+use crate::config::{self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use crate::errors::KaedError;
 use crate::fsops::{self, ReadMode};
 use crate::journal::Journal;
@@ -35,28 +35,191 @@ use std::sync::{Arc, RwLock};
 const DEFAULT_LIST_MAX: usize = 500;
 const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 
+/// What every root on this instance supports. Advertised per-root because
+/// under peer mode (korg:1050) a fleet can be mid-upgrade, and the rule from
+/// the gateway brainstorm is to advertise the **union** with per-root
+/// capabilities — never the intersection, which silently hides working
+/// features on the most-updated host.
+const ROOT_CAPABILITIES: &[&str] = &["stat", "list", "read", "search", "edit"];
+
 /// The authenticated author identity, set by the auth middleware and read
 /// by mutating tools for journal attribution.
 #[derive(Debug, Clone)]
 pub struct Author(pub String);
 
 pub struct AppState {
+    /// This instance's fleet name; the prefix on every root it serves.
+    pub host: String,
     pub roots: Vec<ResolvedRoot>,
+    /// The declared fleet minus this host. `None` = no `[peers]` table at
+    /// all, which is the `never-declared` state and is reported as such.
+    pub peers: Option<Vec<Peer>>,
     pub limits: Limits,
     pub journal: Journal,
 }
 
 impl AppState {
     fn root(&self, name: &str) -> Result<ResolvedRoot, KaedError> {
-        self.roots
-            .iter()
-            .find(|r| r.name == name)
-            .cloned()
-            .ok_or_else(|| {
-                KaedError::not_found(format!(
-                    "unknown root {name:?}; call `roots` for the configured list"
+        if let Some(root) = self.roots.iter().find(|r| r.name == name) {
+            return Ok(root.clone());
+        }
+        Err(self.explain_unknown_root(name))
+    }
+
+    /// Why that root name did not resolve, and what to do instead.
+    ///
+    /// Four wrong `root` values have four different remedies, and a bare
+    /// "unknown root" sends an agent to `roots` for all of them — including
+    /// the two cases where the honest answer is "that host exists and this
+    /// is not it" (D-2). This is korg #930 answered on the path a confused
+    /// agent actually takes: it is the *error*, not the discovery call, that
+    /// the session which assumed rather than asked ends up reading.
+    fn explain_unknown_root(&self, name: &str) -> KaedError {
+        let known: Vec<&str> = self.roots.iter().map(|r| r.name.as_str()).collect();
+        // `this_host` and `target_host`, never a bare `host`: half these
+        // payloads describe two different machines and the reader has to be
+        // able to tell which is which without inferring it.
+        let data = |extra: serde_json::Value| {
+            let mut base =
+                serde_json::json!({ "root": name, "this_host": self.host, "known_roots": known });
+            if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+                b.extend(e.clone());
+            }
+            base
+        };
+
+        let Some((host, local)) = name.split_once(':') else {
+            // Unqualified. If it names a root we serve, say so precisely —
+            // this is the shape every pre-007 agent and doc still holds.
+            let suggestion = self.roots.iter().find(|r| r.local_name == name);
+            return match suggestion {
+                Some(r) => KaedError::not_found(format!(
+                    "root names are host-qualified since sprint 007: pass {:?}, not {name:?}",
+                    r.name
                 ))
-            })
+                .with_data(data(serde_json::json!({
+                    "reason": "unqualified_root",
+                    "did_you_mean": r.name,
+                }))),
+                None => KaedError::not_found(format!(
+                    "unknown root {name:?}; roots are named `host:root` (this host is \
+                     {:?}) — call `roots` for the list",
+                    self.host
+                ))
+                .with_data(data(serde_json::json!({ "reason": "unqualified_root" }))),
+            };
+        };
+
+        if host == self.host {
+            return KaedError::not_found(format!(
+                "unknown root {local:?} on {host}; this host serves {known:?}"
+            ))
+            .with_data(data(
+                serde_json::json!({ "reason": "unknown_root", "target_host": host }),
+            ));
+        }
+
+        // A different host. Whether that host is *supposed* to exist is
+        // exactly the question #930 was filed about, so answer it here.
+        let Some(peers) = &self.peers else {
+            return KaedError::not_found(format!(
+                "root {name:?} names host {host:?}, but this instance serves {:?} and \
+                 declares no fleet — its config has no [peers] table, so kaed here \
+                 knows nothing about {host:?} either way",
+                self.host
+            ))
+            .with_data(data(
+                serde_json::json!({ "reason": "fleet_undeclared", "target_host": host }),
+            ));
+        };
+
+        match peers.iter().find(|p| p.host == host) {
+            Some(p) => match p.status {
+                PeerStatus::Deferred => KaedError::not_found(format!(
+                    "host {host:?} deliberately does not run kaed ({}){} — this is a \
+                     recorded decision, not a broken deploy, so do not install one there",
+                    p.reference.as_deref().unwrap_or("no ref"),
+                    p.note
+                        .as_deref()
+                        .map(|n| format!(": {n}"))
+                        .unwrap_or_default(),
+                ))
+                .with_data(data(serde_json::json!({
+                    "reason": "host_deferred",
+                    "target_host": host,
+                    "host_status": p.status,
+                    "ref": p.reference,
+                    "note": p.note,
+                }))),
+                PeerStatus::Unreachable => KaedError::not_found(format!(
+                    "host {host:?} is declared part of the fleet but is not answering \
+                     (since {})",
+                    p.since.as_deref().unwrap_or("unknown"),
+                ))
+                .with_data(data(serde_json::json!({
+                    "reason": "host_unreachable",
+                    "target_host": host,
+                    "host_status": p.status,
+                    "since": p.since,
+                }))),
+                PeerStatus::Active => KaedError::not_found(format!(
+                    "host {host:?} is in this host's declared fleet, but {} does not \
+                     proxy to peers yet (korg:1050) — connect to {host}'s own kaed",
+                    self.host
+                ))
+                .with_data(data(serde_json::json!({
+                    "reason": "peer_routing_unavailable",
+                    "target_host": host,
+                    "host_status": p.status,
+                    "url": p.url,
+                }))),
+            },
+            None => KaedError::not_found(format!(
+                "host {host:?} is not in this host's declared fleet; kaed on {} has no \
+                 opinion about it",
+                self.host
+            ))
+            .with_data(data(
+                serde_json::json!({ "reason": "host_never_declared", "target_host": host }),
+            )),
+        }
+    }
+
+    /// The declared fleet as `roots` reports it: this instance first, then
+    /// every peer. Only the first entry is `verified` — this sprint probes
+    /// nothing, and reporting a config-declared peer as observed-active
+    /// would be a fresh instance of the bug it is fixing (D-4).
+    fn fleet(&self) -> FleetInfo {
+        let mut hosts = vec![FleetHostInfo {
+            host: self.host.clone(),
+            status: "active",
+            is_self: true,
+            verified: true,
+            version: Some(crate::version::FULL.to_string()),
+            roots: Some(self.roots.iter().map(|r| r.name.clone()).collect()),
+            reference: None,
+            note: None,
+            since: None,
+            url: None,
+        }];
+        for p in self.peers.iter().flatten() {
+            hosts.push(FleetHostInfo {
+                host: p.host.clone(),
+                status: p.status.as_str(),
+                is_self: false,
+                verified: false,
+                version: None,
+                roots: None,
+                reference: p.reference.clone(),
+                note: p.note.clone(),
+                since: p.since.clone(),
+                url: p.url.clone(),
+            });
+        }
+        FleetInfo {
+            declared: self.peers.is_some(),
+            hosts,
+        }
     }
 }
 
@@ -203,11 +366,69 @@ pub struct EditParams {
 }
 
 #[derive(Serialize, JsonSchema)]
+struct RootsResult {
+    /// The instance answering this call. Every root name below is prefixed
+    /// with it.
+    host: String,
+    roots: Vec<RootInfo>,
+    fleet: FleetInfo,
+}
+
+#[derive(Serialize, JsonSchema)]
 struct RootInfo {
+    /// Host-qualified — pass this verbatim as `root`.
     name: String,
+    host: String,
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    status: &'static str,
+    /// The tools that work on this root. Per-root, and the **union** across
+    /// a fleet rather than the intersection, so a mid-upgrade fleet never
+    /// hides a working feature on its most-updated host.
+    capabilities: &'static [&'static str],
+}
+
+/// Which hosts should run kaed, and what is known about them — korg #930,
+/// answered in the response every MCP client already fetches.
+#[derive(Serialize, JsonSchema)]
+struct FleetInfo {
+    /// `false` when this host's config has no `[peers]` table: the fleet is
+    /// **undeclared**, `hosts` is this instance alone, and a host's absence
+    /// from it means nothing. When `true`, an absent host is one kaed here
+    /// has no opinion about — distinct from one declared `deferred`.
+    declared: bool,
+    hosts: Vec<FleetHostInfo>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct FleetHostInfo {
+    host: String,
+    /// `active` | `deferred` | `unreachable`. For every entry but `self`
+    /// this is the *declaration*, not an observation — see `verified`.
+    status: &'static str,
+    /// True for the instance answering this call.
+    #[serde(rename = "self")]
+    is_self: bool,
+    /// Whether this instance checked, as opposed to reading config. Only
+    /// `self` is verified until peer mode lands (korg:1050).
+    verified: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roots: Option<Vec<String>>,
+    /// Why this host is what it is — a korg reference. Always present on
+    /// `deferred`: a deliberate absence with no reasoning behind it is the
+    /// gap #930 was filed about.
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    reference: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    /// When an `unreachable` host was last known good.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 // ------------------------------------------------------------------ tools
@@ -215,7 +436,7 @@ struct RootInfo {
 #[tool_router]
 impl KaedServer {
     #[tool(
-        description = "List the configured workspace roots. Every other tool takes a `root` name plus a root-relative `path`."
+        description = "List the workspace roots this instance serves, and the declared fleet. Root names are host-qualified (`kai:src`) — pass one verbatim as `root`, with a root-relative `path`. `fleet` answers which hosts should run kaed and what is known about each: a host declared `deferred` is deliberately not running one (`ref` says why) and must not be \"fixed\"; `fleet.declared: false` means this host declares no fleet at all, so absence from the list means nothing."
     )]
     async fn roots(&self) -> Result<CallToolResult, ErrorData> {
         let roots: Vec<RootInfo> = self
@@ -224,11 +445,19 @@ impl KaedServer {
             .iter()
             .map(|r| RootInfo {
                 name: r.name.clone(),
+                host: r.host.clone(),
                 path: r.path.display().to_string(),
                 description: r.description.clone(),
+                status: "active",
+                capabilities: ROOT_CAPABILITIES,
             })
             .collect();
-        ok(serde_json::json!({ "roots": roots }))
+        ok(serde_json::to_value(RootsResult {
+            host: self.state.host.clone(),
+            roots,
+            fleet: self.state.fleet(),
+        })
+        .map_err(|e| ErrorData::internal_error(format!("serializing roots: {e}"), None))?)
     }
 
     #[tool(
@@ -390,7 +619,13 @@ impl ServerHandler for KaedServer {
         info.server_info =
             Implementation::new("kaed", crate::version::FULL).with_title("kaed — agent editor");
         info.instructions = Some(
-            "kaed edits files on this host with verified writes. Loop: \
+            "kaed edits files on this host with verified writes. Roots are \
+             host-qualified — `kai:src`, never `src` — so call `roots` first: \
+             it returns the names to pass and a `fleet` block saying which \
+             hosts should run kaed. A fleet host marked `deferred` is \
+             deliberately without an instance and its `ref` says why; that is \
+             a decision, not a broken deploy, so never install one to \"fix\" \
+             it. Loop: \
              search or read (both return a `version`) → edit declaring that \
              version in `base` → the response diff is your proof, no re-read \
              needed. On version_conflict the error data carries \
@@ -404,6 +639,10 @@ impl ServerHandler for KaedServer {
              anchors over whole-file reads. Some paths are refused by the \
              server's deny list: `denied` is permanent, don't retry it, and \
              `denied_hidden` on list/search counts what was filtered out. \
+             `list` and `search` also report `files_searched`: zero there \
+             means your `glob`/`path` selected nothing, not that the pattern \
+             is absent — `glob` matches root-relative paths, so it is not \
+             re-anchored by `path`. \
              Every edit is journaled under your identity; pass `intent` so \
              successors understand it."
                 .into(),
@@ -575,7 +814,9 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
     }
 
     let state = Arc::new(AppState {
+        host: resolved.host,
         roots: resolved.roots,
+        peers: resolved.peers,
         limits: resolved.limits,
         journal,
     });
