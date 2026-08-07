@@ -28,7 +28,20 @@ Nothing in kaed is designed on the assumption that it is.
 
 - **Accidental disclosure through the tool.** Reads, searches, listings and
   edits are all refused for denied paths, and denied entries never appear in
-  enumerations.
+  enumerations. A repo can extend the denials with a gitignore-shaped
+  `.kaedignore` (readable through kaed, never writable through it), and a
+  file can opt itself out with a `# kaedignore` comment in its first lines.
+- **Secrets passing through the agent.** Secret-bearing files (`.env` and
+  friends) are *classified* rather than denied: reads come back redacted,
+  with each value replaced by a sealed placeholder, and edits go through
+  typed operations where a placeholder writes the real value back — so the
+  common flows (add a key, rename it, copy it, reorder the file) never put
+  plaintext in the agent's context. The redaction extends to every derived
+  surface: diffs, conflict deltas, search hits (which run over the redacted
+  text, so probing for a value by searching finds nothing), and journal
+  blobs. There is no reveal operation.
+- **Accidental secret destruction.** A write that would destroy a value the
+  agent never saw is refused unless the edit explicitly declares it.
 - **kaed serving its own credentials.** Its config and journal directories
   are refused unconditionally — no configuration can turn that off.
 - **Escaping the configured roots.** Absolute paths and `..` are rejected;
@@ -54,8 +67,13 @@ Nothing in kaed is designed on the assumption that it is.
 - **Your journal.** `journal.db` stores the content of files kaed has
   edited, so it is as sensitive as the most sensitive file kaed is allowed
   to touch. It is created `0600` and its blob content ages out on a
-  configurable retention (default 7 days), but the strongest control over
-  what ends up in it is the deny list.
+  configurable retention (default 7 days). Classified files are journaled
+  as their *redacted* renderings (or withheld entirely when kaed cannot
+  redact them), so secrets edited through the typed operations do not land
+  in it — but plaintext of every *unclassified* file kaed edits still does,
+  and journals written before classification existed may hold plaintext of
+  files that would be classified today. The strongest control over what
+  ends up in it remains the deny and classify lists.
 
 ## Deployment expectations
 
