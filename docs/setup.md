@@ -317,6 +317,8 @@ fallback.
 | `security.use_default_deny` | Set `false` to drop the built-in glob defaults. kaed's own directories stay refused regardless. |
 | `security.classify` | Extra *classification* globs: matching files are secret-bearing but served **redacted** (dotenv-shaped files get placeholders and typed env ops) rather than refused. |
 | `security.use_default_classify` | Set `false` to drop the built-in classify defaults (`.env*`, `*.env`, `*.pem`, `id_*`, `credentials*`, `*.kdbx`). |
+| `secrets.shapes.<name>` | Named entry for the `secret` tool's shape registry — a spec from the closed grammar (`hex(N)`, `base64url(N)`, `uuid4`, `prefixed(tag,inner)`), e.g. `klams = "prefixed(klams-,hex(64))"`. Validated at startup. |
+| `secrets.allow_reveal` | Set `false` to refuse `secret_reveal` on this host entirely (structured `reveal_disabled` refusal). The default is `true`: the tool being separately permissioned at the harness is the primary gate. |
 
 ### Validate it
 

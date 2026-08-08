@@ -120,6 +120,25 @@ async fn main() -> anyhow::Result<()> {
             for rule in resolved.classify.describe() {
                 println!("  {rule}");
             }
+            println!(
+                "secrets: reveal {}, named shapes: {}",
+                if resolved.secrets.allow_reveal {
+                    "allowed (per-tool permissioning is the gate)"
+                } else {
+                    "REFUSED host-wide (allow_reveal = false)"
+                },
+                if resolved.secrets.shapes.is_empty() {
+                    "none (raw specs still work)".to_string()
+                } else {
+                    resolved
+                        .secrets
+                        .shapes
+                        .iter()
+                        .map(|(name, shape)| format!("{name} = {shape}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
             Ok(())
         }
     }

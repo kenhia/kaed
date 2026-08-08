@@ -11,14 +11,18 @@
 //! rides the request extensions into tool handlers, so every journal
 //! entry is attributed. No anonymous mutation.
 
-use crate::config::{self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
+use crate::config::{
+    self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot, ResolvedSecrets,
+};
 use crate::errors::KaedError;
 use crate::fleet;
 use crate::fsops::{self, ReadMode};
 use crate::history::{self, FeedbackCategory, JournalQuery, RecordKind};
-use crate::journal::Journal;
+use crate::journal::{Journal, SecretEvent};
 use crate::search;
-use crate::txn::{self, BaseVersion, EditOp, EditRequest};
+use crate::secret_tool;
+use crate::secrets;
+use crate::txn::{self, BaseVersion, EditOp, EditRequest, ValueFrom};
 use axum::extract::State;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -38,6 +42,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
+use zeroize::Zeroizing;
 
 const DEFAULT_LIST_MAX: usize = 500;
 const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
@@ -56,8 +61,21 @@ const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 /// even though it addresses no root — an agent asking "can I tell this
 /// host something went wrong" reads this list, and answering per-root is
 /// cheaper than a second discovery mechanism (`roots` is the only one).
+/// `secret_lifecycle` (011): the `secret` tool (describe / generate /
+/// rotate / occurrences), `secret_reveal`, `env_sync_example`, and
+/// `value_from` on `env_set`. One flag for the whole surface: it is one
+/// trust tier, and a peer without it maps to `unsupported_capability` at
+/// call time (D-3 of 010).
 const ROOT_CAPABILITIES: &[&str] = &[
-    "stat", "list", "read", "search", "edit", "secrets", "history", "feedback",
+    "stat",
+    "list",
+    "read",
+    "search",
+    "edit",
+    "secrets",
+    "secret_lifecycle",
+    "history",
+    "feedback",
 ];
 
 /// The authenticated author identity, set by the auth middleware and read
@@ -75,6 +93,8 @@ pub struct AppState {
     pub fleet: Arc<fleet::Peers>,
     pub limits: Limits,
     pub journal: Journal,
+    /// `[secrets]`: named shapes and the reveal kill-switch (011).
+    pub secrets: ResolvedSecrets,
 }
 
 impl AppState {
@@ -446,6 +466,65 @@ pub struct RevertParams {
     pub dry_run: bool,
     /// Why. Journaled alongside the automatic "revert of txn N".
     pub intent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretAction {
+    /// Shape, length, digest, and the durable handle — never the value.
+    /// This IS `load_secret`: the handle is what a cross-session handoff
+    /// carries (011 D-2).
+    Describe,
+    /// Mint a fresh value server-side and write it. New keys only.
+    Generate,
+    /// Same shape, new entropy — the old and new value both stay unseen.
+    Rotate,
+    /// Every entry on this host sealing the same value (digest equality).
+    Occurrences,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretParams {
+    pub action: SecretAction,
+    pub root: String,
+    pub path: String,
+    pub key: String,
+    /// The file's current version — required by `generate` and `rotate`
+    /// (R2: every mutation declares its base).
+    pub version: Option<String>,
+    /// `generate`: required — a name from this host's `[secrets] shapes`
+    /// or a spec (`hex(64)`, `base64url(43)`, `uuid4`,
+    /// `prefixed(tag,inner)`). `rotate`: optional override when the
+    /// current value's shape cannot be detected.
+    pub shape: Option<String>,
+    /// `generate`: comment block above the new entry.
+    pub comment: Option<String>,
+    /// `rotate`: extra locations to write the same new value — feed this
+    /// from `occurrences`. Targets on other hosts are written via peer
+    /// mode, each reported separately (cross-host rotation is not atomic).
+    #[serde(default)]
+    pub also: Vec<secret_tool::AlsoTarget>,
+    /// Journaled, on the transaction and the audit event.
+    pub intent: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRevealParams {
+    pub root: String,
+    pub path: String,
+    pub key: String,
+    /// Required — the audit row must say why plaintext was disclosed.
+    pub intent: String,
+    /// Exact-value semantics: refuse loudly if the value changed since
+    /// this digest was taken. Omit for whatever-is-current.
+    pub expected_digest: Option<String>,
+    /// Names where the value is being carried when this reveal is the
+    /// source half of a cross-host write; the audit row records it as a
+    /// `transport` with that claimed destination. kaed sets this itself
+    /// when resolving `value_from` across hosts.
+    pub transport_destination: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -848,17 +927,143 @@ impl KaedServer {
     ) -> Result<CallToolResult, ErrorData> {
         let author = author_of(&parts)?;
         let state = self.state.clone();
+        // Cross-root `value_from` resolves before the engine (011 D-5):
+        // another local root by direct read, another host via that host's
+        // secret_reveal under the caller's identity. Same-root references
+        // stay for the engine, which resolves them against the evolving
+        // buffers.
+        let mut ops = p.ops;
+        for op in &mut ops {
+            if let EditOp::EnvSet {
+                path,
+                value,
+                value_from,
+                ..
+            } = op
+                && value_from
+                    .as_ref()
+                    .is_some_and(|vf| vf.root.as_deref().is_some_and(|r| r != p.root))
+            {
+                let vf = value_from.take().expect("checked above");
+                let destination = format!("{}/{path}", p.root);
+                match self
+                    .fetch_secret_value(&author, &vf, &destination, false)
+                    .await
+                {
+                    Ok(fetched) => *value = Some(fetched.to_string()),
+                    Err(e) => return kaed_error_result(e),
+                }
+            }
+        }
         run(move || {
             let root = state.root(&p.root)?;
             let req = EditRequest {
                 base: p.base,
-                ops: p.ops,
+                ops,
                 dry_run: p.dry_run,
                 return_diff: p.return_diff,
                 intent: p.intent,
                 drop_keys: p.drop_keys,
             };
             txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
+        })
+        .await
+    }
+
+    // -------------------------------------------- secret lifecycle (011)
+
+    #[tool(
+        description = "The secret lifecycle for dotenv-shaped files — four actions, none of which ever returns a value. `describe`: shape, length, digest and the durable HANDLE (host-qualified root + path + key + digest) — the reference a cross-session or cross-host handoff should carry instead of the value. `generate`: kaed mints a fresh value server-side (shape from a named registry or a closed spec grammar: hex(N), base64url(N), uuid4, prefixed(tag,inner)) and writes it; you get a placeholder, never the plaintext. `rotate`: same shape, new entropy — rotate a token without ever seeing old or new; `also` writes the same new value to more locations (found via `occurrences`), including on other hosts through the gateway. `occurrences`: every entry on this host holding the same value, by digest equality. generate/rotate require the file's current `version` and are journaled as ordinary transactions plus a secrets audit event; read the audit stream back with journal kind \"secret\"."
+    )]
+    async fn secret(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<SecretParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = author_of(&parts)?;
+        if matches!(p.action, SecretAction::Rotate) {
+            return self.secret_rotate(author, p).await;
+        }
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let ctx = secret_tool::Ctx {
+                root: &root,
+                roots: &state.roots,
+                limits: &state.limits,
+                author: &author.0,
+                journal: &state.journal,
+                secrets: &state.secrets,
+            };
+            match p.action {
+                SecretAction::Describe => {
+                    serde_json::to_value(secret_tool::describe(&ctx, &p.path, &p.key)?)
+                }
+                SecretAction::Occurrences => {
+                    serde_json::to_value(secret_tool::occurrences(&ctx, &p.path, &p.key)?)
+                }
+                SecretAction::Generate => {
+                    let version = p.version.as_deref().ok_or_else(|| {
+                        KaedError::invalid_input(
+                            "generate needs `version` — the file's current version, from a \
+                             read or stat (R2: every mutation declares its base)",
+                        )
+                    })?;
+                    let shape = p.shape.as_deref().ok_or_else(|| {
+                        KaedError::invalid_input(
+                            "generate needs `shape`: a [secrets] shapes name or a spec \
+                             (hex(64), base64url(43), uuid4, prefixed(tag,inner))",
+                        )
+                    })?;
+                    serde_json::to_value(secret_tool::generate(
+                        &ctx,
+                        &secret_tool::GenerateParams {
+                            path: &p.path,
+                            key: &p.key,
+                            version,
+                            shape,
+                            comment: p.comment.as_deref(),
+                            intent: p.intent.as_deref(),
+                        },
+                    )?)
+                }
+                SecretAction::Rotate => unreachable!("handled above"),
+            }
+            .map_err(|e| KaedError::internal(format!("serializing secret result: {e}")))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Reveal one secret value in plaintext — the escape hatch, deliberately its own tool so it can be permissioned separately from everything else. Requires `intent` (why the disclosure is needed); every reveal is journaled in the secrets audit stream with your identity, and the response's `disclosed: true` is something to surface to the human you work for. You rarely need this: to USE a value in a shell, source the file (`set -a; . .env; set +a`); to copy or move it, env_set takes placeholders and value_from handles; to mint or replace it, the `secret` tool never shows you anything. Reveal is for values that must leave the kaed-writable world entirely (a client config on a host kaed does not serve, a vendor console). Pass `expected_digest` for exact-value semantics — a changed value then refuses loudly instead of revealing whatever is current."
+    )]
+    async fn secret_reveal(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<SecretRevealParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = author_of(&parts)?;
+        let state = self.state.clone();
+        run(move || {
+            let root = state.root(&p.root)?;
+            let ctx = secret_tool::Ctx {
+                root: &root,
+                roots: &state.roots,
+                limits: &state.limits,
+                author: &author.0,
+                journal: &state.journal,
+                secrets: &state.secrets,
+            };
+            secret_tool::reveal(
+                &ctx,
+                &secret_tool::RevealParams {
+                    path: &p.path,
+                    key: &p.key,
+                    intent: &p.intent,
+                    expected_digest: p.expected_digest.as_deref(),
+                    transport_destination: p.transport_destination.as_deref(),
+                },
+            )
         })
         .await
     }
@@ -1010,6 +1215,335 @@ impl KaedServer {
             Ok(result) => Ok(result),
             Err(e) => kaed_error_result(e),
         }
+    }
+
+    /// `secret` / `rotate`: the primary and every same-root `also` target
+    /// land in one local transaction; `also` targets on OTHER hosts are
+    /// then written via peer mode under the caller's identity — PD-3's
+    /// rotate-both-places path. Not atomic across hosts, and the response
+    /// says per-target what landed.
+    async fn secret_rotate(
+        &self,
+        author: Author,
+        p: SecretParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let state = self.state.clone();
+        let Some(version) = p.version.clone() else {
+            return kaed_error_result(KaedError::invalid_input(
+                "rotate needs `version` — the file's current version, from a read or \
+                 stat (R2: every mutation declares its base)",
+            ));
+        };
+        let (local_also, remote_also): (Vec<_>, Vec<_>) = p
+            .also
+            .into_iter()
+            .partition(|t| t.root.as_deref().is_none_or(|r| r == p.root));
+
+        let (mut result, value) = {
+            let state = state.clone();
+            let author = author.0.clone();
+            let (root_name, path, key) = (p.root.clone(), p.path.clone(), p.key.clone());
+            let (shape, intent) = (p.shape.clone(), p.intent.clone());
+            let joined = tokio::task::spawn_blocking(move || {
+                let root = state.root(&root_name)?;
+                let ctx = secret_tool::Ctx {
+                    root: &root,
+                    roots: &state.roots,
+                    limits: &state.limits,
+                    author: &author,
+                    journal: &state.journal,
+                    secrets: &state.secrets,
+                };
+                secret_tool::rotate_local(
+                    &ctx,
+                    &secret_tool::RotateParams {
+                        path: &path,
+                        key: &key,
+                        version: &version,
+                        shape: shape.as_deref(),
+                        also: &local_also,
+                        intent: intent.as_deref(),
+                    },
+                )
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("task panicked: {e}"), None))?;
+            match joined {
+                Ok(v) => v,
+                Err(e) => return kaed_error_result(e),
+            }
+        };
+
+        for t in remote_also {
+            let target_root = t.root.clone().expect("remote targets carry a root");
+            let key = t.key.as_deref().unwrap_or(&p.key).to_owned();
+            let outcome = self
+                .write_value_to_peer(
+                    &author,
+                    &target_root,
+                    &t.path,
+                    &key,
+                    &t.version,
+                    &value,
+                    p.intent.as_deref(),
+                )
+                .await;
+            let (applied, error) = match outcome {
+                Ok(()) => {
+                    // The value left this host toward that one: a
+                    // transport event on the sender, the redacted write
+                    // journaled on the target (D-5, D-6).
+                    let _ = state.journal.add_secret_event(&SecretEvent {
+                        author: &author.0,
+                        action: "transport",
+                        root: &result.handle.root,
+                        path: &p.path,
+                        key: &p.key,
+                        old_digest: result.old_digest.as_deref(),
+                        new_digest: result.new_digest.as_deref(),
+                        disclosed: true,
+                        destination: Some(&format!("{target_root}/{}", t.path)),
+                        txn_id: result.txn_id,
+                        intent: p.intent.as_deref(),
+                    });
+                    (true, None)
+                }
+                Err(e) => (false, Some(serde_json::to_value(&e).unwrap_or_default())),
+            };
+            result.targets.push(secret_tool::RotatedTarget {
+                root: target_root,
+                path: t.path,
+                key,
+                applied,
+                error,
+            });
+        }
+        drop(value); // zeroized (PD-3)
+
+        ok(serde_json::to_value(result)
+            .map_err(|e| ErrorData::internal_error(format!("serializing rotate: {e}"), None))?)
+    }
+
+    /// Write one value into a peer's dotenv file as an ordinary proxied
+    /// `edit` under the caller's identity — the receiving host journals a
+    /// redacted transaction exactly as if the agent had called it there.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_value_to_peer(
+        &self,
+        author: &Author,
+        target_root: &str,
+        path: &str,
+        key: &str,
+        version: &str,
+        value: &str,
+        intent: Option<&str>,
+    ) -> Result<(), KaedError> {
+        let Some((host, _)) = target_root.split_once(':') else {
+            return Err(self.state.explain_unknown_root(target_root));
+        };
+        let Some(peer) = self.state.fleet.routable(host).cloned() else {
+            return Err(self.state.explain_unknown_root(target_root));
+        };
+        let mut args = serde_json::Map::new();
+        args.insert("root".into(), json!(target_root));
+        args.insert("base".into(), json!([{"path": path, "version": version}]));
+        args.insert(
+            "ops".into(),
+            json!([{"op": "env_set", "path": path, "key": key, "value": value}]),
+        );
+        args.insert("drop_keys".into(), json!([key]));
+        args.insert(
+            "intent".into(),
+            json!(
+                intent.map(str::to_owned).unwrap_or_else(|| format!(
+                    "rotate {key} (propagated from {})",
+                    self.state.host
+                ))
+            ),
+        );
+        let result = self
+            .state
+            .fleet
+            .call(&peer, &author.0, "edit", Some(args), Some(target_root))
+            .await?;
+        if result.is_error == Some(true) {
+            return Err(kaed_error_from_value(
+                result.structured_content.unwrap_or_default(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fetch the value a cross-root `value_from` names (011 D-5). A local
+    /// root is read directly through every policy layer; a peer root goes
+    /// through that host's `secret_reveal` under the caller's identity, so
+    /// the SOURCE host journals the disclosure. `leaves_host` = the write
+    /// target is on another host, in which case a locally-sourced value
+    /// journals a `transport` event here before it goes.
+    async fn fetch_secret_value(
+        &self,
+        author: &Author,
+        vf: &ValueFrom,
+        destination: &str,
+        leaves_host: bool,
+    ) -> Result<Zeroizing<String>, KaedError> {
+        let src_root = vf.root.clone().expect("caller checked value_from.root");
+        if let Some(root) = self
+            .state
+            .roots
+            .iter()
+            .find(|r| r.name == src_root)
+            .cloned()
+        {
+            let state = self.state.clone();
+            let (path, key, digest) = (vf.path.clone(), vf.key.clone(), vf.digest.clone());
+            let value = tokio::task::spawn_blocking(move || -> Result<_, KaedError> {
+                let loaded = fsops::load_text(&root, &path, &state.limits)?;
+                let file = match loaded.secrecy {
+                    fsops::Secrecy::ClassifiedDotenv { file, .. } => file,
+                    fsops::Secrecy::Plain => {
+                        crate::dotenv::parse(&loaded.content).ok_or_else(|| {
+                            KaedError::invalid_input(format!(
+                                "value_from source {path} is not dotenv-shaped"
+                            ))
+                        })?
+                    }
+                };
+                let entry = file.get(&key).ok_or_else(|| {
+                    KaedError::not_found(format!("value_from source {path} has no key {key:?}"))
+                })?;
+                if let Some(d) = &digest
+                    && secrets::digest_of(&entry.value) != *d
+                {
+                    return Err(KaedError::invalid_input(format!(
+                        "value_from digest mismatch for {key:?} in {path} — the value \
+                         changed since that handle was taken; re-describe it (omit \
+                         `digest` for current-value semantics)"
+                    ))
+                    .with_data(serde_json::json!({
+                        "reason": "digest_mismatch",
+                        "path": path,
+                        "key": key,
+                        "expected_digest": d,
+                    })));
+                }
+                Ok(Zeroizing::new(entry.value.clone()))
+            })
+            .await
+            .map_err(|e| KaedError::internal(format!("task panicked: {e}")))??;
+            if leaves_host {
+                let _ = self.state.journal.add_secret_event(&SecretEvent {
+                    author: &author.0,
+                    action: "transport",
+                    root: &src_root,
+                    path: &vf.path,
+                    key: &vf.key,
+                    old_digest: None,
+                    new_digest: secrets::clears_floor(&value)
+                        .then(|| secrets::digest_of(&value))
+                        .as_deref(),
+                    disclosed: true,
+                    destination: Some(destination),
+                    txn_id: None,
+                    intent: None,
+                });
+            }
+            return Ok(value);
+        }
+
+        // Not a local root: the source host reveals it to kaed (never to
+        // the agent) and journals the transport on its side (PD-3, PD-4).
+        let Some((host, _)) = src_root.split_once(':') else {
+            return Err(self.state.explain_unknown_root(&src_root));
+        };
+        let Some(peer) = self.state.fleet.routable(host).cloned() else {
+            return Err(self.state.explain_unknown_root(&src_root));
+        };
+        let mut args = serde_json::Map::new();
+        args.insert("root".into(), json!(src_root));
+        args.insert("path".into(), json!(vf.path));
+        args.insert("key".into(), json!(vf.key));
+        args.insert(
+            "intent".into(),
+            json!(format!("cross-host value_from toward {destination}")),
+        );
+        if let Some(d) = &vf.digest {
+            args.insert("expected_digest".into(), json!(d));
+        }
+        args.insert("transport_destination".into(), json!(destination));
+        let result = self
+            .state
+            .fleet
+            .call(
+                &peer,
+                &author.0,
+                "secret_reveal",
+                Some(args),
+                Some(&src_root),
+            )
+            .await?;
+        if result.is_error == Some(true) {
+            return Err(kaed_error_from_value(
+                result.structured_content.unwrap_or_default(),
+            ));
+        }
+        let value = result
+            .structured_content
+            .as_ref()
+            .and_then(|v| v.get("value"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                KaedError::internal(format!(
+                    "peer {host:?} answered secret_reveal without a value"
+                ))
+            })?;
+        Ok(Zeroizing::new(value.to_owned()))
+    }
+
+    /// The proxy-path half of D-5: before forwarding an `edit` to a peer,
+    /// resolve every `value_from` naming a root that peer does not serve —
+    /// surgically, on the raw JSON (D-1 of 010: everything else passes
+    /// byte-for-byte), substituting the fetched value in memory.
+    async fn resolve_proxied_value_froms(
+        &self,
+        author: &Author,
+        target_host: &str,
+        target_root: &str,
+        args: &mut rmcp::model::JsonObject,
+    ) -> Result<(), KaedError> {
+        let Some(ops) = args.get_mut("ops").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        for op in ops {
+            let Some(obj) = op.as_object_mut() else {
+                continue;
+            };
+            if obj.get("op").and_then(Value::as_str) != Some("env_set") {
+                continue;
+            }
+            let Some(vf_value) = obj.get("value_from") else {
+                continue;
+            };
+            let src_root = vf_value.get("root").and_then(Value::as_str);
+            // No root, or a root on the target host: the peer resolves it.
+            if src_root.is_none_or(|r| r.split_once(':').is_some_and(|(h, _)| h == target_host)) {
+                continue;
+            }
+            let vf: ValueFrom = serde_json::from_value(vf_value.clone())
+                .map_err(|e| KaedError::invalid_input(format!("malformed value_from: {e}")))?;
+            let op_path = obj
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let destination = format!("{target_root}/{op_path}");
+            let fetched = self
+                .fetch_secret_value(author, &vf, &destination, true)
+                .await?;
+            obj.insert("value".into(), json!(*fetched));
+            obj.remove("value_from");
+        }
+        Ok(())
     }
 
     /// Fleet-wide search (D-5): expand the root pattern over this host's
@@ -1205,6 +1739,27 @@ impl KaedServer {
     }
 }
 
+/// Rebuild a `KaedError` from a peer's R4 error payload, so a failure on
+/// the far side of a fetch keeps its code, message and data through this
+/// hop instead of collapsing into `internal`.
+fn kaed_error_from_value(v: Value) -> KaedError {
+    let code = v
+        .get("code")
+        .cloned()
+        .and_then(|c| serde_json::from_value(c).ok())
+        .unwrap_or(crate::errors::ErrorCode::Internal);
+    let message = v
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("peer returned an error without a message")
+        .to_owned();
+    let e = KaedError::new(code, message);
+    match v.get("data").cloned() {
+        Some(data) => e.with_data(data),
+        None => e,
+    }
+}
+
 /// Serialize a `KaedError` into the R4 `isError` tool result, friction
 /// invitation attached — the one shape every failure leaves through.
 fn kaed_error_result(e: KaedError) -> Result<CallToolResult, ErrorData> {
@@ -1238,6 +1793,25 @@ impl ServerHandler for KaedServer {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         if let Some((peer, root)) = self.remote_target(&request) {
+            let mut request = request;
+            // The one exception to verbatim passthrough, and a narrow one
+            // (011 D-5): an `edit` op whose `value_from` names a root the
+            // TARGET host does not serve is resolved here — the secret
+            // moves through this process's memory, never the agent's
+            // context — and everything else forwards byte-for-byte.
+            if request.name == "edit" {
+                let Some(parts) = context.extensions.get::<http::request::Parts>() else {
+                    return Err(ErrorData::internal_error("no http parts on request", None));
+                };
+                let author = author_of(parts)?;
+                if let Some(args) = request.arguments.as_mut()
+                    && let Err(e) = self
+                        .resolve_proxied_value_froms(&author, &peer.host, &root, args)
+                        .await
+                {
+                    return Ok(kaed_error_result(e)?.into());
+                }
+            }
             let result = self.proxy_to_peer(peer, root, request, &context).await?;
             return Ok(result.into());
         }
@@ -1284,6 +1858,21 @@ impl ServerHandler for KaedServer {
              back. You rarely need plaintext: to *use* a value in a shell, \
              `set -a; . .env; set +a` and reference $KEY. Destroying a value \
              requires naming its key in `drop_keys`. \
+             The `secret` tool runs the whole lifecycle without disclosure: \
+             `describe` returns a durable HANDLE (root + path + key + \
+             digest) — carry THAT in a handoff, never a value; `generate` \
+             mints a fresh token server-side (you get a placeholder); \
+             `rotate` re-mints in place and `also` writes the same new \
+             value to other locations, even on other hosts; `occurrences` \
+             finds every copy on the host by digest. An `edit` env_set \
+             takes `value_from: {root, path, key, digest?}` to write a \
+             value by reference — across hosts, the bytes move between \
+             kaed instances and never through your context, and the source \
+             host journals the transfer. `env_sync_example` regenerates \
+             `.env.example` (keys and comments, values stubbed) safely. \
+             `secret_reveal` is the separately-permissioned escape hatch: \
+             one key, `intent` required, always journaled — read the audit \
+             trail back with journal kind \"secret\". \
              `list` and `search` also report `files_searched`: zero there \
              means your `glob`/`path` selected nothing, not that the pattern \
              is absent — `glob` matches root-relative paths, so it is not \
@@ -1507,6 +2096,7 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
         )),
         limits: resolved.limits,
         journal,
+        secrets: resolved.secrets,
     });
     let auth = Arc::new(AuthState {
         identities: RwLock::new(resolved.identities),

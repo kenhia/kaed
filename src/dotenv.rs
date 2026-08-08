@@ -204,6 +204,37 @@ impl DotenvFile {
         s
     }
 
+    /// The `.env.example` rendering (011 D-7): keys and comments preserved
+    /// in order, every value stubbed empty. Comments run through the shape
+    /// detector, so an old token pasted into one does not ride into a file
+    /// that exists to be committed.
+    pub fn example(&self) -> String {
+        let mut s = self
+            .lines
+            .iter()
+            .map(|l| match &l.kind {
+                LineKind::Blank => l.raw.clone(),
+                LineKind::Comment => secrets::redact_free_text(&l.raw),
+                LineKind::Entry(e) => {
+                    format!("{}{}=", if e.export { "export " } else { "" }, e.key)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if self.trailing_newline {
+            s.push('\n');
+        }
+        s
+    }
+
+    /// True when no entry holds a value — a file that discloses nothing.
+    pub fn all_values_empty(&self) -> bool {
+        self.lines.iter().all(|l| match &l.kind {
+            LineKind::Entry(e) => e.value.is_empty(),
+            _ => true,
+        })
+    }
+
     pub fn entries(&self) -> Vec<EntryView> {
         self.lines
             .iter()

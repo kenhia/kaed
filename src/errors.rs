@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     NotFound,
@@ -56,6 +56,9 @@ pub enum RefusalReason {
     ClassifiedOpaque,
     /// `.kaedignore` files are policy and cannot be written through kaed.
     KaedignoreProtected,
+    /// `[secrets] allow_reveal = false`: this host refuses `secret_reveal`
+    /// outright (011 D-1). The lifecycle verbs still work.
+    RevealDisabled,
 }
 
 impl fmt::Display for RefusalReason {

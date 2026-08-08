@@ -51,6 +51,7 @@ async fn start_instance(
         deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
         classify: std::sync::Arc::new(kaed::policy::Classifier::empty()),
         auth: auth_spec,
+        secrets: Default::default(),
     };
     let (app, auth) = kaed::server::build_app(resolved)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -560,6 +561,222 @@ async fn peer_token_rotation_reloads_without_restart() -> anyhow::Result<()> {
     );
 
     let _ = gw.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// Sprint 011, PD-3's payoff: a secret written on one host reaches another
+/// by REFERENCE. The agent passes a handle (`value_from`), the gateway
+/// moves the bytes in its own memory, the source host journals the exit,
+/// the target journals a redacted write — and no tool response anywhere in
+/// the exchange ever contains the value.
+#[tokio::test]
+async fn a_cross_host_value_from_carries_the_secret_without_the_agent() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    std::fs::write(
+        alpha.workdir_path.join(".env"),
+        format!("SERVICE_TOKEN={VALUE}\n"),
+    )?;
+    let digest = kaed::secrets::digest_of(VALUE);
+    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+
+    // gateway-local source → remote target, one proxied edit
+    let edit = call(
+        &gw,
+        "edit",
+        json!({
+            "root": "beta:scratch",
+            "base": [],
+            "ops": [
+                {"op": "create", "path": "svc.env", "content": ""},
+                {"op": "env_set", "path": "svc.env", "key": "CLIENT_TOKEN",
+                 "value_from": {"root": "alpha:scratch", "path": ".env",
+                                "key": "SERVICE_TOKEN", "digest": digest}}
+            ],
+            "intent": "hand the service its token by reference"
+        }),
+    )
+    .await;
+    assert_ne!(edit.is_error, Some(true), "{:?}", edit.structured_content);
+    assert!(
+        !serde_json::to_string(&edit.structured_content)?.contains(VALUE),
+        "the edit response leaked the value"
+    );
+    let on_beta = std::fs::read_to_string(beta.workdir_path.join("svc.env"))?;
+    assert!(
+        on_beta.contains(&format!("CLIENT_TOKEN={VALUE}")),
+        "the value landed on beta: {on_beta}"
+    );
+
+    // the SOURCE host journaled the exit: a transport event, disclosed,
+    // with the claimed destination (D-5/D-6)
+    let exit = structured(&call(&gw, "journal", json!({"kind": ["secret"]})).await);
+    let event = &exit["entries"][0];
+    assert_eq!(event["action"], "transport");
+    assert_eq!(event["disclosed"], true);
+    assert_eq!(event["root"], "alpha:scratch");
+    assert_eq!(event["key"], "SERVICE_TOKEN");
+    assert_eq!(event["destination"], "beta:scratch/svc.env");
+    assert_eq!(event["author"], "claude");
+
+    // the TARGET journaled a redacted transaction under the real author
+    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let beta_journal = structured(&call(&direct, "journal", json!({})).await);
+    let txn = &beta_journal["entries"][0];
+    assert_eq!(txn["kind"], "txn");
+    assert_eq!(txn["author"], "claude");
+
+    // a stale digest refuses loudly BEFORE anything crosses (PD-3)
+    let stale = call(
+        &gw,
+        "edit",
+        json!({
+            "root": "beta:scratch",
+            "base": [],
+            "ops": [{"op": "env_set", "path": "svc.env", "key": "AGAIN",
+                     "value_from": {"root": "alpha:scratch", "path": ".env",
+                                    "key": "SERVICE_TOKEN",
+                                    "digest": "0000000000000000"}}],
+        }),
+    )
+    .await;
+    assert_eq!(stale.is_error, Some(true));
+    assert_eq!(structured(&stale)["data"]["reason"], "digest_mismatch");
+
+    let _ = gw.cancel().await;
+    let _ = direct.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// The reverse direction: the source is on the PEER, the target is local.
+/// The gateway fetches through the peer's `secret_reveal` under the
+/// caller's identity, so the disclosure is journaled on the host the value
+/// left — as a transport with the claimed destination, not an agent reveal.
+#[tokio::test]
+async fn a_peer_sourced_value_from_journals_the_exit_on_the_peer() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+    const VALUE: &str = "2f6b8a1e9c4d4e7ab3f50d8c6a2e9b41";
+    std::fs::write(
+        beta.workdir_path.join(".env"),
+        format!("ISSUED_TOKEN={VALUE}\n"),
+    )?;
+    std::fs::write(alpha.workdir_path.join("app.env"), "")?;
+    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+
+    let version = kaed::fsops::version_of(b"");
+    let edit = call(
+        &gw,
+        "edit",
+        json!({
+            "root": "alpha:scratch",
+            "base": [{"path": "app.env", "version": version}],
+            "ops": [{"op": "env_set", "path": "app.env", "key": "TOKEN",
+                     "value_from": {"root": "beta:scratch", "path": ".env",
+                                    "key": "ISSUED_TOKEN"}}],
+        }),
+    )
+    .await;
+    assert_ne!(edit.is_error, Some(true), "{:?}", edit.structured_content);
+    assert!(
+        std::fs::read_to_string(alpha.workdir_path.join("app.env"))?
+            .contains(&format!("TOKEN={VALUE}"))
+    );
+    assert!(
+        !serde_json::to_string(&edit.structured_content)?.contains(VALUE),
+        "the edit response leaked the value"
+    );
+
+    // beta journaled the disclosure; alpha's secret stream stays empty (the
+    // value ARRIVED here, it did not leave here)
+    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let exit = structured(&call(&direct, "journal", json!({"kind": ["secret"]})).await);
+    let event = &exit["entries"][0];
+    assert_eq!(event["action"], "transport");
+    assert_eq!(event["author"], "claude");
+    assert_eq!(event["destination"], "alpha:scratch/app.env");
+    let local = structured(&call(&gw, "journal", json!({"kind": ["secret"]})).await);
+    assert_eq!(local["entries"].as_array().unwrap().len(), 0);
+
+    let _ = gw.cancel().await;
+    let _ = direct.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// PD-3's preferred path over the transport fallback: rotate on the
+/// gateway with a remote `also` target writes both hosts in one call —
+/// the same fresh value, never seen by the agent, each host journaling its
+/// own side.
+#[tokio::test]
+async fn rotate_writes_both_hosts_via_a_remote_also_target() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    std::fs::write(
+        alpha.workdir_path.join(".env"),
+        format!("SHARED_TOKEN={VALUE}\n"),
+    )?;
+    std::fs::write(
+        beta.workdir_path.join(".env"),
+        format!("SHARED_TOKEN={VALUE}\n"),
+    )?;
+    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+
+    let rotated = call(
+        &gw,
+        "secret",
+        json!({
+            "action": "rotate", "root": "alpha:scratch", "path": ".env",
+            "key": "SHARED_TOKEN",
+            "version": kaed::fsops::version_of(format!("SHARED_TOKEN={VALUE}\n").as_bytes()),
+            "also": [{"root": "beta:scratch", "path": ".env",
+                      "version": kaed::fsops::version_of(format!("SHARED_TOKEN={VALUE}\n").as_bytes())}],
+        }),
+    )
+    .await;
+    assert_ne!(
+        rotated.is_error,
+        Some(true),
+        "{:?}",
+        rotated.structured_content
+    );
+    let r = structured(&rotated);
+    assert_eq!(r["targets"].as_array().unwrap().len(), 2);
+    assert!(r["targets"][1]["applied"].as_bool().unwrap(), "{r}");
+
+    let on_alpha = std::fs::read_to_string(alpha.workdir_path.join(".env"))?;
+    let on_beta = std::fs::read_to_string(beta.workdir_path.join(".env"))?;
+    let new_value = on_alpha
+        .lines()
+        .find_map(|l| l.strip_prefix("SHARED_TOKEN="))
+        .expect("rotated key");
+    assert_ne!(new_value, VALUE);
+    assert_eq!(on_alpha, on_beta, "both hosts hold the same new value");
+    assert!(
+        !serde_json::to_string(&r)?.contains(new_value),
+        "the rotate response leaked the value"
+    );
+
+    // each side journaled its own half: rotate + transport on the gateway,
+    // an ordinary redacted txn on the peer under the real author
+    let stream = structured(&call(&gw, "journal", json!({"kind": ["secret"]})).await);
+    let actions: Vec<&str> = stream["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["transport", "rotate"]);
+    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let beta_journal = structured(&call(&direct, "journal", json!({})).await);
+    assert_eq!(beta_journal["entries"][0]["author"], "claude");
+
+    let _ = gw.cancel().await;
+    let _ = direct.cancel().await;
     alpha.ct.cancel();
     beta.ct.cancel();
     Ok(())

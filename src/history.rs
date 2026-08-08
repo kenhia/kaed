@@ -50,6 +50,8 @@ pub enum RecordKind {
     Failure,
     /// A friction report filed through `feedback`.
     Feedback,
+    /// A secrets-audit event (011): generate / rotate / reveal / transport.
+    Secret,
 }
 
 /// Why a journalled row names a root this host cannot resolve today.
@@ -152,6 +154,37 @@ pub enum Entry {
         #[serde(skip_serializing_if = "Option::is_none")]
         context: Option<String>,
     },
+    /// One secrets-audit event: what happened to a value, never the value.
+    /// `disclosed: true` means it left kaed — toward the calling agent
+    /// (`reveal`) or another host (`transport`, with the claimed
+    /// `destination`). This stream is how "has any agent ever seen this
+    /// secret?" gets answered.
+    Secret {
+        event_id: i64,
+        author: String,
+        time: String,
+        /// `generate` | `rotate` | `reveal` | `transport`
+        action: String,
+        root: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        historical: Option<Historical>,
+        path: String,
+        key: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        old_digest: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_digest: Option<String>,
+        disclosed: bool,
+        /// The caller's claim about where the value went (D-6): kaed
+        /// cannot verify bytes after they leave, and says so here rather
+        /// than implying otherwise.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        txn_id: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
+    },
 }
 
 impl Entry {
@@ -159,7 +192,8 @@ impl Entry {
         match self {
             Entry::Txn { time, .. }
             | Entry::Failure { time, .. }
-            | Entry::Feedback { time, .. } => time,
+            | Entry::Feedback { time, .. }
+            | Entry::Secret { time, .. } => time,
         }
     }
 }
@@ -178,6 +212,11 @@ pub struct CoverageInfo {
     pub failures_from: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback_from: Option<String>,
+    /// Earliest secrets-audit event (011). Same rule as `failures_from`:
+    /// the stream begins here, and a window reaching back further is
+    /// silent about disclosures, not clean of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets_from: Option<String>,
     /// Days blob *content* survives. Transaction metadata is kept forever;
     /// past this window `diff` can name a version it can no longer render.
     pub blob_retention_days: u32,
@@ -232,7 +271,12 @@ pub fn journal(
 ) -> Result<JournalResult> {
     let max = q.max.clamp(1, MAX_ENTRIES_CEILING);
     let kinds = if q.kinds.is_empty() {
-        vec![RecordKind::Txn, RecordKind::Failure, RecordKind::Feedback]
+        vec![
+            RecordKind::Txn,
+            RecordKind::Failure,
+            RecordKind::Feedback,
+            RecordKind::Secret,
+        ]
     } else {
         q.kinds.clone()
     };
@@ -283,6 +327,26 @@ pub fn journal(
             summary: redact_note(&f.summary),
             detail: f.detail.as_deref().map(redact_note),
             context: f.context.as_deref().map(redact_note),
+        }));
+    }
+    if kinds.contains(&RecordKind::Secret) {
+        let rows = j.secret_events(&filter)?;
+        scanned += rows.len();
+        entries.extend(rows.into_iter().map(|e| Entry::Secret {
+            event_id: e.id,
+            author: e.author,
+            time: e.created_at,
+            action: e.action,
+            historical: historical(&e.root, roots, host),
+            root: e.root,
+            path: e.path,
+            key: e.key,
+            old_digest: e.old_digest,
+            new_digest: e.new_digest,
+            disclosed: e.disclosed,
+            destination: e.destination,
+            txn_id: e.txn_id,
+            intent: e.intent.as_deref().map(redact_note),
         }));
     }
 
@@ -353,6 +417,7 @@ fn coverage_info(j: &Journal, since: Option<&str>) -> Result<CoverageInfo> {
         txns_from,
         failures_from,
         feedback_from,
+        secrets_from,
     } = j.coverage()?;
     let mut notes = vec![READS_NOT_JOURNALED.to_string()];
     // The dated boundary #910 left behind: on any host that ran kaed
@@ -379,6 +444,7 @@ fn coverage_info(j: &Journal, since: Option<&str>) -> Result<CoverageInfo> {
         txns_from,
         failures_from,
         feedback_from,
+        secrets_from,
         blob_retention_days: j.blob_retention_days(),
         notes,
     })
@@ -950,6 +1016,7 @@ mod tests {
                 Entry::Txn { .. } => "txn",
                 Entry::Failure { .. } => "failure",
                 Entry::Feedback { .. } => "feedback",
+                Entry::Secret { .. } => "secret",
             })
             .collect();
         assert!(kinds.contains(&"txn"), "{kinds:?}");
@@ -1290,6 +1357,7 @@ mod tests {
                     path: ".env".into(),
                     key: "NEW_FLAG".into(),
                     value: Some("on".into()),
+                    value_from: None,
                     comment: None,
                 }],
                 dry_run: false,
@@ -1621,6 +1689,7 @@ mod tests {
                     path: ".env".into(),
                     key: "FLAG".into(),
                     value: Some("on".into()),
+                    value_from: None,
                     comment: None,
                 }],
                 dry_run: false,
