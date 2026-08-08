@@ -60,15 +60,51 @@ pub fn dir_is_writable(dir: &Path) -> bool {
     }
 }
 
-/// Who kaed is, to the kernel. The uid is the fact; the name is a
-/// convenience read from the environment systemd's `User=` sets, and is
-/// omitted rather than guessed when it is absent.
+/// Whether kaed could enumerate or open this directory. The addressed
+/// counterpart of the skip-and-count rule: `list`/`search` *walking* into
+/// an unreadable directory skip it, but a caller who named it gets a
+/// reason.
+pub fn dir_is_readable(dir: &Path) -> bool {
+    use rustix::fs::{Access, AtFlags};
+    match rustix::fs::accessat(
+        rustix::fs::CWD,
+        dir,
+        Access::READ_OK | Access::EXEC_OK,
+        AtFlags::EACCESS,
+    ) {
+        Ok(()) => true,
+        Err(e) => e != rustix::io::Errno::ACCESS && e != rustix::io::Errno::PERM,
+    }
+}
+
+/// Who kaed is, to the kernel.
+///
+/// The uid is the fact. The *name* is resolved from `/etc/passwd` rather
+/// than from `$USER`, because the environment can disagree with the
+/// kernel (`sudo -E`, a unit whose `User=` was changed without a restart)
+/// — and an error naming the wrong user sends its reader to fix the wrong
+/// thing, which is the failure this whole module exists to stop. No name
+/// is a better answer than a plausible wrong one.
 fn service_identity() -> serde_json::Value {
     let uid = rustix::process::geteuid().as_raw();
-    match std::env::var("USER").or_else(|_| std::env::var("LOGNAME")) {
-        Ok(user) if !user.is_empty() => json!({ "uid": uid, "user": user }),
-        _ => json!({ "uid": uid }),
+    match user_name_of(uid) {
+        Some(user) => json!({ "uid": uid, "user": user }),
+        None => json!({ "uid": uid }),
     }
+}
+
+/// `uid` → login name, straight out of `/etc/passwd`. Deliberately not
+/// `getpwuid`: this avoids an `unsafe` block and an NSS round trip for a
+/// field that is a convenience, and a host whose users live only in LDAP
+/// simply gets the uid.
+fn user_name_of(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut f = line.split(':');
+        let name = f.next()?;
+        let _passwd = f.next()?;
+        (f.next()?.parse::<u32>().ok()? == uid).then(|| name.to_owned())
+    })
 }
 
 /// The owning uid/gid and mode of a path, when it can still be stat'ed.
@@ -156,7 +192,6 @@ pub fn not_writable(root: &ResolvedRoot, rel: &str, dir: &Path) -> KaedError {
         ),
     )
     .merge_data(evidence(root, dir, "directory"))
-    .merge_data(json!({ "path": rel }))
 }
 
 /// Root bypasses DAC, so every test in this sprint is vacuous under it.

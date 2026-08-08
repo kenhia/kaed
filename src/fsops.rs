@@ -417,6 +417,13 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             p.path
         )));
     }
+    // Addressed, not enumerated: a directory the caller NAMED gets a
+    // reason, where one merely walked into is skipped and counted (014
+    // D-6). An empty listing for a directory kaed cannot open is honest
+    // about the count and useless about the cause.
+    if !crate::perm::dir_is_readable(&base) {
+        return Err(crate::perm::not_readable(root, p.path, &base));
+    }
     let matcher = match p.glob {
         Some(g) => Some(
             globset::GlobBuilder::new(g)

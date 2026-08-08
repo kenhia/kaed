@@ -106,7 +106,15 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
     let denied_hidden = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut unreadable_hidden = 0usize;
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    if base.is_file() {
+    // Addressed, not enumerated (014 D-6): whatever `path` NAMED gets a
+    // reason if the OS refuses it. Only what the walk *finds* is skipped
+    // and counted — a zero for the file you asked about, with a count of
+    // one beside it, is the #1091 complaint wearing a different hat.
+    let addressed_file = base.is_file();
+    if !addressed_file && !crate::perm::dir_is_readable(&base) {
+        return Err(crate::perm::not_readable(root, p.path, &base));
+    }
+    if addressed_file {
         files.push(base);
     } else {
         let walker = {
@@ -191,6 +199,9 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
             Ok(b) => b,
             Err(e) => {
                 if crate::perm::is_permission_denied(&e) {
+                    if addressed_file {
+                        return Err(crate::perm::not_readable(root, p.path, abs));
+                    }
                     unreadable_hidden += 1;
                 }
                 continue;
@@ -754,6 +765,44 @@ mod tests {
         assert_eq!(paths, ["plain.txt"]);
         assert_eq!(r.unreadable_hidden, 1);
         assert_eq!(r.files_searched, 1);
+    }
+
+    /// D-6's other half. Skip-and-count is the right answer for what a
+    /// walk *finds*; for what the caller *named*, it is the #1091
+    /// complaint wearing a different hat — a zero with a count beside it
+    /// and no reason, no owner and no route.
+    #[test]
+    fn an_addressed_unreadable_path_refuses_instead_of_counting() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = setup();
+        write(dir.path(), "prometheus/prometheus.yml", "needle\n");
+        std::fs::set_permissions(
+            dir.path().join("prometheus/prometheus.yml"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join("locked")).unwrap();
+        let restore = lock_dir(dir.path(), "locked");
+
+        for (path, subject) in [("prometheus/prometheus.yml", "path"), ("locked", "path")] {
+            let err = search(
+                &root,
+                &SearchParams {
+                    path,
+                    ..params("needle")
+                },
+                &Limits::default(),
+            )
+            .unwrap_err();
+            let v = serde_json::to_value(&err).unwrap();
+            assert_eq!(v["code"], "denied", "{path}");
+            assert_eq!(v["data"]["reason"], "not_readable_by_service_identity");
+            assert_eq!(v["data"][subject], path);
+        }
+        restore();
     }
 
     /// Zero is the common case and must stay off the wire, like its
