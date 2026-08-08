@@ -54,6 +54,8 @@ enters the shipped defaults.
 
 - D-6 names a cheap future improvement: a structured "not writable by the
   service identity" error, gated on journal evidence that agents actually
-  hit root-owned files.
+  hit root-owned files. The host-side half — a `composer` group making
+  that config group-writable, plus a mechanism for catching new root-owned
+  files — is korg #1085 (claude-cleo, brainstorm).
 - After deploy, the next journal-report pass gains its first third-host
   column; the roots decision here is exactly what that pass should audit.

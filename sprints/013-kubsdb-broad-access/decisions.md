@@ -194,6 +194,11 @@ justifies. If journals later show agents actually hitting these (a
 "not writable by the service identity" error is a cheap follow-up —
 noted, not built.
 
+The *host-side* half — whether these files should be group-writable by a
+dedicated group (`composer`) that the service identity belongs to, which
+files fall in the category, and how new root-owned config gets caught —
+is korg #1085 (claude-cleo, brainstorm), deliberately not decided here.
+
 ## D-7 — Nothing changes in the shipped defaults; the sprint is config + one pin test
 
 The fourth #929 question answered: `DEFAULT_DENY` and `DEFAULT_CLASSIFY`
