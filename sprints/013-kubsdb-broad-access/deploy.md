@@ -57,6 +57,9 @@ deny = [
     "/datastore/*/data",
     "/datastore/_retired",
     "/datastore/packages",
+    # korg #1088 interim (post-live-test): root-owned 700 dir kills the
+    # search walker (EACCES); remove once the walker skips-and-counts
+    "/datastore/lost+found",
 ]
 ```
 
@@ -158,12 +161,17 @@ behaviour, not just liveness):
 - `read kubsdb:datastore korg/korg.env` → placeholders only
   (`⟨kaed:DATABASE_URL@…⟩`); no value crossed the wire.
 
-Remaining battery items (fleet search fan-out, hvsim dry_run, direct
-journal read, root-owned-file io error, value-probe search) are covered
-by Ken's live test from cleo, results to land beside this file like 010's
-`live-test.md`.
+The remaining battery items landed in [live-test.md](live-test.md) —
+run from cleo through the kai gateway, all of D-1…D-5 verified from a
+real client. Its three findings: F-1 → korg #1088 (search dies on
+EACCES; interim `/datastore/lost+found` deny entry applied to the host
+and reflected in the config above — the deny list at merge time had five
+entries, the live one has six), F-2 → korg #1089 (single-peer root
+pattern proxied wholesale), F-3 → evidence added to korg #1085 (the
+composer-group discussion; if that lands, the D-6 class mostly
+disappears).
 
-**Known doc staleness for the follow-up chore PR**: the deploy-fleet
-skill's fleet table and its "kubsdb is deliberately NOT in the fleet"
-warning, CLAUDE.md's fleet status ("kubsdb deliberately has no
-instance"), and `docs/setup.md`'s fleet examples all predate this deploy.
+Doc staleness from this deploy was fixed in the follow-up chore PR (the
+deploy-fleet skill's fleet table and kubsdb warning, CLAUDE.md's fleet
+status). `docs/setup.md`'s peer examples turned out to be host-generic
+teaching material, not stale claims — left alone.
