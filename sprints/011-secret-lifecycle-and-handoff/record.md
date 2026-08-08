@@ -111,6 +111,36 @@ the peer, and rotate-both-hosts). Contract gained R11 and the two tool
 sections; capabilities gained `secret_lifecycle`; `deploy/
 config.example.toml`, `docs/setup.md` and `CLAUDE.md` updated.
 
+## Deployed 2026-08-08
+
+Shipped as PR #12 (squash `26b2635`), published as `0.1.0-26b2635` and
+installed from the store on both hosts (`install.sh --from-store`).
+Rollback target: `0.1.0-596c37f` (each host's `kaed.prev`, or the store).
+
+| host | installed | `kaed --version` | unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | 0.1.0-26b2635 | match | active | `0.1.0 (26b2635 2026-08-07)` |
+| kubs0 | 0.1.0-26b2635 | match | active | `0.1.0 (26b2635 2026-08-07)` |
+
+Verified live, against what this sprint actually changed (not just "the
+unit is up"):
+
+- Both hosts list `secret` and `secret_reveal` in `tools/list`, and
+  `check-config` prints the new `secrets:` line (reveal allowed, no named
+  shapes configured yet).
+- **Full lifecycle on kai over the real URL**: `secret generate`
+  (`hex(64)`, into a scratch dotenv) minted a 64-char value that landed
+  on disk and appeared in **no response** — the placeholder came back,
+  the plaintext never did. The audit row (`journal` kind `"secret"`,
+  action `generate`) and `coverage.secrets_from` were live in the same
+  session. Smoke dir removed afterwards.
+- **Gateway intact post-deploy**: `roots` on kai probes kubs0
+  `verified` / `probe: ok`, and kubs0's merged root entries advertise
+  `secret_lifecycle` (the union rule carrying the new capability).
+
+No config edits were needed on either host (`[secrets]` defaults apply);
+named shapes (e.g. a `klams` prefix) are a deliberate later config step.
+
 ## Follow-ups
 
 - Write-side leak detection (#1053, next slice) gets the shape registry and
