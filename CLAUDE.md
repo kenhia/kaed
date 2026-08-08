@@ -148,8 +148,24 @@ fails, and what the journal structurally cannot tell you — see
   every derived surface (diff, conflict delta, search hits, journal blobs)
   is redacted too, and `search` runs over the redacted rendering, so a
   value probe matches nothing by construction. Destroying a value needs
-  `drop_keys`; there is deliberately no `reveal` and no plaintext shadow —
-  do not add either without reopening D-11/#1051.
+  `drop_keys`; there is no plaintext shadow — do not add one without
+  reopening D-11/#1051.
+- **The secret lifecycle is 011** (R11 in the contract;
+  `sprints/011-secret-lifecycle-and-handoff/decisions.md`): a `secret`
+  tool (describe / generate / rotate / occurrences) that never returns a
+  value, over a **closed** shape grammar (`src/shapes.rs` — no
+  `passphrase`, deliberately), and `secret_reveal` as its **own tool**
+  because harness per-tool permissioning is the gate. Three things not to
+  re-derive: **`describe` IS `load_secret`** — the handle is
+  `{root, path, key, digest}` persisted in the file itself, never a second
+  store (PD-3/D-2); **the 008 measurement came back zero**, which is why
+  reveal is minimal (one key, `intent` required, `allow_reveal`
+  kill-switch) — widen it only with new evidence; and **cross-host
+  `value_from` moves bytes kaed-to-kaed** (source host journals a
+  `transport` audit event, gateway journals nothing, agent context never
+  holds the value). The audit stream is `journal` kind `"secret"`;
+  `destination` on transport rows is the caller's *claim*, and D-6 says
+  why that is the honest ceiling.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

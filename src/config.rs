@@ -36,11 +36,40 @@ pub struct Config {
     pub journal: JournalConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
     /// The declared fleet: every *other* host that should, or deliberately
     /// should not, run kaed. `None` — the table absent entirely — is the
     /// `never-declared` state, and is reported as such rather than being
     /// silently indistinguishable from "this host is the whole fleet".
     pub peers: Option<BTreeMap<String, PeerConfig>>,
+}
+
+/// The secret lifecycle (011): named shapes and the reveal kill-switch.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// Named shape entries: name → a spec in the closed grammar
+    /// (`hex(N)`, `base64url(N)`, `uuid4`, `prefixed(tag,inner)`), e.g.
+    /// `klams = "prefixed(klams-,hex(64))"`. `secret` / `generate` accepts
+    /// either a name from here or a raw spec. Validated at startup.
+    #[serde(default)]
+    pub shapes: BTreeMap<String, String>,
+    /// Refuse `secret_reveal` outright when false (011 D-1). The
+    /// load-bearing gate is that `secret_reveal` is its own tool and the
+    /// harness prompts per tool; this switch exists for hosts where even
+    /// that surface is unwanted.
+    #[serde(default = "default_true")]
+    pub allow_reveal: bool,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            shapes: BTreeMap::new(),
+            allow_reveal: true,
+        }
+    }
 }
 
 /// One declared fleet member. Statuses carry the evidence for themselves:
@@ -431,6 +460,16 @@ impl Config {
         let identities = resolve_identities(&self.auth);
         let peers = self.resolve_peers(&host)?;
 
+        // Named shapes are validated at startup: a bad spec is a config
+        // bug, and failing the first `generate` instead would waste an
+        // agent's turn on an operator's typo.
+        let mut shapes = BTreeMap::new();
+        for (name, spec) in &self.secrets.shapes {
+            let shape = crate::shapes::parse_spec(spec)
+                .map_err(|e| anyhow::anyhow!("[secrets] shapes.{name}: {}", e.message))?;
+            shapes.insert(name.clone(), shape);
+        }
+
         Ok(Resolved {
             bind: self.server.bind,
             allowed_hosts: self.server.allowed_hosts.clone(),
@@ -444,6 +483,10 @@ impl Config {
             deny,
             classify,
             auth: self.auth.clone(),
+            secrets: ResolvedSecrets {
+                shapes,
+                allow_reveal: self.secrets.allow_reveal,
+            },
         })
     }
 
@@ -676,6 +719,23 @@ pub struct Resolved {
     /// Where each identity's token lives, kept so SIGHUP can re-read them
     /// without reparsing the config file.
     pub auth: BTreeMap<String, AuthEntry>,
+    pub secrets: ResolvedSecrets,
+}
+
+/// `[secrets]` after validation: named shapes parsed, ready to mint.
+#[derive(Debug, Clone)]
+pub struct ResolvedSecrets {
+    pub shapes: BTreeMap<String, crate::shapes::Shape>,
+    pub allow_reveal: bool,
+}
+
+impl Default for ResolvedSecrets {
+    fn default() -> Self {
+        Self {
+            shapes: BTreeMap::new(),
+            allow_reveal: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

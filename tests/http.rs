@@ -84,6 +84,7 @@ async fn start_server_with(
         deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
         classify: std::sync::Arc::new(kaed::policy::Classifier::empty()),
         auth: auth_spec,
+        secrets: Default::default(),
     };
     let (app, auth) = kaed::server::build_app(resolved)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -241,7 +242,17 @@ async fn lists_the_tool_surface() -> anyhow::Result<()> {
     assert_eq!(
         names,
         [
-            "diff", "edit", "feedback", "journal", "list", "read", "revert", "roots", "search",
+            "diff",
+            "edit",
+            "feedback",
+            "journal",
+            "list",
+            "read",
+            "revert",
+            "roots",
+            "search",
+            "secret",
+            "secret_reveal",
             "stat"
         ]
     );
@@ -429,6 +440,191 @@ async fn secrets_loop_redacted_read_env_edit_and_drop_keys() -> anyhow::Result<(
         .await?;
     assert_ne!(confirmed.is_error, Some(true));
     assert!(!std::fs::read_to_string(server.workdir_path.join(".env"))?.contains("DEBUG"));
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// Sprint 011's lifecycle over the wire: `secret` mints and rotates
+/// without ever disclosing a value, `describe` hands out the durable
+/// handle, `value_from` consumes one, `secret_reveal` is its own gated
+/// tool, and the whole trail reads back as journal kind "secret".
+#[tokio::test]
+async fn secret_lifecycle_generate_rotate_handle_and_audit() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    std::fs::write(
+        server.workdir_path.join(".env"),
+        format!("KLAMS_TOKEN={VALUE}\n"),
+    )?;
+    let client = connect(&server).await?;
+    let version = |path: &str| -> anyhow::Result<String> {
+        Ok(kaed::fsops::version_of(
+            std::fs::read_to_string(server.workdir_path.join(path))?.as_bytes(),
+        ))
+    };
+
+    // 1. describe = load_secret: the handle, never the value
+    let described = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("secret").with_arguments(args(json!({
+                    "action": "describe", "root": ROOT, "path": ".env", "key": "KLAMS_TOKEN"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(described["shape"], "hex");
+    assert_eq!(described["handle"]["root"], ROOT);
+    let digest = described["digest"].as_str().unwrap().to_string();
+    assert_eq!(
+        described["handle_line"].as_str().unwrap(),
+        format!("{ROOT}/.env#KLAMS_TOKEN@{digest}")
+    );
+    assert!(
+        !serde_json::to_string(&described)?.contains(VALUE),
+        "describe leaked the value"
+    );
+
+    // 2. generate: minted server-side; the response carries a placeholder
+    let generated = client
+        .call_tool(
+            CallToolRequestParams::new("secret").with_arguments(args(json!({
+                "action": "generate", "root": ROOT, "path": ".env", "key": "MINTED",
+                "version": version(".env")?, "shape": "hex(64)",
+                "intent": "wire test mint"
+            }))),
+        )
+        .await?;
+    assert_ne!(generated.is_error, Some(true), "{generated:?}");
+    let g = structured(&generated);
+    let disk = std::fs::read_to_string(server.workdir_path.join(".env"))?;
+    let minted = disk
+        .lines()
+        .find_map(|l| l.strip_prefix("MINTED="))
+        .expect("minted key on disk")
+        .to_string();
+    assert_eq!(minted.len(), 64);
+    assert!(
+        !serde_json::to_string(&g)?.contains(&minted),
+        "generate leaked the value"
+    );
+
+    // 3. an edit consumes the handle: create a service env in the same txn
+    // and copy the token into it by value_from — never holding plaintext
+    let copied = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [],
+                "ops": [
+                    {"op": "create", "path": "svc/.env", "content": ""},
+                    {"op": "env_set", "path": "svc/.env", "key": "CLIENT_TOKEN",
+                     "value_from": {"path": ".env", "key": "KLAMS_TOKEN", "digest": digest}}
+                ],
+                "intent": "hand the token to the service by reference"
+            }))),
+        )
+        .await?;
+    assert_ne!(copied.is_error, Some(true), "{copied:?}");
+    assert!(
+        std::fs::read_to_string(server.workdir_path.join("svc/.env"))?
+            .contains(&format!("CLIENT_TOKEN={VALUE}")),
+        "value_from must write the real value"
+    );
+
+    // 4. rotate: same shape, new entropy, occurrences fed the also-target
+    let occurrences = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("secret").with_arguments(args(json!({
+                    "action": "occurrences", "root": ROOT, "path": ".env", "key": "KLAMS_TOKEN"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(occurrences["occurrences"].as_array().unwrap().len(), 2);
+    let rotated = client
+        .call_tool(
+            CallToolRequestParams::new("secret").with_arguments(args(json!({
+                "action": "rotate", "root": ROOT, "path": ".env", "key": "KLAMS_TOKEN",
+                "version": version(".env")?,
+                "also": [{"path": "svc/.env", "key": "CLIENT_TOKEN",
+                          "version": version("svc/.env")?}]
+            }))),
+        )
+        .await?;
+    assert_ne!(rotated.is_error, Some(true), "{rotated:?}");
+    let r = structured(&rotated);
+    assert_eq!(r["old_digest"].as_str().unwrap(), digest);
+    let live = std::fs::read_to_string(server.workdir_path.join(".env"))?;
+    let new_value = live
+        .lines()
+        .find_map(|l| l.strip_prefix("KLAMS_TOKEN="))
+        .unwrap();
+    assert_ne!(new_value, VALUE);
+    assert!(
+        std::fs::read_to_string(server.workdir_path.join("svc/.env"))?
+            .contains(&format!("CLIENT_TOKEN={new_value}")),
+        "the also-target got the same new value"
+    );
+
+    // 5. reveal: intent required, then disclosed and journaled
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("secret_reveal").with_arguments(args(json!({
+                "root": ROOT, "path": ".env", "key": "KLAMS_TOKEN", "intent": ""
+            }))),
+        )
+        .await?;
+    assert_eq!(refused.is_error, Some(true));
+    let revealed = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("secret_reveal").with_arguments(args(json!({
+                    "root": ROOT, "path": ".env", "key": "KLAMS_TOKEN",
+                    "intent": "carry to a host kaed does not serve"
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(revealed["value"], new_value);
+    assert_eq!(revealed["disclosed"], true);
+
+    // 6. the audit stream: journal kind "secret", newest first
+    let audit = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("journal")
+                    .with_arguments(args(json!({"kind": ["secret"]}))),
+            )
+            .await?,
+    );
+    let actions: Vec<&str> = audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["reveal", "rotate", "rotate", "generate"]);
+    assert_eq!(audit["entries"][0]["disclosed"], true);
+    assert!(audit["coverage"]["secrets_from"].is_string());
+
+    // 7. the example sync rides the edit envelope
+    let synced = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": ".env", "version": version(".env")?}],
+                "ops": [{"op": "env_sync_example", "path": ".env"}]
+            }))),
+        )
+        .await?;
+    assert_ne!(synced.is_error, Some(true), "{synced:?}");
+    let example = std::fs::read_to_string(server.workdir_path.join(".env.example"))?;
+    assert!(example.contains("KLAMS_TOKEN=\n"), "{example}");
+    assert!(!example.contains(new_value), "{example}");
 
     let _ = client.cancel().await;
     server.ct.cancel();

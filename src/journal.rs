@@ -80,6 +80,29 @@ CREATE TABLE IF NOT EXISTS feedback (
   context    TEXT,
   created_at TEXT NOT NULL
 );
+-- The secrets audit stream (011): every generate / rotate / reveal /
+-- transport, as events and claims, NEVER payloads. Digests only, and only
+-- above the entropy floor (PD-2). `disclosed` = the value left kaed toward
+-- the caller or another host; `destination` is the caller's *claim* about
+-- where (D-6). Metadata clock: kept forever, like txns — this stream is
+-- what makes \"has any agent ever seen this secret?\" answerable.
+CREATE TABLE IF NOT EXISTS secret_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  author      TEXT NOT NULL,
+  action      TEXT NOT NULL,
+  root        TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  key         TEXT NOT NULL,
+  old_digest  TEXT,
+  new_digest  TEXT,
+  disclosed   INTEGER NOT NULL DEFAULT 0,
+  destination TEXT,
+  txn_id      INTEGER,
+  intent      TEXT,
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS secret_events_by_key
+  ON secret_events(root, path, key);
 ";
 
 /// How often blob GC runs while the daemon is up. Retention is measured in
@@ -304,6 +327,45 @@ pub struct FeedbackRow {
     pub created_at: String,
 }
 
+/// One row of the secrets audit stream (011). An *event*, never a payload:
+/// digests and locations, `disclosed` when the value left kaed, and the
+/// caller's claimed `destination` for transports.
+#[derive(Debug)]
+pub struct SecretEventRow {
+    pub id: i64,
+    pub author: String,
+    /// `generate` | `rotate` | `reveal` | `transport`
+    pub action: String,
+    pub root: String,
+    pub path: String,
+    pub key: String,
+    pub old_digest: Option<String>,
+    pub new_digest: Option<String>,
+    pub disclosed: bool,
+    pub destination: Option<String>,
+    pub txn_id: Option<i64>,
+    pub intent: Option<String>,
+    pub created_at: String,
+}
+
+/// What `add_secret_event` records. Digest fields must already respect the
+/// entropy floor (pass `None` below it) — the journal stores what it is
+/// given and discloses nothing on its own.
+#[derive(Debug, Default)]
+pub struct SecretEvent<'a> {
+    pub author: &'a str,
+    pub action: &'a str,
+    pub root: &'a str,
+    pub path: &'a str,
+    pub key: &'a str,
+    pub old_digest: Option<&'a str>,
+    pub new_digest: Option<&'a str>,
+    pub disclosed: bool,
+    pub destination: Option<&'a str>,
+    pub txn_id: Option<i64>,
+    pub intent: Option<&'a str>,
+}
+
 /// The earliest record of each kind. What `journal` reports as `coverage`
 /// (D-2): a window reaching back before `failures_from` predates #910 and
 /// its silence about failures is not evidence there were none.
@@ -312,6 +374,9 @@ pub struct Coverage {
     pub txns_from: Option<String>,
     pub failures_from: Option<String>,
     pub feedback_from: Option<String>,
+    /// Earliest secrets-audit event (011). Same honesty rule as
+    /// `failures_from`: a window reaching back past it is silent, not clean.
+    pub secrets_from: Option<String>,
 }
 
 /// The query axes sprint 006's evidence pass actually used, minus the
@@ -578,6 +643,96 @@ impl Journal {
         Ok(rows)
     }
 
+    /// The secrets audit stream (011), newest first. `path` filters exactly
+    /// (an event names one file, so subtree matching rides the same rule as
+    /// txns via LIKE).
+    pub fn secret_events(&self, f: &HistoryFilter<'_>) -> Result<Vec<SecretEventRow>> {
+        let conn = self.lock();
+        let mut sql = String::from(
+            "SELECT id, author, action, root, path, key, old_digest, new_digest,
+                    disclosed, destination, txn_id, intent, created_at
+               FROM secret_events WHERE 1=1",
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(root) = f.root {
+            args.push(Box::new(root.to_owned()));
+            sql.push_str(&format!(" AND root = ?{}", args.len()));
+        }
+        if let Some(author) = f.author {
+            args.push(Box::new(author.to_owned()));
+            sql.push_str(&format!(" AND author = ?{}", args.len()));
+        }
+        if let Some(since) = f.since {
+            args.push(Box::new(since.to_owned()));
+            sql.push_str(&format!(" AND created_at >= ?{}", args.len()));
+        }
+        if let Some(path) = f.path {
+            let path = path.trim_end_matches('/');
+            args.push(Box::new(path.to_owned()));
+            let exact = args.len();
+            args.push(Box::new(format!("{path}/%")));
+            sql.push_str(&format!(
+                " AND (path = ?{exact} OR path LIKE ?{})",
+                args.len()
+            ));
+        }
+        args.push(Box::new(f.limit as i64));
+        sql.push_str(&format!(" ORDER BY id DESC LIMIT ?{}", args.len()));
+
+        let params: Vec<&dyn rusqlite::ToSql> = args.iter().map(AsRef::as_ref).collect();
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+        let rows = stmt
+            .query_map(params.as_slice(), |r| {
+                Ok(SecretEventRow {
+                    id: r.get(0)?,
+                    author: r.get(1)?,
+                    action: r.get(2)?,
+                    root: r.get(3)?,
+                    path: r.get(4)?,
+                    key: r.get(5)?,
+                    old_digest: r.get(6)?,
+                    new_digest: r.get(7)?,
+                    disclosed: r.get::<_, i64>(8)? != 0,
+                    destination: r.get(9)?,
+                    txn_id: r.get(10)?,
+                    intent: r.get(11)?,
+                    created_at: r.get(12)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// Record one secrets-audit event. `intent` arrives already redacted —
+    /// the caller owns that, as with feedback (D-5 of 009).
+    pub fn add_secret_event(&self, e: &SecretEvent<'_>) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO secret_events
+               (author, action, root, path, key, old_digest, new_digest,
+                disclosed, destination, txn_id, intent, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                e.author,
+                e.action,
+                e.root,
+                e.path,
+                e.key,
+                e.old_digest,
+                e.new_digest,
+                e.disclosed as i64,
+                e.destination,
+                e.txn_id,
+                e.intent,
+                now()
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// File a friction report. Text arrives already redacted — the caller
     /// owns that, because the caller knows it is free text (D-5).
     pub fn add_feedback(
@@ -612,6 +767,7 @@ impl Journal {
             txns_from: first("SELECT min(started_at) FROM txns")?,
             failures_from: first("SELECT min(failed_at) FROM txn_failures")?,
             feedback_from: first("SELECT min(created_at) FROM feedback")?,
+            secrets_from: first("SELECT min(created_at) FROM secret_events")?,
         })
     }
 }
@@ -1230,6 +1386,7 @@ mod tests {
                     path: ".env".into(),
                     key: "NEW_FLAG".into(),
                     value: Some("on".into()),
+                    value_from: None,
                     comment: None,
                 }],
                 dry_run: false,

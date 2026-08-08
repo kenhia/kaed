@@ -143,3 +143,11 @@ deny = [
 ]
 # classify = ["**/service.conf"]   # extra redaction targets, same shapes
 # use_default_classify = true      # the built-in classify list above
+
+# The secret lifecycle (011). `secret` / generate accepts either a raw spec
+# from the closed grammar — hex(N), base64url(N), uuid4, prefixed(tag,inner)
+# — or a name declared here. Specs are validated at startup.
+# [secrets]
+# allow_reveal = true              # false refuses secret_reveal host-wide
+# [secrets.shapes]
+# klams = "prefixed(klams-,hex(64))"

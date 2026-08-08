@@ -132,7 +132,7 @@ const PROVIDER_PREFIXES: &[&str] = &[
     "AIza",
 ];
 
-fn provider_prefix(token: &str) -> Option<&'static str> {
+pub(crate) fn provider_prefix(token: &str) -> Option<&'static str> {
     PROVIDER_PREFIXES.iter().copied().find(|p| {
         token
             .strip_prefix(p)

@@ -42,7 +42,7 @@ on it without a verification round-trip.
 
 ## What works today
 
-Ten tools over streamable HTTP with per-agent bearer auth:
+Twelve tools over streamable HTTP with per-agent bearer auth:
 
 | tool | what it does |
 |---|---|
@@ -52,7 +52,9 @@ Ten tools over streamable HTTP with per-agent bearer auth:
 | `read` | whole file, a line range, or a window around a line or unique anchor |
 | `search` | ripgrep-grade, every hit carrying its file's version; root patterns (`*:*`) search the whole fleet in one call |
 | `edit` | anchor/range replace + create + typed dotenv ops; multi-file, atomic, `dry_run` |
-| `journal` | what happened here: applied writes, failed attempts and friction reports, merged |
+| `secret` | the secret lifecycle without disclosure: describe (a durable handle), generate, rotate, occurrences |
+| `secret_reveal` | the escape hatch — its own tool so it can be permissioned separately; always journaled |
+| `journal` | what happened here: applied writes, failed attempts, friction reports and secret-audit events, merged |
 | `diff` | any two states of a file — a version, a transaction, or the working tree |
 | `revert` | undo a transaction as a new transaction; never history rewriting |
 | `feedback` | tell kaed it got in your way; one required field |
@@ -89,7 +91,20 @@ back. The agent edits a secrets file without ever holding a secret. Diffs,
 conflict deltas, search hits and journal blobs are redacted too; destroying
 a value must be declared (`drop_keys`); and a gitignore-shaped
 `.kaedignore` (or an in-file `# kaedignore` marker) opts paths out of kaed
-entirely. There is deliberately no reveal operation.
+entirely.
+
+The `secret` tool runs the whole lifecycle on the same terms: kaed mints
+values server-side from a closed shape grammar (`hex(64)`,
+`base64url(43)`, `uuid4`, `prefixed(tag,inner)`), so an agent can create
+and rotate a token it has never seen — and `describe` returns a durable
+**handle** (root + path + key + content digest) that a later session, even
+on another host, can hand to `edit` as `value_from` to write the value by
+reference: across hosts the bytes move between kaed instances, never
+through the agent's context. Every generate, rotate, reveal and transport
+lands in a secrets audit stream (`journal` kind `"secret"`), which is what
+makes "has any agent ever seen this token?" an answerable question.
+Revealing plaintext exists but is deliberately its own tool, one key at a
+time, with a required `intent` and a host-wide off switch.
 
 Any instance can also be its fleet's **gateway**: declare peers with URLs
 and per-identity tokens, and calls addressing another host's roots are

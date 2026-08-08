@@ -210,6 +210,13 @@ The sprints so far:
   hop (per-author tokens per backend — journal attribution on the target is
   identical to a direct call), errors passed through verbatim, and
   fleet-wide search under one budget with per-root truncation reporting.
+- **011 — the secret lifecycle.** kaed mints, rotates and moves secrets an
+  agent never sees: server-side generation from a closed shape grammar,
+  durable handles (location + content digest, persisted in the file itself)
+  that later sessions consume by reference — across hosts, through the
+  gateway's memory rather than the agent's context — and a secrets audit
+  stream that makes "has any agent ever seen this token?" answerable.
+  Revealing plaintext is deliberately a separate, always-journaled tool.
 
 ## Where it is going
 
@@ -231,12 +238,12 @@ Roughly in order, with the reasoning in
   cost. The evidence for whether the bet paid off. Until that exists, "kaed is
   better" is a hypothesis.
 
-Further out, and genuinely uncertain: the rest of the secrets lifecycle
-(blind generate/rotate, where kaed writes a secret an agent never sees, and
-cross-host secret handoff riding the gateway), per-region versioning so two
-agents can edit disjoint parts of one file, and kaed as a *local* tool
-alongside an agent's built-in editing — the "if we got this right" bet,
-which needs the dogfood report first.
+Further out, and genuinely uncertain: write-side leak detection (kaed sees
+every write, so a known secret heading into a README can be caught at the
+moment it happens), per-region versioning so two agents can edit disjoint
+parts of one file, and kaed as a *local* tool alongside an agent's built-in
+editing — the "if we got this right" bet, which needs the dogfood report
+first.
 
 ## Reading further
 

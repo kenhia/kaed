@@ -105,9 +105,41 @@ agent-filed feedback. Nothing here is frozen.
   text, and journal blobs — and a write that would destroy a value
   (delete, or overwrite by a new literal) refuses unless the key is named
   in the edit's `drop_keys`: the value may never have been seen and kaed
-  keeps no recoverable shadow. There is deliberately no `reveal` yet
-  (measure the pressure first); to *use* a value, source the file in a
-  shell (`set -a; . .env; set +a`).
+  keeps no recoverable shadow. To *use* a value, source the file in a
+  shell (`set -a; . .env; set +a`); to manage one, R11's lifecycle never
+  needs plaintext, and `secret_reveal` (011, shipped minimal after the
+  pressure measurement came back empty) is the separately-permissioned
+  escape hatch.
+- **R11 — the secret lifecycle never discloses, and every disclosure is
+  journaled (011).** The `secret` tool (describe / generate / rotate /
+  occurrences) returns placeholders, digests and handles — never a value:
+  kaed mints server-side from a **closed** shape grammar (`hex(N)`,
+  `base64url(N)`, `uuid4`, `prefixed(tag,inner)`, plus named
+  `[secrets] shapes` entries), so an agent can create and rotate a token
+  it has never seen. `secret_reveal` is deliberately its **own tool** —
+  harness permissioning is per-tool, and that split is the load-bearing
+  gate — one key per call, `intent` required, refusable host-wide with
+  `[secrets] allow_reveal = false` (`denied` / `reveal_disabled`).
+
+  A **secret handle** is `{root, path, key, digest}` — host-qualified
+  location plus the PD-2 BLAKE3 digest, persisted in the file itself
+  (never a second store; R1's rule applied to values). Location is what
+  you *resolve* (current value); digest is what you *verify* (exact
+  value); a digest that no longer matches **fails loudly**
+  (`digest_mismatch`) rather than silently resolving to current. A
+  handoff carries the handle, never the value.
+
+  `edit` consumes handles via `env_set.value_from`. Across hosts, the
+  bytes move kaed-to-kaed under the caller's identity — through gateway
+  memory, never through the agent's context (PD-3, Ken's accepted risk) —
+  and are zeroed after use. Every generate / rotate / reveal / transport
+  lands in the **secrets audit stream** (`journal` kind `"secret"`;
+  `coverage.secrets_from` dates its beginning): events, digests and
+  *claimed* destinations, never payloads. The gateway journals nothing it
+  proxies (010 D-7); the source host journals the value's exit, the
+  target its redacted write. Cross-host rotation (`rotate.also` on
+  another host's root) is **not atomic** — the response reports
+  per-target outcomes.
 - **R5 — three addressing modes, one engine.** Content **anchor** (unique
   match, robust to line drift), **range@version** (line numbers valid only
   against a declared version), **node** (tree-sitter selector). Identical
@@ -367,9 +399,18 @@ One tool, transactional, all addressing modes.
       {"op": "env_set", "path": ".env", "key": "KLAMS_TOKEN",
        "value?": "literal or ⟨kaed:KEY@digest⟩ placeholder",
        "comment?": "replaces the attached comment block"},
+      {"op": "env_set", "path": "svc/.env", "key": "CLIENT_TOKEN",
+       // R11: write by handle — same root resolves in the engine, other
+       // roots/hosts resolve at the instance that took the call; `digest`
+       // means exact-or-fail-loudly, omitting it means current-value
+       "value_from?": {"root?": "kai:src", "path": ".env",
+                       "key": "KLAMS_TOKEN", "digest?": "a3f9c2d41b7e5860"}},
       {"op": "env_rename", "path": ".env", "from": "OLD", "to": "NEW"},
       {"op": "env_delete", "path": ".env", "key": "OLD_TOKEN"},
-      {"op": "env_reorder", "path": ".env", "keys": ["A", "B", "C"]}
+      {"op": "env_reorder", "path": ".env", "keys": ["A", "B", "C"]},
+      // regenerate `.env.example`: keys + comments, values stubbed empty;
+      // an existing example must be declared in `base` (R11)
+      {"op": "env_sync_example", "path": ".env", "example_path?": ".env.example"}
     ],
     "dry_run?": false,
     "return_diff?": true,     // default true
@@ -407,11 +448,55 @@ One tool, transactional, all addressing modes.
     silently resolving to the current value. A write that makes a value
     vanish refuses unless its key is in `drop_keys` (R9).
 
+### Secrets (R11)
+
+#### `secret`
+The lifecycle — four actions, none of which ever returns a value.
+- **In:** `{action: "describe"|"generate"|"rotate"|"occurrences", root,
+  path, key, version? (generate/rotate — R2), shape? (generate: required,
+  a `[secrets] shapes` name or a spec; rotate: override for undetectable
+  values), comment?, also?: [{root?, path, key?, version}], intent?}`
+- `describe` → `{key, shape, len, digest?, placeholder?, handle: {root,
+  path, key, digest?}, handle_line, rotatable_by_detection}`. This **is**
+  `load_secret`: the handle is the durable cross-session reference (PD-3),
+  recomputed from the file on every call — nothing to expire. Digest
+  withheld below the entropy floor (PD-2), and then equality/staleness are
+  deliberately unanswerable.
+- `generate` → mints server-side, writes via the ordinary transaction
+  engine (journaled, redacted), returns `{txn_id, placeholder, handle, …}`.
+  New keys only — replacing a value is `rotate`, so "this destroys a
+  value" stays attached to the verb that means it.
+- `rotate` → same shape (detected from the current value; undetectable
+  refuses without an explicit `shape` — kaed does not guess, and
+  provider-issued tokens are deliberately undetectable), new entropy.
+  Primary plus same-root `also` targets land in ONE transaction; targets
+  on other hosts are proxied writes under the caller's identity,
+  reported per-target (`targets[].applied/error`) — not atomic, and it
+  says so. Rotation's overwrite needs no `drop_keys`: it *is* the verb.
+- `occurrences` → every classified-dotenv entry on this host sealing the
+  same value, by digest equality over redacted renderings; feeds
+  `rotate.also`. Fleet-wide is deliberately not a second mechanism:
+  `search {pattern: <digest>, root: "*:*"}` already answers it (010).
+
+#### `secret_reveal`
+The escape hatch, its own tool so the harness prompts for it separately.
+- **In:** `{root, path, key, intent (required), expected_digest?,
+  transport_destination?}`
+- **Out:** `{key, value, digest?, disclosed: true, note}` — the one field
+  in the whole surface that carries plaintext, and the response says to
+  surface the disclosure to the human.
+- Refuses: empty `intent`; unclassified files (read those directly);
+  `expected_digest` mismatch (loud, PD-3); the whole tool when
+  `[secrets] allow_reveal = false` (`denied` / `reveal_disabled`).
+- Always journaled as a `secret` audit event — `transport_destination`
+  (set by kaed itself when this reveal feeds a cross-host `value_from`)
+  makes it a `transport` row with the claimed destination.
+
 ### History
 
 #### `journal`
 - **In:** `{root?, path?, author?, since?, kind?: ["txn"|"failure"|
-  "feedback"], max? (default 20, capped at 200)}`
+  "feedback"|"secret"], max? (default 20, capped at 200)}`
 - **Out:**
   ```jsonc
   {
@@ -426,12 +511,18 @@ One tool, transactional, all addressing modes.
        "root": "kai:src", "paths": ["src/txn.rs"], "code": "version_conflict",
        "message": "…", "expected_version": "…", "actual_version": "…"},
       {"kind": "feedback", "feedback_id": 3, "author": "claude", "time": "…",
-       "category": "friction", "summary": "…", "detail": "…", "context": "…"}
+       "category": "friction", "summary": "…", "detail": "…", "context": "…"},
+      {"kind": "secret", "event_id": 5, "author": "claude", "time": "…",
+       "action": "generate" /* | rotate | reveal | transport */,
+       "root": "kai:src", "path": ".env", "key": "KLAMS_TOKEN",
+       "old_digest": "…", "new_digest": "…", "disclosed": false,
+       "destination": "kubs0:src/svc/.env" /* transport: the CLAIM */,
+       "txn_id": 42, "intent": "…"}
     ],
     "truncated": false,
     "records_scanned": 3,
     "coverage": {"txns_from": "…", "failures_from": "…", "feedback_from": "…",
-                 "blob_retention_days": 7, "notes": ["…"]},
+                 "secrets_from": "…", "blob_retention_days": 7, "notes": ["…"]},
     "reason": {"code": "…", "hint": "…"}
   }
   ```
@@ -579,7 +670,7 @@ And the zero that used to lie (R8's sibling, korg #1066):
 | Excluded | Why | Where it lands |
 |---|---|---|
 | `exec` / shell | Agents have ssh; mutation surface stays file-only | never |
-| `secret_reveal` | ship redaction first, measure the real pressure for plaintext; per-tool permissioning is the point of a separate tool | Next (#1051), evidence permitting |
+| ~~`secret_reveal`~~ | the 008 measurement found zero live pressure, so it shipped **minimal**: one key, required intent, always journaled, config kill-switch (R11) | shipped in 011 |
 | git operations | git-over-ssh works; journal records `git_head` for correlation | never (correlation only) |
 | `apply_patch` (unified-diff input) | overlaps `edit` ops; wait for demand | Next, if dogfooding misses it |
 | LSP semantics (rename-symbol, references) | heavy lifecycle; tree-sitter first | Later |

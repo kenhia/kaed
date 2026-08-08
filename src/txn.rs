@@ -68,12 +68,17 @@ pub enum EditOp {
     /// and/or replaces its comment block. New key: appended, `value`
     /// required. A `value` that is exactly a placeholder is substituted
     /// with the real value it seals — the agent passes handles through
-    /// verbatim and never holds plaintext (D-9).
+    /// verbatim and never holds plaintext (D-9). `value_from` writes the
+    /// value another file's key holds, by handle (011 D-5) — same rule,
+    /// wider reach: same root resolves here; the server resolves other
+    /// roots and other hosts before the transaction ever sees it.
     EnvSet {
         path: String,
         key: String,
         #[serde(default)]
         value: Option<String>,
+        #[serde(default)]
+        value_from: Option<ValueFrom>,
         #[serde(default)]
         comment: Option<String>,
     },
@@ -89,6 +94,32 @@ pub enum EditOp {
     /// Rearrange entries into this exact order (a permutation of the
     /// current keys). Entry positions and spacing stay; contents move.
     EnvReorder { path: String, keys: Vec<String> },
+    /// Regenerate `path`'s example file (default `<path>.example`): keys
+    /// and comments preserved, every value stubbed empty (011 D-7). The
+    /// safe direction of the operation where an agent used to copy a real
+    /// value by accident. An existing example must be declared in `base`.
+    EnvSyncExample {
+        path: String,
+        #[serde(default)]
+        example_path: Option<String>,
+    },
+}
+
+/// A secret reference consumed by `env_set` (011 D-5, PD-3): resolve by
+/// location, verify by digest. No digest = current-value semantics; a
+/// digest = exact-or-fail-loudly.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ValueFrom {
+    /// Host-qualified root holding the source. Defaults to the edit's own
+    /// root. A root on another host is resolved by the gateway (the value
+    /// transits its memory, never the agent's context — PD-3).
+    pub root: Option<String>,
+    pub path: String,
+    pub key: String,
+    /// From a handle / placeholder. When given, a changed source value
+    /// fails the edit instead of silently writing whatever is current.
+    pub digest: Option<String>,
 }
 
 impl EditOp {
@@ -100,7 +131,8 @@ impl EditOp {
             | EditOp::EnvSet { path, .. }
             | EditOp::EnvRename { path, .. }
             | EditOp::EnvDelete { path, .. }
-            | EditOp::EnvReorder { path, .. } => path,
+            | EditOp::EnvReorder { path, .. }
+            | EditOp::EnvSyncExample { path, .. } => path,
         }
     }
 }
@@ -462,16 +494,31 @@ fn apply_inner(
                 path,
                 key,
                 value,
+                value_from,
                 comment,
             } => {
+                if value.is_some() && value_from.is_some() {
+                    return Err(KaedError::invalid_input(format!(
+                        "{path}: env_set {key:?} takes `value` or `value_from`, not both"
+                    )));
+                }
+                // A same-root reference resolves here, against the on-disk
+                // source (or its evolving buffer if this txn is editing
+                // it). Other roots and other hosts were resolved by the
+                // server before the transaction began (011 D-5).
+                let from_value = value_from
+                    .as_ref()
+                    .map(|vf| resolve_value_from(root, vf, &bufs, limits, path))
+                    .transpose()?;
                 let buf = declared(&mut bufs, path)?;
                 let mut file = parse_dotenv_buf(path, buf)?;
                 // placeholders resolve against the buffer as previous ops
                 // left it — a value set earlier in this txn is addressable
-                let resolved = value
-                    .as_deref()
-                    .map(|v| dotenv::resolve_value(&file, path, v))
-                    .transpose()?;
+                let resolved = match (&from_value, value.as_deref()) {
+                    (Some(v), _) => Some(v.clone()),
+                    (None, Some(v)) => Some(dotenv::resolve_value(&file, path, v)?),
+                    (None, None) => None,
+                };
                 file.set(key, resolved.as_deref(), comment.as_deref())
                     .map_err(|e| KaedError::new(e.code, format!("{path}: {}", e.message)))?;
                 buf.content = file.render();
@@ -500,6 +547,47 @@ fn apply_inner(
                     .map_err(|e| KaedError::new(e.code, format!("{path}: {}", e.message)))?;
                 buf.content = file.render();
                 buf.touched = true;
+            }
+            EditOp::EnvSyncExample { path, example_path } => {
+                let example_rel = example_path
+                    .clone()
+                    .unwrap_or_else(|| format!("{path}.example"));
+                if example_rel == *path {
+                    return Err(KaedError::invalid_input(format!(
+                        "{path}: env_sync_example cannot target the live file itself"
+                    )));
+                }
+                let source = declared(&mut bufs, path)?;
+                let example_content = parse_dotenv_buf(path, source)?.example();
+                if let Some(buf) = bufs.get_mut(&example_rel) {
+                    buf.content = example_content;
+                    buf.touched = true;
+                } else {
+                    let abs = fsops::resolve_creatable(root, &example_rel)?;
+                    if abs.exists() {
+                        // A generated file, but silently clobbering hand
+                        // edits would break R2's promise: declare it.
+                        return Err(KaedError::invalid_input(format!(
+                            "{example_rel}: already exists — declare it in `base` with \
+                             its version so this sync is an ordinary versioned edit"
+                        )));
+                    }
+                    let classified = root.classify.classified_by(&abs);
+                    bufs.insert(
+                        example_rel.clone(),
+                        FileBuf {
+                            abs,
+                            old_content: None,
+                            content: example_content,
+                            old_version: None,
+                            mode: CREATE_MODE,
+                            touched: true,
+                            classified,
+                        },
+                    );
+                }
+                // size check below keys off the op's own path; the example
+                // shrank from the source, which was already checked
             }
         }
         let buf = &bufs[path];
@@ -575,6 +663,9 @@ fn apply_inner(
     let warnings: Vec<String> = touched
         .iter()
         .filter(|(_, buf)| buf.classified.is_some())
+        // an all-empty dotenv (a synced `.env.example`) discloses nothing,
+        // and it exists precisely to be committed — no warning for it
+        .filter(|(_, buf)| !dotenv::parse(&buf.content).is_some_and(|f| f.all_values_empty()))
         .filter_map(|(path, buf)| policy::gitignore_warning(&buf.abs, path))
         .collect();
 
@@ -678,6 +769,73 @@ fn refuse_text_op_on_classified(path: &str, buf: &FileBuf) -> Result<()> {
         ))),
         None => Ok(()),
     }
+}
+
+/// Resolve a same-root `value_from` (011 D-5): the evolving buffer when
+/// this transaction is also editing the source, else the on-disk file
+/// through every policy layer (`load_text` — a denied or opaque source
+/// refuses exactly as a read would). A digest that no longer matches fails
+/// loudly rather than silently writing the current value (PD-3).
+fn resolve_value_from(
+    root: &ResolvedRoot,
+    vf: &ValueFrom,
+    bufs: &BTreeMap<String, FileBuf>,
+    limits: &Limits,
+    target_path: &str,
+) -> Result<String> {
+    if let Some(r) = vf.root.as_deref()
+        && r != root.name
+    {
+        // The server resolves every reference beyond this root — other
+        // local roots and other hosts — before the engine runs. Reaching
+        // here means it did not, which is a routing gap, not a file state.
+        return Err(KaedError::invalid_input(format!(
+            "{target_path}: value_from names root {r:?}, but this transaction runs \
+             on {:?} — cross-root references are resolved before the engine, so \
+             the instance that accepted this call could not (or did not) resolve \
+             {r:?}; check `roots` for whether it can route there",
+            root.name
+        )));
+    }
+    let content_owned;
+    let content: &str = match bufs.get(&vf.path) {
+        Some(buf) => &buf.content,
+        None => {
+            let loaded = fsops::load_text(root, &vf.path, limits)?;
+            content_owned = loaded.content;
+            &content_owned
+        }
+    };
+    let file = dotenv::parse(content).ok_or_else(|| {
+        KaedError::invalid_input(format!(
+            "{target_path}: value_from source {} is not dotenv-shaped",
+            vf.path
+        ))
+    })?;
+    let entry = file.get(&vf.key).ok_or_else(|| {
+        KaedError::not_found(format!(
+            "{target_path}: value_from source {} has no key {:?}",
+            vf.path, vf.key
+        ))
+    })?;
+    if let Some(d) = &vf.digest
+        && crate::secrets::digest_of(&entry.value) != *d
+    {
+        return Err(KaedError::invalid_input(format!(
+            "{target_path}: value_from digest mismatch for {:?} in {} — the value \
+             changed since that handle was taken. Re-describe the key and decide \
+             whether current is what you want (omit `digest` for current-value \
+             semantics)",
+            vf.key, vf.path
+        ))
+        .with_data(serde_json::json!({
+            "reason": "digest_mismatch",
+            "path": vf.path,
+            "key": vf.key,
+            "expected_digest": d,
+        })));
+    }
+    Ok(entry.value.clone())
 }
 
 /// Parse the evolving buffer for an env op. Env ops work on any strictly
@@ -1403,12 +1561,14 @@ mod tests {
                         path: ".env".into(),
                         key: "KLAMS_TOKEN_COPY".into(),
                         value: Some(ph),
+                        value_from: None,
                         comment: None,
                     },
                     EditOp::EnvSet {
                         path: ".env".into(),
                         key: "NEW_FLAG".into(),
                         value: Some("on".into()),
+                        value_from: None,
                         comment: Some("added by test".into()),
                     },
                 ],
@@ -1442,6 +1602,7 @@ mod tests {
                     path: ".env".into(),
                     key: "COPY".into(),
                     value: Some("⟨kaed:KLAMS_TOKEN@0000000000000000⟩".into()),
+                    value_from: None,
                     comment: None,
                 }],
             ),
@@ -1487,6 +1648,7 @@ mod tests {
                 path: ".env".into(),
                 key: "KLAMS_TOKEN".into(),
                 value: Some("overwritten".into()),
+                value_from: None,
                 comment: None,
             }],
         ] {
@@ -1561,6 +1723,7 @@ mod tests {
                     path: "settings.conf".into(),
                     key: "MODE".into(),
                     value: Some("slow".into()),
+                    value_from: None,
                     comment: None,
                 }],
             ),
@@ -1629,6 +1792,7 @@ mod tests {
                     path: ".env".into(),
                     key: "X".into(),
                     value: Some("y".into()),
+                    value_from: None,
                     comment: None,
                 }],
             ),
@@ -1644,6 +1808,263 @@ mod tests {
             "delta leaked plaintext: {delta}"
         );
         assert!(delta.contains("⟨kaed:KLAMS_TOKEN"), "{delta}");
+    }
+
+    // -------------------------------------------- value_from + sync (011)
+
+    #[test]
+    fn value_from_copies_across_files_in_the_same_root() {
+        let (dir, root, v_env) = classified_setup();
+        let v_svc = write(dir.path(), "svc/.env", "CLIENT_TOKEN=\n");
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v_env), base("svc/.env", &v_svc)],
+                vec![EditOp::EnvSet {
+                    path: "svc/.env".into(),
+                    key: "CLIENT_TOKEN".into(),
+                    value: None,
+                    value_from: Some(ValueFrom {
+                        root: None,
+                        path: ".env".into(),
+                        key: "KLAMS_TOKEN".into(),
+                        digest: Some(crate::secrets::digest_of(TOKEN_VALUE)),
+                    }),
+                    comment: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(
+            std::fs::read_to_string(dir.path().join("svc/.env"))
+                .unwrap()
+                .contains(&format!("CLIENT_TOKEN={TOKEN_VALUE}"))
+        );
+        // the proof stays redacted
+        assert!(!out.diff.unwrap().contains(TOKEN_VALUE));
+    }
+
+    #[test]
+    fn value_from_digest_mismatch_fails_loudly_and_applies_nothing() {
+        let (dir, root, v_env) = classified_setup();
+        let v_svc = write(dir.path(), "svc/.env", "CLIENT_TOKEN=\n");
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v_env), base("svc/.env", &v_svc)],
+                vec![EditOp::EnvSet {
+                    path: "svc/.env".into(),
+                    key: "CLIENT_TOKEN".into(),
+                    value: None,
+                    value_from: Some(ValueFrom {
+                        root: None,
+                        path: ".env".into(),
+                        key: "KLAMS_TOKEN".into(),
+                        digest: Some("0000000000000000".into()),
+                    }),
+                    comment: None,
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.data.as_ref().unwrap()["reason"], "digest_mismatch");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("svc/.env")).unwrap(),
+            "CLIENT_TOKEN=\n"
+        );
+    }
+
+    #[test]
+    fn value_from_and_value_are_mutually_exclusive() {
+        let (_dir, root, v) = classified_setup();
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSet {
+                    path: ".env".into(),
+                    key: "X".into(),
+                    value: Some("literal".into()),
+                    value_from: Some(ValueFrom {
+                        root: None,
+                        path: ".env".into(),
+                        key: "KLAMS_TOKEN".into(),
+                        digest: None,
+                    }),
+                    comment: None,
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("not both"), "{}", err.message);
+    }
+
+    #[test]
+    fn value_from_source_goes_through_every_policy_layer() {
+        let (dir, root, _) = classified_setup();
+        // an opaque-classified source (PEM shape under a classify rule)
+        std::fs::write(
+            dir.path().join("key.pem"),
+            "-----BEGIN PRIVATE KEY-----\nzzz\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let v_svc = write(dir.path(), "svc/.env", "CLIENT_TOKEN=\n");
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base("svc/.env", &v_svc)],
+                vec![EditOp::EnvSet {
+                    path: "svc/.env".into(),
+                    key: "CLIENT_TOKEN".into(),
+                    value: None,
+                    value_from: Some(ValueFrom {
+                        root: None,
+                        path: "key.pem".into(),
+                        key: "WHATEVER".into(),
+                        digest: None,
+                    }),
+                    comment: None,
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert_eq!(err.data.unwrap()["reason"], "classified_opaque");
+    }
+
+    #[test]
+    fn value_from_a_foreign_root_is_refused_at_the_engine() {
+        let (_dir, root, v) = classified_setup();
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSet {
+                    path: ".env".into(),
+                    key: "X".into(),
+                    value: None,
+                    value_from: Some(ValueFrom {
+                        root: Some("elsewhere:src".into()),
+                        path: ".env".into(),
+                        key: "K".into(),
+                        digest: None,
+                    }),
+                    comment: None,
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("elsewhere:src"), "{}", err.message);
+    }
+
+    #[test]
+    fn env_sync_example_stubs_values_and_redacts_comments() {
+        let (dir, root) = setup();
+        let content = format!(
+            "# how to run\n# old token: {TOKEN_VALUE} (rotated)\nKLAMS_TOKEN={TOKEN_VALUE}\n\nexport DEBUG=true\n"
+        );
+        let v = write(dir.path(), ".env", &content);
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSyncExample {
+                    path: ".env".into(),
+                    example_path: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        let example = std::fs::read_to_string(dir.path().join(".env.example")).unwrap();
+        assert!(example.contains("KLAMS_TOKEN=\n"), "{example}");
+        assert!(example.contains("export DEBUG=\n"), "{example}");
+        assert!(example.contains("# how to run"), "{example}");
+        assert!(
+            !example.contains(TOKEN_VALUE),
+            "comment token leaked into the example: {example}"
+        );
+        // the live file is untouched
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+            content
+        );
+
+        // an existing example must be declared in base…
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSyncExample {
+                    path: ".env".into(),
+                    example_path: None,
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("base"), "{}", err.message);
+
+        // …and once declared, the sync updates it
+        let v_ex = fsops::version_of(example.as_bytes());
+        let v2 = write(dir.path(), ".env", "NEW_KEY=x\n");
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v2), base(".env.example", &v_ex)],
+                vec![EditOp::EnvSyncExample {
+                    path: ".env".into(),
+                    example_path: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        let example = std::fs::read_to_string(dir.path().join(".env.example")).unwrap();
+        assert_eq!(example, "NEW_KEY=\n");
+    }
+
+    #[test]
+    fn env_sync_example_on_a_classified_env_warns_nothing() {
+        // the example is classified by name (`**/.env.*`) but holds no
+        // values, so the gitignore warning stays quiet for it
+        let (dir, root, v) = classified_setup();
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSyncExample {
+                    path: ".env".into(),
+                    example_path: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        let example = std::fs::read_to_string(dir.path().join(".env.example")).unwrap();
+        assert!(!example.contains(TOKEN_VALUE));
+        assert!(
+            !out.warnings.iter().any(|w| w.contains(".env.example")),
+            "an all-empty example must not warn: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn env_sync_example_refuses_the_live_file_as_target() {
+        let (_dir, root, v) = classified_setup();
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSyncExample {
+                    path: ".env".into(),
+                    example_path: Some(".env".into()),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("itself"), "{}", err.message);
     }
 
     #[test]
