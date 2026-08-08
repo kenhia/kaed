@@ -417,6 +417,19 @@ Repeat against the external URL if you exposed it.
 
 ## 7. Wire up a client
 
+**How many connections?** One per *entry point*, not one per host. A single
+instance means one connection, and that is the whole answer. A fleet whose
+gateway has peer routing configured (see [Gateway mode](#gateway-mode-routing-to-peers))
+also means **one connection — to the gateway**: its `roots` response carries
+every host's roots, calls addressing another host route there under your own
+identity, and the gateway-only client additionally gets fleet-wide search and
+unreachable-hosts-as-data. A second, permanent connection to a host the
+gateway already reaches is not a backup, it is strictly worse for the session
+that picks it — a half-fleet `roots` view, a duplicate set of tool schemas,
+no fleet search. Keep the backend's direct URL *documented* (it is the
+gateway-down fallback, and it should stay exercised), but wire it only when
+you need it.
+
 Add kaed as a custom MCP server / connector:
 
 - **URL:** `https://<host>.<tailnet>.ts.net:4870/mcp` (or
@@ -428,17 +441,20 @@ owns that file's format and encoding. Hand-editing it is where the accidents
 happen, and one of them cost this project every MCP server on a machine; see
 [the warning below](#name-every-entry-after-its-host).
 
-Name each entry after its host: `kaed-kai`, `kaed-kubs0` — never a bare
-`kaed`. With more than one instance, a bare name is the one an agent reaches
-for by default, and every wrong-machine edit still returns a
-successful-looking diff.
+Name the entry after the host it connects to: `kaed-kai` — never a bare
+`kaed`. The name says which machine answers, which matters the moment a
+second connection exists for any reason (a fallback wired during an outage,
+a host not behind the gateway), and a wrong-machine edit still returns a
+successful-looking diff. Note the name is the *connection's* target, not the
+fleet: a gateway entry named `kaed-kai` still serves `kubs0:*` roots, and
+that is fine — the roots themselves carry their host.
 
 For Claude Code, `.claude.json`:
 
 ```json
 {
   "mcpServers": {
-    "kaed": {
+    "kaed-myhost": {
       "type": "http",
       "url": "https://myhost.tailnet-name.ts.net:4870/mcp",
       "headers": { "Authorization": "Bearer PASTE_TOKEN_HERE" }
@@ -484,7 +500,7 @@ restart the client.
 > that would have caught this before a restart made it visible:
 >
 > ```powershell
-> .\deploy\check-client-config.ps1 -Expect kaed-kai,kaed-kubs0
+> .\deploy\check-client-config.ps1 -Expect kaed-kai
 > ```
 >
 > [`deploy/check-client-config.ps1`](../deploy/check-client-config.ps1) checks

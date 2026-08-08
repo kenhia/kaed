@@ -78,6 +78,15 @@ http + 9 installer tests):
 - Contract updated in place (`sprints/planning/mcp-contract.md`);
   reasoning in `contract-notes.md` beside this file.
 
+## Verified from a real client
+
+`live-test.md` beside this file records the client-side round: gateway mode
+exercised from cleo over the real tailnet, with the PD-4 attribution gate,
+D-3 verbatim passthrough and the conflict/re-anchor loop each checked against
+a *direct* connection to kubs0 as a control. All held. The one change it
+prompted was on the client, not in kaed — cleo's redundant `kaed-kubs0`
+connection was removed (korg #1074).
+
 ## Follow-ups
 
 - Deploy: add `url` + `[peers.<host>.tokens]` on kai (and kubs0 if it
