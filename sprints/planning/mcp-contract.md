@@ -63,6 +63,25 @@ agent-filed feedback. Nothing here is frozen.
   and the journal loses the edit too. (Peer-mode refusals ride the same
   code with `no_peer_credential` / `peer_credential_rejected` — R10.)
 
+  **The OS is the fifth refusing layer (014).** Unix ownership refuses
+  too, and used to do it as a bare `internal` / `Permission denied (os
+  error 13)` — the one error shape in the contract carrying no recovery
+  data, which is precisely what this posture exists to prevent. It now
+  rides the same `denied` code with
+  `not_readable_by_service_identity` / `not_writable_by_service_identity`,
+  and its `data` adds `service_identity` (the uid kaed runs as), `owner`
+  (uid/gid/mode of whatever refused), and `root_advisory` — the addressed
+  root's own `description`, verbatim, so a host that records where its
+  rendered files are managed from repeats it at the point of failure
+  instead of only in `roots`. Two consequences follow from *how* kaed
+  writes — a staged temp file plus a rename: **writability is a property
+  of the containing directory**, so a root-owned `0644` file inside a
+  writable directory really is editable through kaed while a file whose
+  directory is root-owned is not, whatever its own mode says; and
+  `dry_run` **probes that for real** rather than answering the content
+  question and presenting as if it answered the environment one. Same
+  probe, same refusal, on the dry and the real path.
+
   Errors that are plausibly **kaed's** fault also carry
   `data.feedback_invite` — a one-line ask, no round-trip, no standing
   invitation to ignore (see `feedback`). Narrow on purpose: `denied`,
@@ -82,7 +101,14 @@ agent-filed feedback. Nothing here is frozen.
   should never be retried; `data.reason` says which layer (R4).
   Enumeration (`list`, `search`) omits denied paths instead of failing,
   and reports `denied_hidden: N` so a filtered result is never mistaken
-  for the whole directory. Path checks are lexical, applied identically to
+  for the whole directory. `classified_hidden` and — since 014 —
+  `unreadable_hidden` are its siblings under the same rule: an entry the
+  OS would not let kaed enumerate or open is skipped and **counted**,
+  never fatal and never silent. (One `drwx------` directory used to kill
+  an entire `search`; kept separate from `denied_hidden` because the
+  remedies differ — one needs a human to change config, the other a
+  chmod, a different identity, or nothing at all.) Path checks are
+  lexical, applied identically to
   paths that exist and paths that don't, so a `denied` is never evidence
   that a file is there (the in-file marker is necessarily content-level:
   it is checked wherever content is opened — read, edit, search — and is
@@ -216,6 +242,15 @@ agent-filed feedback. Nothing here is frozen.
     `reason: no_peer_credential` — never a borrowed identity. A token the
     backend rejects → `denied` / `peer_credential_rejected`. Peer token
     files reload on SIGHUP, like every other credential (#914).
+  - **Patterns are expanded by the instance that was asked (014).**
+    Routing reads the host prefix, so a pattern naming exactly one peer
+    (`kubsdb:*`) used to forward wholesale — and the peer ran the fan-out
+    and answered with *its* `hosts_unavailable`, describing a fleet the
+    caller is not in. A `root` containing a glob is now always expanded
+    locally and only the resulting concrete peer roots are forwarded, so
+    `kubsdb:*`, `kai:*` and `*:*` are one code path. A host the pattern
+    excludes by name is not probed and therefore never reported
+    unavailable; a host it *includes* still reports an honest gap.
   - **Passthrough is verbatim.** Arguments are forwarded as received
     (routing reads only `root`), results return untouched, and error
     objects pass through whole plus a top-level `root` tag —
@@ -317,10 +352,12 @@ What this instance serves, and which hosts are supposed to.
 #### `list`
 - **In:** `{root, path?, glob?, depth? (default 1), max? }`
 - **Out:** `{entries: [{path, kind, size}], truncated, next_offset?,
-  entries_scanned, reason?, denied_hidden?}`
+  entries_scanned, reason?, denied_hidden?, unreadable_hidden?}`
 - Respects `.gitignore` by default (`ignored: true` to include).
 - `denied_hidden` counts entries the deny list removed (R7); a hidden
   directory counts once, subtree included. Absent when zero.
+- `unreadable_hidden` counts entries the OS would not let kaed enumerate
+  (014). Same rule, different remedy — see R7. Absent when zero.
 - `entries_scanned` is what the walk produced *before* `glob` — always
   present, including zero. See `search` for why.
 - `reason` (see `search`) when nothing matched at all. Absent for an empty
@@ -356,7 +393,7 @@ What this instance serves, and which hosts are supposed to.
   context? (default 2), max_results? (default 50)}`
 - **Out:** `{matches: [{path, version, line, col, text, before[],
   after[]}], truncated, total?, files_searched, reason?, denied_hidden?,
-  classified_hidden?}`
+  classified_hidden?, unreadable_hidden?}`
 - Ripgrep-grade server-side search. Each match carries its file's
   `version`, so a hit is directly addressable: search → edit with no read
   in between, safely (a stale hit becomes `version_conflict`, not a wrong
@@ -366,6 +403,10 @@ What this instance serves, and which hosts are supposed to.
   value matches nothing, by construction. Opaque-classified files are
   skipped whole and counted in `classified_hidden` (sibling of
   `denied_hidden`). Hit `version` stays the raw file's.
+- Entries the OS refuses — an undescendable directory, an unopenable file
+  — are skipped and counted in `unreadable_hidden` (014). One of them used
+  to kill the whole call, which made a broad root unsearchable without a
+  `path` scope.
 - **`files_searched` is always present, including zero.** `0 matches in 41
   files` and `0 matches in 0 files` are different answers, and until they
   were distinguishable a scoping mistake was outcome-identical to a genuine
@@ -378,7 +419,8 @@ What this instance serves, and which hosts are supposed to.
   changes only for patterns: `fleet: true`, each match tagged with its
   `root`, ONE `max_results` budget across the whole fan-out, and per-root
   reporting in `fanout[]` — each root's own `files_searched` / `truncated`
-  / `denied_hidden` / `classified_hidden` / `reason`, plus `merge_dropped`
+  / `denied_hidden` / `classified_hidden` / `unreadable_hidden` /
+  `reason`, plus `merge_dropped`
   for what the *merge* discarded over budget (top-level `truncated` goes
   true either way). Hosts that could not be searched are named in
   `hosts_unavailable[]` (`unreachable` + `since`, `no_credential`,

@@ -1533,6 +1533,87 @@ mod tests {
         ResolvedRoot::with_default_classify("t", dir.canonicalize().unwrap())
     }
 
+    /// korg #1093's open question, answered by observation rather than
+    /// assumption, and pinned so the answer cannot drift silently.
+    ///
+    /// kubsdb's five secret-bearing service files are **not** dotenv-shaped
+    /// — a YAML compose file and a TOML-ish `up.conf` — and 008's redaction
+    /// surface is dotenv-typed. The expected and desired outcome was
+    /// `classified_opaque`: refused with a reason, no attempted redaction
+    /// that might pass a value through. It is what happens, and the reason
+    /// is structural: the strict grammar needs every line to be blank, a
+    /// `#` comment, or `KEY=value` at column 0, and both shapes open with a
+    /// line (`services:`, `[unifi.defaults]`) that is none of those.
+    #[test]
+    fn kubsdbs_secret_bearing_service_files_classify_opaque_not_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "docker-compose.yml",
+            concat!(
+                "services:\n",
+                "  postgres:\n",
+                "    image: postgres:16\n",
+                "    environment:\n",
+                "      - POSTGRES_PASSWORD=b7f3a9d2c8e14f60b7f3a9d2c8e14f60\n",
+            ),
+        );
+        write(
+            dir.path(),
+            "up.conf",
+            concat!(
+                "[unifi.defaults]\n",
+                "  url = \"https://unifi.example\"\n",
+                "  user = \"unpoller\"\n",
+                "  pass = \"b7f3a9d2c8e14f60b7f3a9d2c8e14f60\"\n",
+            ),
+        );
+        // Neither name matches DEFAULT_CLASSIFY: on kubsdb these are
+        // covered by explicit `[security] classify` globs, which is the
+        // whole point of the item.
+        let root = ResolvedRoot {
+            classify: Arc::new(
+                crate::policy::Classifier::new(&[
+                    "**/docker-compose.yml".to_string(),
+                    "**/up.conf".to_string(),
+                ])
+                .unwrap(),
+            ),
+            ..ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap())
+        };
+
+        for path in ["docker-compose.yml", "up.conf"] {
+            let err = load_text(&root, path, &Limits::default()).unwrap_err();
+            let v = serde_json::to_value(&err).unwrap();
+            assert_eq!(v["code"], "denied", "{path}");
+            assert_eq!(v["data"]["reason"], "classified_opaque", "{path}");
+            assert!(
+                !err.message.contains("b7f3a9d2c8e14f60"),
+                "{path}: the refusal must not quote the file: {}",
+                err.message
+            );
+        }
+
+        // The value probe (008 D-8) over the same files: an opaque
+        // classified file is skipped whole, so the value is unreachable by
+        // search as well as by read.
+        let hits = crate::search::search(
+            &root,
+            &crate::search::SearchParams {
+                pattern: "b7f3a9d2c8e14f60",
+                regex: false,
+                glob: None,
+                path: "",
+                context: 0,
+                max_results: 50,
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(hits.matches.is_empty(), "{:?}", hits.matches);
+        assert_eq!(hits.classified_hidden, 2);
+    }
+
     #[test]
     fn read_of_a_classified_dotenv_is_redacted_and_carries_the_raw_version() {
         let dir = tempfile::tempdir().unwrap();

@@ -391,6 +391,68 @@ mod tests {
         }
     }
 
+    /// Sprint 014 / korg #1093, the sibling of 013's
+    /// `the_kubsdb_broad_access_shape_holds`: these are the exact
+    /// `[security] classify` globs kubsdb's config carries, so matcher
+    /// drift fails here rather than on the host.
+    ///
+    /// The precision is the decision. Six files under `/datastore` hold
+    /// credentials inline, and none is `.env`-shaped — today they are
+    /// protected by unix mode alone, which is luck rather than policy, and
+    /// korg #1085 opened by proposing to change exactly those modes. A
+    /// tempting `**/docker-compose.yml` would have classified the whole
+    /// managed set too, and those are world-readable, hold no secrets, and
+    /// are useful to read: making them opaque would be a regression 013's
+    /// live test would have caught.
+    #[test]
+    fn the_kubsdb_classify_shape_holds() {
+        const KUBSDB_CLASSIFY: &[&str] = &[
+            "/datastore/postgresql/docker-compose.yml",
+            "/datastore/mongodb/docker-compose.yml",
+            "/datastore/redis/docker-compose.yml",
+            "/datastore/unpoller/up.conf",
+            "/datastore/grafana/provisioning/datasources/datasources.yml",
+        ];
+        let c = Classifier::new(
+            &KUBSDB_CLASSIFY
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        for secret in KUBSDB_CLASSIFY {
+            assert!(
+                c.classified_by(Path::new(secret)).is_some(),
+                "{secret} carries a credential inline and must classify"
+            );
+        }
+        // The k-homelab-managed set: rendered artifacts, world-readable, no
+        // secrets. Reading them is genuinely useful — only *writing* them is
+        // futile, and that is #1091's job to explain, not this one's.
+        for managed in [
+            "/datastore/grafana/docker-compose.yml",
+            "/datastore/prometheus/docker-compose.yml",
+            "/datastore/prometheus/prometheus.yml",
+            "/datastore/package-store/docker-compose.yml",
+            "/datastore/package-store/nginx.conf",
+            "/datastore/registry/docker-compose.yml",
+            "/datastore/grafana/provisioning/dashboards/dashboards.yml",
+            "/datastore/korg/docker-compose.yml",
+        ] {
+            assert!(
+                c.classified_by(Path::new(managed)).is_none(),
+                "{managed} is a rendered artifact, not a secret — it must stay readable"
+            );
+        }
+        // grafana's provisioning tree classifies at exactly one file, not
+        // wholesale: `datasources.yml` is 0640 root:root by k-homelab
+        // sprint 016's deliberate choice, and its neighbours are not.
+        assert!(
+            c.classified_by(Path::new("/datastore/grafana/provisioning"))
+                .is_none()
+        );
+    }
+
     #[test]
     fn classification_is_lexical_and_covers_subtrees() {
         let c = Classifier::new(&["**/vault-files".to_string()]).unwrap();

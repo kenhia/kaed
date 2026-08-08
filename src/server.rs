@@ -824,7 +824,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "List directory entries (gitignore-aware; `.git` always hidden). Budgeted: `truncated: true` + `next_offset` mean more entries exist — continue by passing `offset`."
+        description = "List directory entries (gitignore-aware; `.git` always hidden). Budgeted: `truncated: true` + `next_offset` mean more entries exist — continue by passing `offset`. `denied_hidden` / `unreadable_hidden` count what policy and the OS kept out, so a filtered listing is never mistaken for the whole directory."
     )]
     async fn list(
         &self,
@@ -912,7 +912,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Ripgrep-grade search. Each match carries its file's `version`, so search → edit is safe with no read in between (a stale hit becomes version_conflict, never a wrong edit). `root` also takes a PATTERN (`*:*`, `*:src`, `kai:*`) for fleet-wide search in one call: every matching root on every reachable host is searched in parallel under one `max_results` budget, matches gain a `root` tag, `fanout` reports each root's own files_searched/truncation (plus what the merge dropped), and hosts that could not be searched are listed in `hosts_unavailable` — never silently skipped."
+        description = "Ripgrep-grade search. Each match carries its file's `version`, so search → edit is safe with no read in between (a stale hit becomes version_conflict, never a wrong edit). `root` also takes a PATTERN (`*:*`, `*:src`, `kai:*`) for fleet-wide search in one call: every matching root on every reachable host is searched in parallel under one `max_results` budget, matches gain a `root` tag, `fanout` reports each root's own files_searched/truncation (plus what the merge dropped), and hosts that could not be searched are listed in `hosts_unavailable` — never silently skipped (a pattern is always expanded by the host you asked, so `kubsdb:*` reports YOUR fleet's reachability, not the peer's). Entries the OS refuses — an undescendable directory, an unopenable file — are skipped and counted in `unreadable_hidden`, never fatal."
     )]
     async fn search(
         &self,
@@ -947,7 +947,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Writes into UNclassified files are scanned for leaking secrets: content matching a known secret's digest, a provider token prefix, or a private-key block refuses with `reason: secret_leak` naming the exact `allow_secrets` override to pass if the write is deliberate (reference the variable instead of the value where you can); merely secret-shaped content applies with a warning. Supports dry_run."
+        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Writes into UNclassified files are scanned for leaking secrets: content matching a known secret's digest, a provider token prefix, or a private-key block refuses with `reason: secret_leak` naming the exact `allow_secrets` override to pass if the write is deliberate (reference the variable instead of the value where you can); merely secret-shaped content applies with a warning. Supports dry_run — and dry_run models WRITABILITY, so a path the service identity cannot write refuses on the dry run too rather than returning a diff for a write that cannot land."
     )]
     async fn edit(
         &self,
@@ -1899,8 +1899,18 @@ impl ServerHandler for KaedServer {
              anchors over whole-file reads. Some paths are refused: `denied` \
              is permanent, don't retry it — its data carries a `reason` \
              (server_denylist, kaedignore, in_file_marker, classified_opaque) \
-             and a `hint` naming what to do instead. `denied_hidden` on \
-             list/search counts what was filtered out. Secret-bearing files \
+             and a `hint` naming what to do instead. The OS refuses too, \
+             under the same code: not_readable_by_service_identity / \
+             not_writable_by_service_identity mean unix ownership, not kaed \
+             policy, and the data names the owner, the uid kaed runs as, and \
+             this root's own advisory about where such files are managed \
+             from. kaed writes by staging a temp file and renaming, so \
+             writability is a property of the DIRECTORY, not the file's \
+             mode — and `dry_run` probes it, so a dry run that returns a \
+             diff is a write that can actually land. `denied_hidden`, \
+             `classified_hidden` and `unreadable_hidden` on list/search \
+             count what policy, classification and the OS kept out; an \
+             unreadable directory is skipped and counted, never fatal. Secret-bearing files \
              (.env and friends) are *classified*, not denied: `read` serves \
              them redacted — values become sealed `⟨kaed:KEY@digest⟩` \
              placeholders, line-for-line with the raw file — and `edit` \

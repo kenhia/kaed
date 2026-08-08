@@ -923,9 +923,72 @@ async fn structured_errors_reach_the_agent() -> anyhow::Result<()> {
     assert_eq!(a["code"], "ambiguous_anchor");
     assert_eq!(a["data"]["occurrences"], json!([1, 2]));
 
+    // 014 / korg #1091: the OS refusing is what an AGENT receives, which is
+    // the whole complaint — the journal row was already better than the
+    // error. `list` still sees the name and the size; opening it is where
+    // the refusal happens, and it now says so with recovery data.
+    if !running_as_root() {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            server.workdir_path.join("docker-compose.yml"),
+            "POSTGRES_PASSWORD: x\n",
+        )?;
+        std::fs::set_permissions(
+            server.workdir_path.join("docker-compose.yml"),
+            std::fs::Permissions::from_mode(0o000),
+        )?;
+
+        let listed = structured(
+            &client
+                .call_tool(
+                    CallToolRequestParams::new("list")
+                        .with_arguments(args(json!({"root": ROOT, "path": ""}))),
+                )
+                .await?,
+        );
+        assert!(
+            listed["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["path"] == "docker-compose.yml"),
+            "discoverable-then-opaque: the name is visible, {listed:#}"
+        );
+
+        let refused = client
+            .call_tool(
+                CallToolRequestParams::new("read")
+                    .with_arguments(args(json!({"root": ROOT, "path": "docker-compose.yml"}))),
+            )
+            .await?;
+        assert_eq!(refused.is_error, Some(true));
+        let e = structured(&refused);
+        assert_eq!(e["code"], "denied");
+        assert_eq!(e["data"]["reason"], "not_readable_by_service_identity");
+        assert_eq!(e["data"]["path"], "docker-compose.yml");
+        assert!(e["data"]["owner"]["mode"].is_string(), "{e:#}");
+        assert!(e["data"]["service_identity"]["uid"].is_u64(), "{e:#}");
+        assert!(e["data"]["hint"].is_string(), "{e:#}");
+        // 009 D-5: a refusal that cost a detour still invites the report
+        assert!(e["data"]["feedback_invite"]["ask"].is_string(), "{e:#}");
+
+        std::fs::set_permissions(
+            server.workdir_path.join("docker-compose.yml"),
+            std::fs::Permissions::from_mode(0o644),
+        )?;
+    }
+
     let _ = client.cancel().await;
     server.ct.cancel();
     Ok(())
+}
+
+/// Root bypasses DAC, so a permission assertion under it would pass for the
+/// wrong reason.
+fn running_as_root() -> bool {
+    std::fs::metadata("/proc/self")
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
+        .unwrap_or(false)
 }
 
 #[tokio::test]
