@@ -8,6 +8,21 @@ side by side.*
 > **Status: not yet run.** This is the prepared script; it is filled in
 > from an actual session. It **must run after the deploy**, or it verifies
 > the previous build.
+>
+> **Deploy is done** (`0.1.0-88005bc`, 2026-08-08 — see `deploy.md`), so
+> this is ready to run. Two things `deploy.md`'s own smoke test already
+> established, so a disagreement here is a real finding rather than a
+> surprise:
+>
+> - The five newly-classified files refuse as
+>   `not_readable_by_service_identity`, **not** `classified_opaque` — they
+>   are 0600 root:root and the OS refuses before kaed can read the bytes it
+>   would classify. That is a pass. The classify globs are dormant policy
+>   that becomes load-bearing only if a mode changes, which is the korg
+>   #1085 scenario they were added for.
+> - `unreadable_hidden` on an unscoped `search kubsdb:datastore` was **2**,
+>   not 1 — `lost+found` plus one more. Worth identifying which, since the
+>   sprint predicted one.
 
 ## How to run it, and why it matters that it is run this way
 
