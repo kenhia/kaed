@@ -1,9 +1,8 @@
 # Sprint 013 deploy — kubsdb joins the fleet
 
-> Written as the plan before ship; updated to a record when `/sprint-ship`
-> Phase 7 runs `deploy-fleet` from merged main. Store-native throughout
-> (005): kubsdb gets no checkout and no cargo — which is pleasingly
-> circular, since the store it installs from is the very
+> Planned before ship; executed 2026-08-08 (record at the end). Store-native
+> throughout (005): kubsdb gets no checkout and no cargo — which is
+> pleasingly circular, since the store it installs from is the very
 > `/datastore/packages` that D-2 denies it from editing.
 
 ## Target state
@@ -125,3 +124,46 @@ From cleo (or any client of the gateway) unless noted:
 Post-deploy bookkeeping: korg #929 closes with a comment pointing here;
 kai's journal keeps the only record of the config edit if made through
 kaed (gateway journals nothing it proxies).
+
+---
+
+## Deployed 2026-08-08
+
+**Artifact `0.1.0-0ed27cc`** (squash-merge of PR #14), published to the
+store and installed on all three hosts. Rollback target: `0.1.0-af0731b`
+via `kaed.prev` on each host, or any published version from the store.
+
+| host | `kaed --version` | unit | MCP `serverInfo.version` |
+|---|---|---|---|
+| kai | `0.1.0-0ed27cc` ✓ | active | `0.1.0 (0ed27cc)` ✓ (gateway calls) |
+| kubs0 | `0.1.0-0ed27cc` ✓ | active | `0.1.0 (0ed27cc)` ✓ |
+| kubsdb | `0.1.0-0ed27cc` ✓ | active | `0.1.0 (0ed27cc)` ✓ |
+
+kubsdb bring-up went exactly per the plan above: config written
+base64-over-ssh and hash-verified, token minted with `kaed-new-token`
+(copied to kai's `peer-tokens/kubsdb-claude`, mode 600, never printed),
+`tailscale serve --bg --https=4870` added alongside the host's existing
+serve entries, `kaed check-config` printed the three roots and the exact
+deny list from D-1, and kai's `[peers.kubsdb]` flipped
+`deferred → active` + tokens table, then a unit restart.
+
+**Verified live, through the gateway as `claude`** (the sprint's own
+behaviour, not just liveness):
+
+- `roots` on kai probes kubsdb live: three `kubsdb:*` roots, `active`,
+  descriptions (including both DEPLOY TARGET advisories) verbatim; the
+  `deferred`/`korg:929` entry is gone.
+- `read kubsdb:datastore postgresql/data/PG_VERSION` → structured
+  `denied` (with 009's feedback invite riding it).
+- `read kubsdb:datastore korg/korg.env` → placeholders only
+  (`⟨kaed:DATABASE_URL@…⟩`); no value crossed the wire.
+
+Remaining battery items (fleet search fan-out, hvsim dry_run, direct
+journal read, root-owned-file io error, value-probe search) are covered
+by Ken's live test from cleo, results to land beside this file like 010's
+`live-test.md`.
+
+**Known doc staleness for the follow-up chore PR**: the deploy-fleet
+skill's fleet table and its "kubsdb is deliberately NOT in the fleet"
+warning, CLAUDE.md's fleet status ("kubsdb deliberately has no
+instance"), and `docs/setup.md`'s fleet examples all predate this deploy.
