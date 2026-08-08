@@ -136,6 +136,11 @@ retention_days = 7
 # under it. The `/**` form matches only what is inside, leaving the
 # directory itself listable and stat-able — which was true on kai until
 # sprint 004 noticed.
+#
+# Absolute patterns are legal too, and `*` crosses `/`: on a host whose
+# services keep live state in per-service data directories, a single
+# "/srv/*/data" denies every one of them — at any depth, including ones
+# created after you wrote the rule.
 [security]
 deny = [
     "**/secrets",
