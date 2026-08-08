@@ -679,6 +679,10 @@ pub struct RevertRequest<'a> {
     /// The identity the revert is journalled under — its own, not that of
     /// the transaction being undone.
     pub author: &'a str,
+    /// Leak-match overrides (012 D-2), passed through to the engine: a
+    /// revert that re-introduces a secret the current content lacks is a
+    /// re-leak, and refuses like any other write until named here.
+    pub allow_secrets: &'a [String],
 }
 
 /// Undo a transaction as a **new** transaction. Never history rewriting:
@@ -699,6 +703,7 @@ pub fn revert(
         dry_run,
         intent,
         author,
+        allow_secrets,
     } = *req;
     let Some(row) = j.txn(txn_id)? else {
         return Err(KaedError::not_found(format!(
@@ -833,6 +838,7 @@ pub fn revert(
             return_diff: true,
             intent: Some(intent),
             drop_keys: Vec::new(),
+            allow_secrets: allow_secrets.to_vec(),
         },
         limits,
         author,
@@ -945,6 +951,7 @@ mod tests {
                 return_diff: false,
                 intent: intent.map(str::to_owned),
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -993,6 +1000,7 @@ mod tests {
                 return_diff: false,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1194,6 +1202,7 @@ mod tests {
                 return_diff: false,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1364,6 +1373,7 @@ mod tests {
                 return_diff: false,
                 intent: Some(format!("rotating to {VALUE}")),
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1570,6 +1580,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1591,6 +1602,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1623,6 +1635,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1656,6 +1669,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1696,6 +1710,7 @@ mod tests {
                 return_diff: false,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1710,6 +1725,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1748,6 +1764,7 @@ mod tests {
                 return_diff: false,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1762,6 +1779,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1791,6 +1809,7 @@ mod tests {
                 dry_run: true,
                 intent: None,
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),
@@ -1821,6 +1840,7 @@ mod tests {
                 dry_run: false,
                 intent: Some("the change broke the build"),
                 author: "claude",
+                allow_secrets: &[],
             },
             &j,
             &Limits::default(),

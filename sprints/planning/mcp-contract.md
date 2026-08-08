@@ -140,6 +140,33 @@ agent-filed feedback. Nothing here is frozen.
   target its redacted write. Cross-host rotation (`rotate.also` on
   another host's root) is **not atomic** — the response reports
   per-target outcomes.
+- **R12 — writes are checked for leaking secrets (012).** kaed is the
+  choke point for writes, and the higher-frequency real incident is a
+  secret written *into* a README, a fixture, a doc — so every write to an
+  **unclassified** file is scanned for newly-introduced secrets
+  (classified files are exempt: they are where secrets belong, and
+  already redacted, guarded and journaled). Three tiers:
+  - **Known digest** — the token's BLAKE3 digest is in the host's
+    `secret_digests` index (a secret kaed has *seen*: served redacted,
+    journaled redacted, minted, or audited). Refuses, and the refusal
+    names the variable to reference instead of the value.
+  - **Provider prefix / private-key armor** (`sk-ant-`, `ghp_`, `AKIA`,
+    `-----BEGIN … PRIVATE KEY-----`, …) — externally precise. Refuses.
+  - **Secret-shaped** (the high-entropy heuristic) — false-positives by
+    nature, so it **warns and applies**, never blocks.
+
+  A refusal is `invalid_input` with `data.reason: "secret_leak"`, the
+  match list (kind, line, source location — never the token itself), and
+  the exact `allow_secrets` override to pass if writing the literal is
+  deliberate — the `drop_keys` shape applied to leaks. Only
+  newly-introduced tokens trip: a file already containing a token stays
+  editable, including the edit that removes it. Every detection lands in
+  the secrets audit stream (`leak_refused` / `leak_flagged` /
+  `leak_allowed`), dry runs run the checks but journal nothing, and
+  `[secrets] leak_checks = "refuse" | "flag" | "off"` is the host-wide
+  lever. **The honest limit:** the precise tier covers secrets kaed has
+  seen, not secrets on the host — a value that never passed through kaed
+  falls to the heuristic. No walk runs on the write path.
 - **R5 — three addressing modes, one engine.** Content **anchor** (unique
   match, robust to line drift), **range@version** (line numbers valid only
   against a declared version), **node** (tree-sitter selector). Identical
@@ -416,7 +443,8 @@ One tool, transactional, all addressing modes.
     "return_diff?": true,     // default true
     "check?": false,          // parse-check touched files post-edit
     "intent?": "extract rollback into its own fn",  // journaled
-    "drop_keys?": ["OLD_TOKEN"]  // values this edit may destroy (R9)
+    "drop_keys?": ["OLD_TOKEN"],  // values this edit may destroy (R9)
+    "allow_secrets?": ["sk-ant-"] // leak matches this edit may write (R12)
   }
   ```
 - **Out:** `{txn_id, files: [{path, old_version, new_version}], diff,
@@ -447,6 +475,12 @@ One tool, transactional, all addressing modes.
     key's placeholder copies it); a stale digest fails loudly rather than
     silently resolving to the current value. A write that makes a value
     vanish refuses unless its key is in `drop_keys` (R9).
+  - **Unclassified files are scanned for leaking secrets** (R12): a
+    newly-introduced token matching a known digest, a provider prefix or
+    a private-key block refuses with `reason: secret_leak` and the exact
+    `allow_secrets` override; merely secret-shaped content applies with a
+    warning. `revert` takes `allow_secrets` too — restoring content that
+    re-introduces a secret is a re-leak and refuses the same way.
 
 ### Secrets (R11)
 
@@ -513,7 +547,12 @@ The escape hatch, its own tool so the harness prompts for it separately.
       {"kind": "feedback", "feedback_id": 3, "author": "claude", "time": "…",
        "category": "friction", "summary": "…", "detail": "…", "context": "…"},
       {"kind": "secret", "event_id": 5, "author": "claude", "time": "…",
-       "action": "generate" /* | rotate | reveal | transport */,
+       "action": "generate" /* | rotate | reveal | transport
+                               | leak_refused | leak_flagged | leak_allowed:
+                               write-side detections (R12) — path is the
+                               write TARGET; key is the source key, or the
+                               detector's detail (prefix, armor label,
+                               shape) when no key is known */,
        "root": "kai:src", "path": ".env", "key": "KLAMS_TOKEN",
        "old_digest": "…", "new_digest": "…", "disclosed": false,
        "destination": "kubs0:src/svc/.env" /* transport: the CLAIM */,
@@ -585,7 +624,7 @@ The escape hatch, its own tool so the harness prompts for it separately.
   opted out and was later deleted has no readable history either.
 
 #### `revert`
-- **In:** `{root, txn_id, dry_run?, intent?}`
+- **In:** `{root, txn_id, dry_run?, intent?, allow_secrets?}`
 - **Out:** same shape as `edit` (a revert **is** a new journaled
   transaction, never history rewriting) — and it is itself revertible.
 - Runs through the same engine and the same versioning contract: `base` is

@@ -319,6 +319,7 @@ fallback.
 | `security.use_default_classify` | Set `false` to drop the built-in classify defaults (`.env*`, `*.env`, `*.pem`, `id_*`, `credentials*`, `*.kdbx`). |
 | `secrets.shapes.<name>` | Named entry for the `secret` tool's shape registry — a spec from the closed grammar (`hex(N)`, `base64url(N)`, `uuid4`, `prefixed(tag,inner)`), e.g. `klams = "prefixed(klams-,hex(64))"`. Validated at startup. |
 | `secrets.allow_reveal` | Set `false` to refuse `secret_reveal` on this host entirely (structured `reveal_disabled` refusal). The default is `true`: the tool being separately permissioned at the harness is the primary gate. |
+| `secrets.leak_checks` | Write-side leak detection strictness. `"refuse"` (default): writing content that matches a known secret's digest, a provider token prefix, or a private-key block into an **unclassified** file refuses with a named `allow_secrets` override, while merely secret-shaped content applies with a warning. `"flag"`: everything warns, nothing blocks. `"off"`: no scanning. |
 
 ### Validate it
 

@@ -66,6 +66,9 @@ const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 /// `value_from` on `env_set`. One flag for the whole surface: it is one
 /// trust tier, and a peer without it maps to `unsupported_capability` at
 /// call time (D-3 of 010).
+/// `leak_detection` (012): the write path scans for secrets heading into
+/// unclassified files (`secret_leak` refusals, `allow_secrets` override).
+/// Advertised so a mid-upgrade fleet says honestly which hosts check.
 const ROOT_CAPABILITIES: &[&str] = &[
     "stat",
     "list",
@@ -74,6 +77,7 @@ const ROOT_CAPABILITIES: &[&str] = &[
     "edit",
     "secrets",
     "secret_lifecycle",
+    "leak_detection",
     "history",
     "feedback",
 ];
@@ -422,6 +426,12 @@ pub struct EditParams {
     /// have been seen and cannot be restored.
     #[serde(default)]
     pub drop_keys: Vec<String>,
+    /// Overrides for a `secret_leak` refusal: the exact `detail` strings it
+    /// reported (a digest, a provider prefix, an armor label). Writing
+    /// secret-matching content into an unclassified file refuses unless the
+    /// match is named here.
+    #[serde(default)]
+    pub allow_secrets: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -466,6 +476,11 @@ pub struct RevertParams {
     pub dry_run: bool,
     /// Why. Journaled alongside the automatic "revert of txn N".
     pub intent: Option<String>,
+    /// As on `edit`: a revert that re-introduces a secret the current
+    /// content lacks is a re-leak, and refuses unless the match's `detail`
+    /// is named here.
+    #[serde(default)]
+    pub allow_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
@@ -870,14 +885,28 @@ impl KaedServer {
                 },
                 (None, None) => ReadMode::Whole,
             };
-            fsops::read(
+            let result = fsops::read(
                 &root,
                 &p.path,
                 &mode,
                 p.numbered,
                 p.max_bytes,
                 &state.limits,
-            )
+            )?;
+            // A redacted read feeds the known-digest index (012 D-4): the
+            // rendering already disclosed these digests, so indexing them
+            // discloses nothing further — it is what lets the write path
+            // recognize a hand-provisioned secret kaed never wrote. Not a
+            // read journal: no author, no event, no timestamp beyond
+            // first_seen (009 D-2 stays intact).
+            if result.redacted {
+                state.journal.record_digests(
+                    &root.name,
+                    &p.path,
+                    &crate::secrets::extract_placeholder_digests(&result.content),
+                );
+            }
+            Ok(result)
         })
         .await
     }
@@ -918,7 +947,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Supports dry_run."
+        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Writes into UNclassified files are scanned for leaking secrets: content matching a known secret's digest, a provider token prefix, or a private-key block refuses with `reason: secret_leak` naming the exact `allow_secrets` override to pass if the write is deliberate (reference the variable instead of the value where you can); merely secret-shaped content applies with a warning. Supports dry_run."
     )]
     async fn edit(
         &self,
@@ -964,6 +993,7 @@ impl KaedServer {
                 return_diff: p.return_diff,
                 intent: p.intent,
                 drop_keys: p.drop_keys,
+                allow_secrets: p.allow_secrets,
             };
             txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
         })
@@ -1132,6 +1162,7 @@ impl KaedServer {
                     dry_run: p.dry_run,
                     intent: p.intent.as_deref(),
                     author: &author.0,
+                    allow_secrets: &p.allow_secrets,
                 },
                 &state.journal,
                 &state.limits,
@@ -1857,7 +1888,14 @@ impl ServerHandler for KaedServer {
              where a placeholder passed as a value writes the real value \
              back. You rarely need plaintext: to *use* a value in a shell, \
              `set -a; . .env; set +a` and reference $KEY. Destroying a value \
-             requires naming its key in `drop_keys`. \
+             requires naming its key in `drop_keys`. The write path also \
+             watches the other direction: putting a secret INTO a file \
+             nothing classifies (a README, a fixture, a doc) is refused \
+             with `reason: secret_leak` when the content matches a known \
+             secret's digest, a provider prefix, or a private-key block — \
+             reference the variable instead of the value, or pass the \
+             named `allow_secrets` override if writing it is deliberate; \
+             merely secret-shaped content applies with a warning. \
              The `secret` tool runs the whole lifecycle without disclosure: \
              `describe` returns a durable HANDLE (root + path + key + \
              digest) — carry THAT in a handoff, never a value; `generate` \

@@ -93,6 +93,18 @@ a value must be declared (`drop_keys`); and a gitignore-shaped
 `.kaedignore` (or an in-file `# kaedignore` marker) opts paths out of kaed
 entirely.
 
+The write path watches the opposite direction too, because the leak that
+actually happens is a secret written *into* a README, a fixture, a doc.
+Writes to unclassified files are scanned for newly-introduced secrets:
+content matching a known secret's digest, a provider token prefix
+(`sk-ant-`, `ghp_`, `AKIA`, …) or a private-key block refuses with a
+structured reason naming what to do instead — reference the variable, or
+pass the named `allow_secrets` override if the write is deliberate — while
+merely secret-shaped content applies with a warning rather than a wall.
+Every detection is journaled, so "how often does this almost happen?" is a
+query. A file that already contains a token stays editable, including the
+edit that removes it.
+
 The `secret` tool runs the whole lifecycle on the same terms: kaed mints
 values server-side from a closed shape grammar (`hex(64)`,
 `base64url(43)`, `uuid4`, `prefixed(tag,inner)`), so an agent can create

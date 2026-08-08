@@ -121,12 +121,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("  {rule}");
             }
             println!(
-                "secrets: reveal {}, named shapes: {}",
+                "secrets: reveal {}, leak checks {:?}, named shapes: {}",
                 if resolved.secrets.allow_reveal {
                     "allowed (per-tool permissioning is the gate)"
                 } else {
                     "REFUSED host-wide (allow_reveal = false)"
                 },
+                resolved.secrets.leak_checks,
                 if resolved.secrets.shapes.is_empty() {
                     "none (raw specs still work)".to_string()
                 } else {
