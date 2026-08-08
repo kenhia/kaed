@@ -107,8 +107,12 @@ agent-filed feedback. Nothing here is frozen.
   never fatal and never silent. (One `drwx------` directory used to kill
   an entire `search`; kept separate from `denied_hidden` because the
   remedies differ — one needs a human to change config, the other a
-  chmod, a different identity, or nothing at all.) Path checks are
-  lexical, applied identically to
+  chmod, a different identity, or nothing at all.) The rule is
+  **addressed → refuse, enumerated → skip and count**: a path the caller
+  *named* gets the structured refusal, and only what the walk *found* is
+  counted, because a zero with a count beside it and no cause is the same
+  unhelpfulness one level up. Path checks are lexical, applied identically
+  to
   paths that exist and paths that don't, so a `denied` is never evidence
   that a file is there (the in-file marker is necessarily content-level:
   it is checked wherever content is opened — read, edit, search — and is

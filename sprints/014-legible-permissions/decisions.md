@@ -119,9 +119,31 @@ asked for. Two things newly counted that were **silently** skipped before:
 an unreadable directory (which used to be fatal) and an unreadable file
 (which used to be a bare `continue`).
 
+**The rule is addressed → refuse, enumerated → skip and count**, and
+getting only half of it was a real defect in this sprint's first pass.
+Skip-and-count is the right answer for what a *walk finds*; applied to
+what the caller *named* it reproduces #1091 exactly —
+`search {path: "prometheus/prometheus.yml"}` on an unreadable file came
+back as zero matches with a count of one beside it, which is a fact
+without a cause. `list` on an unreadable directory did the same. Both now
+refuse with the structured reason.
+
 Non-permission walk errors still fail the call loudly. They are not a
 coverage question, and swallowing them would trade one silence for
 another.
+
+## D-8 — the service identity is resolved from `/etc/passwd`, not `$USER`
+
+Cheap to get wrong and expensive when wrong. The environment can disagree
+with the kernel — `sudo -E`, a unit whose `User=` changed without a
+restart — and an error naming the wrong user sends its reader to fix the
+wrong thing, which is precisely the failure this module exists to stop.
+
+The uid is the fact and is always reported; the name is resolved by uid
+and **omitted** when it cannot be, rather than guessed. A host whose users
+live only in LDAP gets the uid alone, which is still true. Parsing
+`/etc/passwd` directly rather than calling `getpwuid` avoids an `unsafe`
+block and an NSS round trip for a convenience field.
 
 ## D-7 — nothing kubsdb-shaped enters the shipped defaults
 
