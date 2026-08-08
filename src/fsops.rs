@@ -101,6 +101,12 @@ pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     check_denied(root, rel, &joined)?;
     let canonical = joined.canonicalize().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => KaedError::not_found(format!("{rel}: not found")),
+        // An unreadable ancestor directory refuses here, before the file is
+        // ever reached; the subject of the refusal is the deepest thing
+        // that still stats (014, #1091).
+        std::io::ErrorKind::PermissionDenied => {
+            crate::perm::not_readable(root, rel, deepest_existing(&joined))
+        }
         _ => KaedError::internal(format!("{rel}: {e}")),
     })?;
     if !canonical.starts_with(&root.path) {
@@ -111,6 +117,16 @@ pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     }
     check_denied(root, rel, &canonical)?;
     Ok(canonical)
+}
+
+/// The deepest ancestor of `p` (including `p`) that can still be stat'ed.
+/// When a permission refusal comes from partway up a path, that ancestor is
+/// the thing whose ownership actually explains it — reporting the leaf
+/// would name a file kaed never got close enough to see.
+pub fn deepest_existing(p: &Path) -> &Path {
+    p.ancestors()
+        .find(|a| a.symlink_metadata().is_ok())
+        .unwrap_or(p)
 }
 
 /// Resolve a path that may not exist yet (create targets, staged temps).
@@ -289,6 +305,12 @@ pub struct ListResult {
     /// mistaken for the whole directory.
     #[serde(skip_serializing_if = "is_zero")]
     pub denied_hidden: usize,
+    /// Entries the OS refused to enumerate — unix permissions, not kaed
+    /// policy (014, korg #1088). `list` walks directories itself, so it
+    /// needs its own count for the same reason it needs its own deny check
+    /// (R7's three-places rule).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unreadable_hidden: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -395,6 +417,13 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             p.path
         )));
     }
+    // Addressed, not enumerated: a directory the caller NAMED gets a
+    // reason, where one merely walked into is skipped and counted (014
+    // D-6). An empty listing for a directory kaed cannot open is honest
+    // about the count and useless about the cause.
+    if !crate::perm::dir_is_readable(&base) {
+        return Err(crate::perm::not_readable(root, p.path, &base));
+    }
     let matcher = match p.glob {
         Some(g) => Some(
             globset::GlobBuilder::new(g)
@@ -438,8 +467,18 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             })
             .build()
     };
+    let mut unreadable_hidden = 0usize;
     for entry in walker {
-        let entry = entry.map_err(|e| KaedError::internal(e.to_string()))?;
+        let entry = match entry {
+            Ok(e) => e,
+            // Same rule as `search` (#1088): the OS is a filter, not a
+            // fatality. Other walk errors still fail loudly.
+            Err(e) if e.io_error().is_some_and(crate::perm::is_permission_denied) => {
+                unreadable_hidden += 1;
+                continue;
+            }
+            Err(e) => return Err(KaedError::internal(e.to_string())),
+        };
         if entry.depth() == 0 {
             continue; // the listed dir itself
         }
@@ -456,9 +495,14 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             continue;
         }
         tally.kept += 1;
-        let meta = entry
-            .metadata()
-            .map_err(|e| KaedError::internal(e.to_string()))?;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) if e.io_error().is_some_and(crate::perm::is_permission_denied) => {
+                unreadable_hidden += 1;
+                continue;
+            }
+            Err(e) => return Err(KaedError::internal(e.to_string())),
+        };
         let kind = if meta.is_symlink() {
             EntryKind::Symlink
         } else if meta.is_dir() {
@@ -494,6 +538,7 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             .then(|| tally.explain(p.glob, p.path))
             .flatten(),
         denied_hidden: denied_hidden.load(Ordering::Relaxed),
+        unreadable_hidden,
     })
 }
 
@@ -573,7 +618,7 @@ pub struct Loaded {
 /// it holds a classified dotenv it must serve redacted.
 pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Loaded> {
     let abs = resolve_existing(root, rel)?;
-    let meta = std::fs::metadata(&abs)?;
+    let meta = std::fs::metadata(&abs).map_err(|e| crate::perm::map_read_io(root, rel, &abs, e))?;
     if meta.is_dir() {
         return Err(KaedError::invalid_input(format!("{rel}: is a directory")));
     }
@@ -584,7 +629,10 @@ pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Load
             limits.max_file_bytes
         )));
     }
-    let bytes = std::fs::read(&abs)?;
+    // The #1091 case: discoverable-then-opaque. `list` showed this file and
+    // its size; opening it is where the OS says no, and it must say so with
+    // a path, a reason and a route — not `internal: os error 13`.
+    let bytes = std::fs::read(&abs).map_err(|e| crate::perm::map_read_io(root, rel, &abs, e))?;
     let version = version_of(&bytes);
     let classified = root.classify.classified_by(&abs);
     let text = if looks_binary(&bytes) {
@@ -1490,6 +1538,87 @@ mod tests {
 
     fn classified_root(dir: &Path) -> ResolvedRoot {
         ResolvedRoot::with_default_classify("t", dir.canonicalize().unwrap())
+    }
+
+    /// korg #1093's open question, answered by observation rather than
+    /// assumption, and pinned so the answer cannot drift silently.
+    ///
+    /// kubsdb's five secret-bearing service files are **not** dotenv-shaped
+    /// — a YAML compose file and a TOML-ish `up.conf` — and 008's redaction
+    /// surface is dotenv-typed. The expected and desired outcome was
+    /// `classified_opaque`: refused with a reason, no attempted redaction
+    /// that might pass a value through. It is what happens, and the reason
+    /// is structural: the strict grammar needs every line to be blank, a
+    /// `#` comment, or `KEY=value` at column 0, and both shapes open with a
+    /// line (`services:`, `[unifi.defaults]`) that is none of those.
+    #[test]
+    fn kubsdbs_secret_bearing_service_files_classify_opaque_not_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "docker-compose.yml",
+            concat!(
+                "services:\n",
+                "  postgres:\n",
+                "    image: postgres:16\n",
+                "    environment:\n",
+                "      - POSTGRES_PASSWORD=b7f3a9d2c8e14f60b7f3a9d2c8e14f60\n",
+            ),
+        );
+        write(
+            dir.path(),
+            "up.conf",
+            concat!(
+                "[unifi.defaults]\n",
+                "  url = \"https://unifi.example\"\n",
+                "  user = \"unpoller\"\n",
+                "  pass = \"b7f3a9d2c8e14f60b7f3a9d2c8e14f60\"\n",
+            ),
+        );
+        // Neither name matches DEFAULT_CLASSIFY: on kubsdb these are
+        // covered by explicit `[security] classify` globs, which is the
+        // whole point of the item.
+        let root = ResolvedRoot {
+            classify: Arc::new(
+                crate::policy::Classifier::new(&[
+                    "**/docker-compose.yml".to_string(),
+                    "**/up.conf".to_string(),
+                ])
+                .unwrap(),
+            ),
+            ..ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap())
+        };
+
+        for path in ["docker-compose.yml", "up.conf"] {
+            let err = load_text(&root, path, &Limits::default()).unwrap_err();
+            let v = serde_json::to_value(&err).unwrap();
+            assert_eq!(v["code"], "denied", "{path}");
+            assert_eq!(v["data"]["reason"], "classified_opaque", "{path}");
+            assert!(
+                !err.message.contains("b7f3a9d2c8e14f60"),
+                "{path}: the refusal must not quote the file: {}",
+                err.message
+            );
+        }
+
+        // The value probe (008 D-8) over the same files: an opaque
+        // classified file is skipped whole, so the value is unreachable by
+        // search as well as by read.
+        let hits = crate::search::search(
+            &root,
+            &crate::search::SearchParams {
+                pattern: "b7f3a9d2c8e14f60",
+                regex: false,
+                glob: None,
+                path: "",
+                context: 0,
+                max_results: 50,
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(hits.matches.is_empty(), "{:?}", hits.matches);
+        assert_eq!(hits.classified_hidden, 2);
     }
 
     #[test]

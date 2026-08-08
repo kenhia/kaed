@@ -43,6 +43,24 @@ pub fn is_pattern(root: &str) -> bool {
     root.contains(['*', '?', '['])
 }
 
+/// Could a root on `host` ever match this root pattern? Used to keep a
+/// fan-out from probing — and then reporting on — hosts the pattern
+/// excludes by name (014 D-5, korg #1089).
+///
+/// Only the host segment is consulted. A pattern with no `:` constrains
+/// nothing about the host and matches every one of them.
+pub fn pattern_admits_host(pattern: &str, host: &str) -> bool {
+    let Some((host_pat, _)) = pattern.split_once(':') else {
+        return true;
+    };
+    match globset::Glob::new(host_pat) {
+        Ok(g) => g.compile_matcher().is_match(host),
+        // An unparseable host segment is not this function's error to
+        // raise; admit the host and let the caller's own compile fail.
+        Err(_) => true,
+    }
+}
+
 /// The resolved (peer host, author) → bearer token table, swappable behind
 /// a lock so SIGHUP can rotate peer credentials without a restart — the
 /// same shape, and the same reason, as the inbound identity table (#914).
@@ -491,6 +509,7 @@ pub fn merge_search(
                     "truncated",
                     "denied_hidden",
                     "classified_hidden",
+                    "unreadable_hidden",
                     "reason",
                 ] {
                     if let Some(v) = result.get(field) {
@@ -584,6 +603,24 @@ mod tests {
         assert!(is_pattern("kai:*"));
         assert!(is_pattern("*:src"));
         assert!(!is_pattern("kai:src"));
+    }
+
+    /// korg #1089's gate, at the level the routing decision is made: a
+    /// pattern naming exactly one peer must be treated like every other
+    /// pattern, and a host it excludes must not be probed (and so never
+    /// reported as unavailable).
+    #[test]
+    fn a_pattern_selects_which_hosts_are_even_part_of_the_search() {
+        assert!(pattern_admits_host("kubsdb:*", "kubsdb"));
+        assert!(!pattern_admits_host("kubsdb:*", "kai"));
+        assert!(!pattern_admits_host("kubsdb:*", "kubs0"));
+        // Host-wildcards admit everyone, which is what `*:*` has always done
+        for host in ["kai", "kubs0", "kubsdb"] {
+            assert!(pattern_admits_host("*:*", host));
+            assert!(pattern_admits_host("*:src", host));
+        }
+        // A pattern with no host segment constrains no host.
+        assert!(pattern_admits_host("*", "kai"));
     }
 
     #[test]

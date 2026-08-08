@@ -13,6 +13,7 @@ pub mod fsops;
 pub mod history;
 pub mod journal;
 pub mod leak;
+pub mod perm;
 pub mod policy;
 pub mod search;
 pub mod secret_tool;
