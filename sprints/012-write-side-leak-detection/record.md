@@ -104,6 +104,39 @@ no index, both events countable in the journal. Contract gained R12 and
 the edit/journal/revert updates; README, `docs/setup.md`,
 `deploy/config.example.toml` and `CLAUDE.md` updated.
 
+## Deployed 2026-08-08
+
+Shipped as PR #13 (squash `6da4452`), published as `0.1.0-6da4452` and
+installed from the store on both hosts (`install.sh --from-store`).
+Rollback target: `0.1.0-26b2635` (each host's `kaed.prev`, or the store).
+
+| host | installed | `kaed --version` | unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | 0.1.0-6da4452 | match | active | `0.1.0 (6da4452 2026-08-07)` |
+| kubs0 | 0.1.0-6da4452 | match | active | `0.1.0 (6da4452 2026-08-07)` |
+
+Verified live against what this sprint actually changed, not just "the
+unit is up":
+
+- `check-config` on kai prints the new strictness line
+  (`leak checks Refuse`); defaults apply, no config edits needed on
+  either host.
+- **The R12 loop over kai's real URL**: an `edit` creating a scratch
+  file containing an `sk-ant-…` token refused with
+  `reason: secret_leak` and `allow_secrets: ["sk-ant-"]`, no file
+  landed on disk, and `journal` kind `"secret"` immediately showed the
+  `leak_refused` row with the prefix and the target path — the refusal
+  is countable, which is D-3's whole point.
+- The `secret_digests` backfill ran at first post-upgrade daemon start:
+  checked directly on kai (read-only sqlite) — the table exists, holds
+  the digest backfilled from 011's audit rows, and the smoke-test
+  refusal is its first `leak_%` event. No backfill/migration warnings in
+  either host's unit log; kubs0's only WARN was the expected 401 from a
+  cross-host verification probe carrying the wrong host's token.
+
+No data migration in this sprint; the new journal table is additive and
+`INSERT OR IGNORE`-idempotent.
+
 ## Follow-ups
 
 - Promote (or demote) the heuristic tier with `leak_flagged` evidence
