@@ -189,4 +189,49 @@ mod tests {
     fn empty_denies_nothing() {
         assert!(!DenyList::empty().is_denied(Path::new("/home/k/.ssh/id_rsa")));
     }
+
+    #[test]
+    fn the_kubsdb_broad_access_shape_holds() {
+        // Sprint 013: kubsdb roots at /datastore with the data denied by
+        // shape, not by service name. These are the exact globs its config
+        // carries; if matcher semantics ever drift, this fails before a
+        // deploy does. Absolute patterns are legal deny globs — matching is
+        // against the absolute path.
+        let d = list(&[
+            "**/secrets",
+            "**/*.key",
+            "/datastore/*/data",
+            "/datastore/_retired",
+            "/datastore/packages",
+        ]);
+        // every service's live data, including the data directory itself —
+        // the 004 lesson: bare form + ancestor matching, never `/**`
+        assert!(d.is_denied(Path::new("/datastore/postgresql/data")));
+        assert!(d.is_denied(Path::new(
+            "/datastore/postgresql/data/base/16384/pg_internal.init"
+        )));
+        assert!(d.is_denied(Path::new("/datastore/mongodb/data/WiredTiger.wt")));
+        assert!(d.is_denied(Path::new("/datastore/grafana/data/grafana.db")));
+        // globset's `*` crosses separators (literal_separator defaults
+        // off), so a `data` dir at ANY depth under /datastore is covered —
+        // deliberate: the safe direction, and a new service following the
+        // layout convention is covered on arrival with no config edit
+        assert!(d.is_denied(Path::new("/datastore/kwebi/app/cache/data/x.bin")));
+        // the config surfaces are the point of the root: reachable
+        assert!(!d.is_denied(Path::new("/datastore/korg/docker-compose.yml")));
+        assert!(!d.is_denied(Path::new("/datastore/prometheus/prometheus.yml")));
+        assert!(!d.is_denied(Path::new("/datastore/kwebi/app/routes/index.tsx")));
+        // korg.env classifies (008 D-1) rather than denies: redacted read,
+        // env ops — the deny-vs-classify split this root exists to use
+        assert!(!d.is_denied(Path::new("/datastore/korg/korg.env")));
+        // the package store is a fleet supply-chain surface, not host
+        // config: what lands there is what every host installs
+        assert!(d.is_denied(Path::new(
+            "/datastore/packages/artifacts/kaed/kaed-0.12.0.tar.zst"
+        )));
+        // …but the compose/config that *serves* the store is host config
+        assert!(!d.is_denied(Path::new("/datastore/package-store/nginx.conf")));
+        // retired database exports are data wearing a different name
+        assert!(d.is_denied(Path::new("/datastore/_retired/vikunja-final-20260727.sql")));
+    }
 }
