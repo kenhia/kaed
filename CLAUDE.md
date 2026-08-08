@@ -214,7 +214,17 @@ fails, and what the journal structurally cannot tell you — see
   here: root patterns are always expanded by the instance that was asked
   and never proxied (D-5), and kubsdb's config gained five classify globs
   plus a MANAGED root description (#1093) — the `lost+found` interim deny
-  entry is **gone**, replaced by the walker fix.
+  entry is **gone**, replaced by the walker fix. **Live-tested from cleo
+  through the kai gateway** (`014-legible-permissions/live-test.md`): every
+  013 finding closed, no regressions, and the first live test in this
+  program to file nothing. Two things it settled that are easy to
+  re-derive wrongly: the five classified kubsdb files refuse
+  `not_readable_by_service_identity` rather than `classified_opaque`
+  (0600 root:root — the OS refuses before kaed can read bytes to classify,
+  so the globs are dormant policy that arms itself if a mode ever
+  changes); and **the hidden counters are lower bounds when `truncated`**,
+  which is why one root reported 1, 2 and 6 unreadable entries across
+  three sessions.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

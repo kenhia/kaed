@@ -111,7 +111,16 @@ agent-filed feedback. Nothing here is frozen.
   **addressed → refuse, enumerated → skip and count**: a path the caller
   *named* gets the structured refusal, and only what the walk *found* is
   counted, because a zero with a count beside it and no cause is the same
-  unhelpfulness one level up. Path checks are lexical, applied identically
+  unhelpfulness one level up.
+
+  All three counters describe **what the enumeration actually reached**, so
+  when `truncated` is true they are lower bounds: the walk itself runs to
+  exhaustion, but anything discovered by *opening* a file (unreadable,
+  classified, in-file marker) is only counted as far as the budget allowed.
+  The partial result already says it is partial — reading a counter without
+  its `truncated` is the caller error, and it is one worth naming, because
+  it produced three different counts for one root across three sessions in
+  014's live test. Path checks are lexical, applied identically
   to
   paths that exist and paths that don't, so a `denied` is never evidence
   that a file is there (the in-file marker is necessarily content-level:

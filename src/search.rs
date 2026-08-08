@@ -805,6 +805,62 @@ mod tests {
         restore();
     }
 
+    /// What the 014 live test found by getting three different numbers for
+    /// the same root (1, 2, then 6) across three sessions.
+    ///
+    /// The hidden counters describe **what the walk actually reached**, so
+    /// a search that fills `max_results` stops early and reports less than
+    /// the whole picture. That is not a contract gap — `truncated: true`
+    /// rides the same response and says the result is partial — but the
+    /// counters are **lower bounds** in that case, and reading one without
+    /// the other is how three sessions disagreed.
+    ///
+    /// The split is structural: the walk runs to exhaustion before any
+    /// file is opened, so whatever it filters is counted in full, while
+    /// everything discovered by *opening* a file (unreadable, classified,
+    /// in-file marker) is only counted as far as the budget allowed.
+    #[test]
+    fn a_truncated_search_reports_lower_bound_counters_and_says_it_is_truncated() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, _) = setup();
+        // Interleave so a small budget stops before the later ones. Sorted
+        // file order makes this deterministic.
+        for i in 0..6 {
+            write(dir.path(), &format!("{i}-hit.txt"), "needle\n");
+            write(dir.path(), &format!("{i}-locked.env"), "TOKEN=needle\n");
+            std::fs::set_permissions(
+                dir.path().join(format!("{i}-locked.env")),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+        }
+        let root = ResolvedRoot::with_default_classify("t", dir.path().canonicalize().unwrap());
+
+        let full = search(&root, &params("needle"), &Limits::default()).unwrap();
+        assert!(!full.truncated);
+        assert_eq!(full.unreadable_hidden, 6, "the complete walk sees them all");
+
+        let capped = search(
+            &root,
+            &SearchParams {
+                max_results: 2,
+                ..params("needle")
+            },
+            &Limits::default(),
+        )
+        .unwrap();
+        assert!(capped.truncated, "the partial answer says it is partial");
+        assert!(
+            capped.unreadable_hidden < full.unreadable_hidden,
+            "a truncated walk reports a lower bound, not the whole: {} vs {}",
+            capped.unreadable_hidden,
+            full.unreadable_hidden
+        );
+    }
+
     /// Zero is the common case and must stay off the wire, like its
     /// siblings — a field that is always present stops being read.
     #[test]
