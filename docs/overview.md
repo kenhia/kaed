@@ -130,6 +130,22 @@ correction makes it work. Enumerations (`list`, `search`) omit denied entries
 rather than failing, but report `denied_hidden: N`, because a silently
 filtered listing reads as a complete one.
 
+The operating system is a fourth layer, and it does not read kaed's config at
+all: a file the service identity cannot open, or a directory it cannot write,
+refuses too. That also arrives as `denied` — with
+`not_readable_by_service_identity` / `not_writable_by_service_identity`, the
+owning uid and mode, and the uid kaed runs as, so the answer is "chmod this"
+rather than "os error 13". Enumerations count what the OS hid in
+`unreadable_hidden`, the sibling of `denied_hidden`: one unreadable directory
+should never decide the fate of a whole search.
+
+One consequence is worth knowing because it is not obvious: kaed writes by
+staging a temporary file beside the destination and renaming over it, so
+**writability is a property of the containing directory**. A read-only file in
+a writable directory is editable through kaed; a writable file in a directory
+you do not own is not. `dry_run` asks the real question, so a dry run that
+returns a diff is a write that can actually land.
+
 **This is blast-radius reduction, not access control.** Any agent with a shell
 can read what kaed refuses. What the deny list buys is that the ordinary,
 well-intentioned path is safe. [SECURITY.md](../SECURITY.md) is explicit about

@@ -45,7 +45,7 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–013, 2026-08-08):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–014, 2026-08-08):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
 auth. kubsdb joined in 013 after two sprints deferred (korg #929) — see
@@ -191,12 +191,30 @@ fails, and what the journal structurally cannot tell you — see
   as fleet supply chain, `/gratch` has no root, and rsync deploy targets
   are *told, not denied* via root `description`s. Three things not to
   re-derive: **nothing kubsdb-shaped went into `DEFAULT_DENY`** (D-7 —
-  it is per-host config); root-owned files still refuse at the OS (D-6,
-  accepted — host-side `composer`-group discussion is korg #1085, and the
-  live deny list carries a `/datastore/lost+found` interim entry for korg
-  #1088 that the sprint record predates); and the live test's two open
-  bugs are #1088 (search dies on EACCES) and #1089 (single-peer root
-  pattern proxied wholesale, misleading `hosts_unavailable`).
+  it is per-host config, and 014 D-7 says the same of its classify globs);
+  root-owned files refuse at the OS (D-6, accepted then; made legible by
+  014); and the live test's findings were all closed by 014.
+- **The OS is a named policy layer since 014** (`sprints/
+  014-legible-permissions/decisions.md`), closing 013's whole live-test
+  tail. EACCES is `denied` with `not_readable_by_service_identity` /
+  `not_writable_by_service_identity` — **not a new error code** (D-1:
+  `reason` is the field whose job that is). Four things not to
+  re-derive: **writability is a property of the containing DIRECTORY**
+  (D-2 — kaed stages a temp file and renames, so a root-owned 0644 file
+  in a writable dir *is* editable and `access(file, W_OK)` would refuse a
+  write that works); the route to the editable copy is the addressed
+  root's own `description`, carried back as `root_advisory` (D-3 — so
+  never hardcode a host's layout in this public repo, and editing the
+  root description on the host changes both the advisory and the hint);
+  `dry_run` **probes for real** and shares the write path's probe (D-4 —
+  a dry run that used to pass against an unwritable path now fails, and
+  that is the fix); and enumeration counts OS-hidden entries as
+  `unreadable_hidden`, a third sibling of `denied_hidden` /
+  `classified_hidden`, deliberately not folded into them (D-6). Also
+  here: root patterns are always expanded by the instance that was asked
+  and never proxied (D-5), and kubsdb's config gained five classify globs
+  plus a MANAGED root description (#1093) — the `lost+found` interim deny
+  entry is **gone**, replaced by the walker fix.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

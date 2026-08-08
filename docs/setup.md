@@ -620,7 +620,10 @@ seeing what torn states actually look like.
 | `401` with a token you believe is right | Client hasn't restarted since the token changed, or you're sending the old one. Tokens do not expire. |
 | `denied` on a path you expected to read | The deny list. Run `kaed check-config` to see every active rule. This is permanent — no path correction will work. |
 | `outside_root` | The path escapes its root, or is absolute. Paths are always root-relative. |
-| `list`/`search` results look short | Check `denied_hidden` in the response — entries were filtered by the deny list. |
+| `list`/`search` results look short | Check `denied_hidden` (the deny list), `classified_hidden` (secret-bearing files with no redacted surface) and `unreadable_hidden` (the OS refused) in the response. |
+| `denied` with `reason: not_readable_by_service_identity` | Unix ownership, not kaed's config — the data names the file's owner and mode and the uid kaed runs as. `chmod`/`chgrp` on the host, or read it as an identity that can. |
+| A write refuses with `not_writable_by_service_identity` | kaed writes by staging a temp file and renaming, so it needs write+execute on the **containing directory**; the file's own mode is not the obstacle. If that root's `description` names where the file is managed from, the refusal repeats it as `root_advisory`. |
+| A `dry_run` that used to pass now refuses | Since sprint 014 `dry_run` probes writability instead of only checking the content. The write it was predicting could never have landed. |
 | `search` found nothing and you expected hits | Check `files_searched`. Zero means your `glob`/`path` selected nothing, not that the pattern is absent — `glob` matches **root-relative** paths and is not re-anchored by `path`. The `reason` in the response names the fix. |
 | `not_found` on a root you are sure exists | Root names are host-qualified: `myhost:src`, not `src`. The error carries `data.did_you_mean`. |
 | `not_found` naming another host | Read `data.reason`. `host_deferred` means that host deliberately has no instance (`data.ref` says why) — do not install one. `host_never_declared` means this host's config says nothing about it. |

@@ -865,6 +865,15 @@ figcaption {
         results. A filtered listing that doesn't say so reads as a complete
         one.
       </p>
+      <p class="dim">
+        The operating system refuses too, and it never read your config. A
+        file the service identity can't open comes back as <code>denied</code>
+        with <code>not_readable_by_service_identity</code>, the owning uid and
+        mode, and the uid kaed runs as — the difference between "chmod this"
+        and <code>os error 13</code>. Listings count those in
+        <code>unreadable_hidden</code>: one unreadable directory should never
+        decide the fate of an entire search, and for one sprint it did.
+      </p>
     </div>
 
     <div class="callout reveal">
