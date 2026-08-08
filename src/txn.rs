@@ -758,6 +758,28 @@ fn apply_inner(
         w
     };
 
+    // Writability, asked BEFORE the dry-run return (014 D-4, korg #1092).
+    //
+    // `dry_run` used to answer "does this edit apply cleanly to this
+    // content?" while presenting as if it answered "will this write
+    // succeed?" — anchor resolution, version match and diff generation are
+    // all content questions, and writability is an environment question
+    // that was never asked. So a root-owned file returned a clean diff and
+    // a plausible new_version for a write that could not land.
+    //
+    // One probe, one vocabulary, both paths: the real write gets the same
+    // structured refusal instead of an EACCES out of `stage`, and the
+    // prediction is the thing being predicted.
+    // The subject is the deepest EXISTING ancestor, not the immediate
+    // parent: a create into a not-yet-existing subdirectory needs write
+    // permission on the highest directory `create_dir_all` will start from.
+    for (path, buf) in &touched {
+        let dir = fsops::deepest_existing(buf.abs.parent().unwrap_or(&buf.abs));
+        if !crate::perm::dir_is_writable(dir) {
+            return Err(crate::perm::not_writable(root, path, dir));
+        }
+    }
+
     if req.dry_run {
         return Ok(EditOutcome {
             txn_id: None,
@@ -770,12 +792,21 @@ fn apply_inner(
 
     // Stage everything before any rename; abort cleanly on any failure.
     let mut staged = Vec::new();
-    for (_, buf) in &touched {
+    for (path, buf) in &touched {
         match fsops::stage(&buf.abs, buf.content.as_bytes(), buf.mode & 0o7777) {
             Ok(s) => staged.push(s),
             Err(e) => {
                 for s in &staged {
                     fsops::discard(s);
+                }
+                // Backstop for what the probe cannot see: a race, or a
+                // refusal from a layer above DAC. Reclassify rather than
+                // let an os-error-13 escape as `internal` again.
+                let dir = fsops::deepest_existing(buf.abs.parent().unwrap_or(&buf.abs));
+                if e.code == crate::errors::ErrorCode::Internal
+                    && !crate::perm::dir_is_writable(dir)
+                {
+                    return Err(crate::perm::not_writable(root, path, dir));
                 }
                 return Err(e);
             }
@@ -1503,6 +1534,140 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "a\n"
+        );
+    }
+
+    // ------------------------------ the OS layer (014, #1091/#1092)
+
+    /// korg #1092, the finding that outlives every host-side fix: a
+    /// `dry_run` against a file in an unwritable directory returned a clean
+    /// diff and a plausible `new_version` for a write that could not land.
+    /// An agent doing the exact thing `dry_run` exists for learned nothing.
+    #[test]
+    fn a_dry_run_into_an_unwritable_directory_refuses_instead_of_promising() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = setup();
+        std::fs::create_dir(dir.path().join("prometheus")).unwrap();
+        let v = write(dir.path(), "prometheus/prometheus.yml", "scrape: 15s\n");
+        std::fs::set_permissions(
+            dir.path().join("prometheus"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+
+        let req = |dry_run| EditRequest {
+            base: vec![base("prometheus/prometheus.yml", &v)],
+            ops: vec![EditOp::AnchorReplace {
+                path: "prometheus/prometheus.yml".into(),
+                old_text: "15s".into(),
+                new_text: "30s".into(),
+                occurrence: None,
+            }],
+            dry_run,
+            return_diff: true,
+            intent: None,
+            drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
+        };
+        let dry = apply(&root, &req(true), &Limits::default(), "test", &NoopRecorder).unwrap_err();
+        let wet = apply(
+            &root,
+            &req(false),
+            &Limits::default(),
+            "test",
+            &NoopRecorder,
+        )
+        .unwrap_err();
+        let _ = std::fs::set_permissions(
+            dir.path().join("prometheus"),
+            std::fs::Permissions::from_mode(0o755),
+        );
+
+        // The prediction IS the thing predicted — same code, same reason.
+        for err in [&dry, &wet] {
+            let v = serde_json::to_value(err).unwrap();
+            assert_eq!(v["code"], "denied");
+            assert_eq!(v["data"]["reason"], "not_writable_by_service_identity");
+            assert_eq!(v["data"]["path"], "prometheus/prometheus.yml");
+            assert_eq!(v["data"]["directory"], "prometheus");
+            assert!(v["data"]["hint"].is_string());
+        }
+    }
+
+    /// D-2 from the other side: a file kaed cannot open for writing is
+    /// still writable *through kaed*, because the atomic path renames over
+    /// it. The probe must not refuse a write that would have worked.
+    #[test]
+    fn a_read_only_file_in_a_writable_directory_still_edits() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = setup();
+        let v = write(dir.path(), "f.txt", "x\n");
+        std::fs::set_permissions(
+            dir.path().join("f.txt"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let out = apply(
+            &root,
+            &EditRequest {
+                base: vec![base("f.txt", &v)],
+                ops: vec![EditOp::AnchorReplace {
+                    path: "f.txt".into(),
+                    old_text: "x".into(),
+                    new_text: "y".into(),
+                    occurrence: None,
+                }],
+                dry_run: false,
+                return_diff: false,
+                intent: None,
+                drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
+            },
+            &Limits::default(),
+            "test",
+            &NoopRecorder,
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "y\n"
+        );
+    }
+
+    /// #1091's read half, on the path that produced kubsdb `failure_id 1`:
+    /// the file is listed with its size, and opening it used to collapse to
+    /// `internal: … Permission denied (os error 13)`.
+    #[test]
+    fn an_unreadable_file_refuses_with_a_reason_not_a_bare_internal() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = setup();
+        write(dir.path(), "docker-compose.yml", "POSTGRES_PASSWORD: x\n");
+        std::fs::set_permissions(
+            dir.path().join("docker-compose.yml"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let err = fsops::load_text(&root, "docker-compose.yml", &Limits::default()).unwrap_err();
+        let v = serde_json::to_value(&err).unwrap();
+        assert_eq!(v["code"], "denied");
+        assert_eq!(v["data"]["reason"], "not_readable_by_service_identity");
+        assert_eq!(v["data"]["path"], "docker-compose.yml");
+        assert!(v["data"]["owner"]["mode"].is_string());
+        assert!(
+            !err.message.contains("os error 13"),
+            "the raw errno is not an explanation: {}",
+            err.message
         );
     }
 

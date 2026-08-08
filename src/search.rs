@@ -59,6 +59,13 @@ pub struct SearchResult {
     /// rendering (D-8).
     #[serde(skip_serializing_if = "is_zero")]
     pub classified_hidden: usize,
+    /// Entries the OS refused: directories that could not be descended and
+    /// files that could not be opened, because of unix permissions rather
+    /// than any kaed policy (014, korg #1088). Third sibling, same rule —
+    /// and deliberately NOT folded into `denied_hidden`, because "policy
+    /// says no" and "the OS said no" have different remedies.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unreadable_hidden: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -97,6 +104,7 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
     // deny check would hand back the *contents* of a denied file, not just
     // its name.
     let denied_hidden = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut unreadable_hidden = 0usize;
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     if base.is_file() {
         files.push(base);
@@ -120,7 +128,18 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
                 .build()
         };
         for entry in walker {
-            let entry = entry.map_err(|e| KaedError::internal(e.to_string()))?;
+            let entry = match entry {
+                Ok(e) => e,
+                // One `drwx------` directory used to kill the whole call
+                // (#1088). The OS is a filter like any other: skip it,
+                // count it, keep walking. Non-permission walk errors still
+                // fail loudly — they are not a coverage question.
+                Err(e) if walk_error_is_permission(&e) => {
+                    unreadable_hidden += 1;
+                    continue;
+                }
+                Err(e) => return Err(KaedError::internal(e.to_string())),
+            };
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 files.push(entry.into_path());
             }
@@ -153,14 +172,29 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
             continue;
         }
         tally.kept += 1;
-        let Ok(meta) = std::fs::metadata(abs) else {
-            continue;
+        let meta = match std::fs::metadata(abs) {
+            Ok(m) => m,
+            Err(e) => {
+                if crate::perm::is_permission_denied(&e) {
+                    unreadable_hidden += 1;
+                }
+                continue;
+            }
         };
         if meta.len() > limits.max_file_bytes {
             continue;
         }
-        let Ok(bytes) = std::fs::read(abs) else {
-            continue;
+        // A reachable-but-unopenable file (root-owned 0600 config) was a
+        // silent skip before #1088 — the same R7 dishonesty one level down
+        // from the walker.
+        let bytes = match std::fs::read(abs) {
+            Ok(b) => b,
+            Err(e) => {
+                if crate::perm::is_permission_denied(&e) {
+                    unreadable_hidden += 1;
+                }
+                continue;
+            }
         };
         let text = if fsops::looks_binary(&bytes) {
             None
@@ -224,7 +258,14 @@ pub fn search(root: &ResolvedRoot, p: &SearchParams, limits: &Limits) -> Result<
         files_searched: tally.opened,
         denied_hidden: denied_hidden.load(std::sync::atomic::Ordering::Relaxed),
         classified_hidden,
+        unreadable_hidden,
     })
+}
+
+/// Is this walk error the OS refusing on permissions? `ignore` wraps the
+/// underlying `io::Error`, so the kind survives the wrapping.
+fn walk_error_is_permission(e: &ignore::Error) -> bool {
+    e.io_error().is_some_and(crate::perm::is_permission_denied)
 }
 
 struct CollectSink<'a> {
@@ -649,6 +690,81 @@ mod tests {
         let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
         assert_eq!(paths, ["plain.txt"]);
         assert_eq!(r.denied_hidden, 1);
+    }
+
+    // ------------------------------------------ the OS layer (014, #1088)
+
+    /// Set up `dir/locked/` as `drwx------ root root` is on kubsdb: present,
+    /// undescendable. Returns the restore closure — the tempdir cannot
+    /// clean itself up otherwise.
+    fn lock_dir(dir: &Path, rel: &str) -> impl FnOnce() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(rel);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        move || {
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    /// korg #1088, reproduced exactly: ONE unreadable directory inside the
+    /// root killed the entire call, so the broad root sprint 013 shipped was
+    /// unsearchable without a `path` scope. It must degrade the way every
+    /// other filter does — skip, count, keep going.
+    #[test]
+    fn an_unreadable_directory_is_skipped_and_counted_not_fatal() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        let (dir, root) = setup();
+        write(dir.path(), "prometheus/prometheus.yml", "needle here\n");
+        std::fs::create_dir_all(dir.path().join("lost+found")).unwrap();
+        write(dir.path(), "lost+found/inner.txt", "needle\n");
+        let restore = lock_dir(dir.path(), "lost+found");
+
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        restore();
+
+        let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["prometheus/prometheus.yml"]);
+        assert_eq!(
+            r.unreadable_hidden, 1,
+            "the skip is reported, or the result silently lies about its own coverage"
+        );
+        // …and it is NOT conflated with policy: nothing here is denied.
+        assert_eq!(r.denied_hidden, 0);
+    }
+
+    /// The sibling case: the file is reachable but not openable (a 0600
+    /// root-owned config). Previously a silent `continue`, which is the same
+    /// R7 dishonesty one level down.
+    #[test]
+    fn an_unreadable_file_is_counted_too() {
+        if crate::perm::running_as_root() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, root) = setup();
+        write(dir.path(), "plain.txt", "needle\n");
+        write(dir.path(), "postgresql/docker-compose.yml", "needle\n");
+        let locked = dir.path().join("postgresql/docker-compose.yml");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        let paths: Vec<_> = r.matches.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["plain.txt"]);
+        assert_eq!(r.unreadable_hidden, 1);
+        assert_eq!(r.files_searched, 1);
+    }
+
+    /// Zero is the common case and must stay off the wire, like its
+    /// siblings — a field that is always present stops being read.
+    #[test]
+    fn nothing_unreadable_means_no_field_at_all() {
+        let (dir, root) = setup();
+        write(dir.path(), "f.txt", "needle\n");
+        let r = search(&root, &params("needle"), &Limits::default()).unwrap();
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("unreadable_hidden").is_none());
     }
 
     #[test]

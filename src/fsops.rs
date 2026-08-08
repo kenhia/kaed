@@ -101,6 +101,12 @@ pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     check_denied(root, rel, &joined)?;
     let canonical = joined.canonicalize().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => KaedError::not_found(format!("{rel}: not found")),
+        // An unreadable ancestor directory refuses here, before the file is
+        // ever reached; the subject of the refusal is the deepest thing
+        // that still stats (014, #1091).
+        std::io::ErrorKind::PermissionDenied => {
+            crate::perm::not_readable(root, rel, deepest_existing(&joined))
+        }
         _ => KaedError::internal(format!("{rel}: {e}")),
     })?;
     if !canonical.starts_with(&root.path) {
@@ -111,6 +117,16 @@ pub fn resolve_existing(root: &ResolvedRoot, rel: &str) -> Result<PathBuf> {
     }
     check_denied(root, rel, &canonical)?;
     Ok(canonical)
+}
+
+/// The deepest ancestor of `p` (including `p`) that can still be stat'ed.
+/// When a permission refusal comes from partway up a path, that ancestor is
+/// the thing whose ownership actually explains it — reporting the leaf
+/// would name a file kaed never got close enough to see.
+pub fn deepest_existing(p: &Path) -> &Path {
+    p.ancestors()
+        .find(|a| a.symlink_metadata().is_ok())
+        .unwrap_or(p)
 }
 
 /// Resolve a path that may not exist yet (create targets, staged temps).
@@ -289,6 +305,12 @@ pub struct ListResult {
     /// mistaken for the whole directory.
     #[serde(skip_serializing_if = "is_zero")]
     pub denied_hidden: usize,
+    /// Entries the OS refused to enumerate — unix permissions, not kaed
+    /// policy (014, korg #1088). `list` walks directories itself, so it
+    /// needs its own count for the same reason it needs its own deny check
+    /// (R7's three-places rule).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub unreadable_hidden: usize,
 }
 
 fn is_zero(n: &usize) -> bool {
@@ -438,8 +460,18 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             })
             .build()
     };
+    let mut unreadable_hidden = 0usize;
     for entry in walker {
-        let entry = entry.map_err(|e| KaedError::internal(e.to_string()))?;
+        let entry = match entry {
+            Ok(e) => e,
+            // Same rule as `search` (#1088): the OS is a filter, not a
+            // fatality. Other walk errors still fail loudly.
+            Err(e) if e.io_error().is_some_and(crate::perm::is_permission_denied) => {
+                unreadable_hidden += 1;
+                continue;
+            }
+            Err(e) => return Err(KaedError::internal(e.to_string())),
+        };
         if entry.depth() == 0 {
             continue; // the listed dir itself
         }
@@ -456,9 +488,14 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             continue;
         }
         tally.kept += 1;
-        let meta = entry
-            .metadata()
-            .map_err(|e| KaedError::internal(e.to_string()))?;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(e) if e.io_error().is_some_and(crate::perm::is_permission_denied) => {
+                unreadable_hidden += 1;
+                continue;
+            }
+            Err(e) => return Err(KaedError::internal(e.to_string())),
+        };
         let kind = if meta.is_symlink() {
             EntryKind::Symlink
         } else if meta.is_dir() {
@@ -494,6 +531,7 @@ pub fn list(root: &ResolvedRoot, p: &ListParams) -> Result<ListResult> {
             .then(|| tally.explain(p.glob, p.path))
             .flatten(),
         denied_hidden: denied_hidden.load(Ordering::Relaxed),
+        unreadable_hidden,
     })
 }
 
@@ -573,7 +611,7 @@ pub struct Loaded {
 /// it holds a classified dotenv it must serve redacted.
 pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Loaded> {
     let abs = resolve_existing(root, rel)?;
-    let meta = std::fs::metadata(&abs)?;
+    let meta = std::fs::metadata(&abs).map_err(|e| crate::perm::map_read_io(root, rel, &abs, e))?;
     if meta.is_dir() {
         return Err(KaedError::invalid_input(format!("{rel}: is a directory")));
     }
@@ -584,7 +622,10 @@ pub fn load_text(root: &ResolvedRoot, rel: &str, limits: &Limits) -> Result<Load
             limits.max_file_bytes
         )));
     }
-    let bytes = std::fs::read(&abs)?;
+    // The #1091 case: discoverable-then-opaque. `list` showed this file and
+    // its size; opening it is where the OS says no, and it must say so with
+    // a path, a reason and a route — not `internal: os error 13`.
+    let bytes = std::fs::read(&abs).map_err(|e| crate::perm::map_read_io(root, rel, &abs, e))?;
     let version = version_of(&bytes);
     let classified = root.classify.classified_by(&abs);
     let text = if looks_binary(&bytes) {

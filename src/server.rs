@@ -1205,6 +1205,19 @@ impl KaedServer {
     /// schema.
     fn remote_target(&self, request: &CallToolRequestParams) -> Option<(Peer, String)> {
         let root = request.arguments.as_ref()?.get("root")?.as_str()?;
+        // A PATTERN is always expanded by the instance that was asked
+        // (014 D-5, korg #1089). `kubsdb:*` has host prefix `kubsdb`, so
+        // D-1's routing rule used to forward the whole call — and the peer
+        // ran the fan-out, returning ITS world-model (`hosts_unavailable`:
+        // kai and kubs0 `no_credential`) to a caller for whom that is
+        // false. Results were fine; the one field whose job is stopping an
+        // agent forming a wrong picture was corrupted, in the direction of
+        // claiming a gap that does not exist. `kai:*` and `*:*` were never
+        // affected because they already expanded locally; this makes all
+        // three the same call.
+        if fleet::is_pattern(root) {
+            return None;
+        }
         let (host, _) = root.split_once(':')?;
         if host == self.state.host {
             return None;
@@ -1614,6 +1627,13 @@ impl KaedServer {
         if let Some(peers) = state.fleet.declared() {
             let mut probes = tokio::task::JoinSet::new();
             for peer in peers {
+                // A host the pattern excludes by name is not part of this
+                // search, so it is neither probed nor reported: listing
+                // `kubs0: no_credential` under `kubsdb:*` is the same lie
+                // #1089 filed, just told by the gateway instead of the peer.
+                if !fleet::pattern_admits_host(&p.root, &peer.host) {
+                    continue;
+                }
                 if peer.status == PeerStatus::Deferred {
                     // Deliberately without an instance: listed so "the fleet
                     // was searched" is never silently narrower than the

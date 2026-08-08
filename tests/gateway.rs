@@ -491,6 +491,174 @@ async fn fleet_search_merges_across_hosts_with_per_root_reporting() -> anyhow::R
     Ok(())
 }
 
+/// korg #1089, reproduced with kubsdb's exact topology: a peer that
+/// **declares** the fleet (PD-5) but holds no peer tokens for it, because it
+/// is a leaf and not a gateway.
+///
+/// `beta:*` addressed to alpha used to route on the host prefix (010 D-1)
+/// before the pattern was recognised (010 D-5), so the whole call forwarded
+/// and beta ran the fan-out. Beta's honest answer — "I have no credential
+/// for alpha" — arrived at a caller who is *talking to* alpha, describing a
+/// degraded fleet that is not degraded. The matches were always right; the
+/// one field whose job is preventing a wrong world-model was the casualty.
+#[tokio::test]
+async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyhow::Result<()> {
+    let beta_port = {
+        // beta must declare alpha, so it needs alpha's address first — bind
+        // a throwaway listener to reserve a port number for alpha.
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        l.local_addr()?.port()
+    };
+    let beta = start_instance(
+        "beta",
+        vec![identity("claude", "tok-beta-claude")],
+        BTreeMap::new(),
+        // declared, routable, and NO tokens — kubsdb's shape exactly
+        Some(vec![Peer {
+            url: Some(format!("http://127.0.0.1:{beta_port}/mcp")),
+            ..Peer::declared("alpha", PeerStatus::Active)
+        }]),
+    )
+    .await?;
+
+    let secrets = tempfile::tempdir()?;
+    let beta_token_file = secrets.path().join("beta-claude.token");
+    std::fs::write(&beta_token_file, "tok-beta-claude\n")?;
+    let mut tokens = BTreeMap::new();
+    tokens.insert(
+        "claude".to_string(),
+        PeerTokenEntry {
+            token_env: None,
+            token_file: Some(beta_token_file.display().to_string()),
+        },
+    );
+    let alpha = start_instance(
+        "alpha",
+        vec![
+            identity("claude", "tok-alpha-claude"),
+            // deliberately no beta credential, so this author has a real
+            // fleet gap to report — the control for the assertions below
+            identity("ghcp", "tok-alpha-ghcp"),
+        ],
+        BTreeMap::new(),
+        Some(vec![Peer {
+            url: Some(format!("http://{}/mcp", beta.addr)),
+            tokens,
+            ..Peer::declared("beta", PeerStatus::Active)
+        }]),
+    )
+    .await?;
+
+    std::fs::write(alpha.workdir_path.join("a.txt"), "needle here\n")?;
+    std::fs::write(beta.workdir_path.join("b.txt"), "needle there\n")?;
+    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+
+    let single = structured(
+        &call(
+            &gw,
+            "search",
+            json!({"root": "beta:*", "pattern": "needle"}),
+        )
+        .await,
+    );
+    // The results were never the problem, and must stay right.
+    let matches = single["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0]["root"], "beta:scratch");
+    assert_eq!(single["fleet"], true);
+    // The finding itself: no borrowed world-model.
+    assert!(
+        single.get("hosts_unavailable").is_none(),
+        "the peer's reachability answered the caller's question: {single:#}"
+    );
+
+    // The gate from the work item: `beta:*` and `*:*` agree about the fleet.
+    let all = structured(&call(&gw, "search", json!({"root": "*:*", "pattern": "needle"})).await);
+    assert!(all.get("hosts_unavailable").is_none());
+    let hosts: Vec<&str> = single["fanout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["host"].as_str().unwrap())
+        .collect();
+    assert_eq!(hosts, ["beta"], "only the named host is in the fan-out");
+
+    // The routing half, tested on what actually distinguishes it: the
+    // instance that ANSWERS a pattern is the one whose world-model the
+    // caller gets. Alpha knows both hosts' roots; beta, holding no
+    // credential for alpha, knows only its own — so if this call were still
+    // forwarded, the hint would be missing half the fleet.
+    let none = structured(
+        &call(
+            &gw,
+            "search",
+            json!({"root": "beta:nop*", "pattern": "needle"}),
+        )
+        .await,
+    );
+    assert_eq!(none["reason"]["code"], "root_pattern_matched_no_roots");
+    let hint = none["reason"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("alpha:scratch") && hint.contains("beta:scratch"),
+        "the answering host expands the pattern against the whole fleet it can see: {hint}"
+    );
+
+    // …and a host the pattern excludes is not probed, so it can never be
+    // reported unavailable either. `alpha:*` must not mention beta at all.
+    let local = structured(
+        &call(
+            &gw,
+            "search",
+            json!({"root": "alpha:*", "pattern": "needle"}),
+        )
+        .await,
+    );
+    let hosts: Vec<&str> = local["fanout"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["host"].as_str().unwrap())
+        .collect();
+    assert_eq!(hosts, ["alpha"]);
+    assert!(local.get("hosts_unavailable").is_none());
+
+    // The same lie the gateway could tell, and the control that keeps the
+    // fix from being a mute button. ghcp genuinely has no beta credential:
+    //   - under `alpha:*`, beta is not part of the search, so reporting it
+    //     unavailable would be #1089 with the hosts swapped;
+    //   - under `*:*`, beta IS part of the search and the gap is real, so
+    //     it must still be reported (D-5's no-silent-gap rule).
+    let stranger = connect(alpha.addr, "tok-alpha-ghcp").await?;
+    let scoped = structured(
+        &call(
+            &stranger,
+            "search",
+            json!({"root": "alpha:*", "pattern": "needle"}),
+        )
+        .await,
+    );
+    assert!(
+        scoped.get("hosts_unavailable").is_none(),
+        "a host the pattern excludes has no reachability to report: {scoped:#}"
+    );
+    let fleetwide = structured(
+        &call(
+            &stranger,
+            "search",
+            json!({"root": "*:*", "pattern": "needle"}),
+        )
+        .await,
+    );
+    assert_eq!(fleetwide["hosts_unavailable"][0]["host"], "beta");
+    assert_eq!(fleetwide["hosts_unavailable"][0]["status"], "no_credential");
+
+    let _ = stranger.cancel().await;
+    let _ = gw.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
 /// D-2's rotation story: a backend rotates, the gateway's stale credential
 /// fails loudly with the remedy named, and a SIGHUP-equivalent reload picks
 /// up the new token with no restart — the #914 promise, extended to the

@@ -59,6 +59,14 @@ pub enum RefusalReason {
     /// `[secrets] allow_reveal = false`: this host refuses `secret_reveal`
     /// outright (011 D-1). The lifecycle verbs still work.
     RevealDisabled,
+    /// The OS refused the read: the file exists, kaed's policy layers had
+    /// nothing to say about it, and the identity kaed runs as cannot open
+    /// it (014 D-1). A host fact, not kaed policy.
+    NotReadableByServiceIdentity,
+    /// The OS will refuse the write. kaed writes atomically — temp file in
+    /// the containing directory, then rename — so this is about the
+    /// *directory*, not the file's own mode (014 D-2).
+    NotWritableByServiceIdentity,
 }
 
 impl fmt::Display for RefusalReason {
@@ -98,6 +106,22 @@ impl KaedError {
 
     pub fn with_data(mut self, data: impl Serialize) -> Self {
         self.data = Some(serde_json::to_value(data).expect("error data serializes"));
+        self
+    }
+
+    /// Fold extra fields into an existing `data` object without disturbing
+    /// what is already there — how a refusal gains the evidence behind it
+    /// (the identity, the owning uid, the root's advisory) while keeping the
+    /// `{path, rule, reason, hint}` shape every reader already parses.
+    pub fn merge_data(mut self, extra: serde_json::Value) -> Self {
+        let Some(extra) = extra.as_object() else {
+            return self;
+        };
+        match &mut self.data {
+            Some(Value::Object(obj)) => obj.extend(extra.clone()),
+            None => self.data = Some(Value::Object(extra.clone())),
+            Some(_) => {}
+        }
         self
     }
 
