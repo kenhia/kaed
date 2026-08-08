@@ -103,6 +103,21 @@ CREATE TABLE IF NOT EXISTS secret_events (
 );
 CREATE INDEX IF NOT EXISTS secret_events_by_key
   ON secret_events(root, path, key);
+-- The known-digest index (012 D-4): digests of secrets kaed has seen —
+-- read, written, minted, or journaled — with where they live, so a
+-- write-side refusal can say \"reference the variable, not the value\".
+-- Digests only, above-floor only (PD-2); `key` is empty for a value only
+-- ever seen redacted out of a comment. Never pruned: a rotated-away
+-- value's digest stays, because writing an OLD secret into a README is
+-- still a leak.
+CREATE TABLE IF NOT EXISTS secret_digests (
+  digest     TEXT NOT NULL,
+  root       TEXT NOT NULL,
+  path       TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  first_seen TEXT NOT NULL,
+  PRIMARY KEY (digest, root, path, key)
+);
 ";
 
 /// How often blob GC runs while the daemon is up. Retention is measured in
@@ -156,6 +171,11 @@ impl Journal {
         let dropped = j.gc_blobs()?;
         if dropped > 0 {
             tracing::info!(dropped, days = blob_retention_days, "expired journal blobs");
+        }
+        // Seed the known-digest index from history (012 D-4). Idempotent;
+        // a failure degrades write-side detection, never startup.
+        if let Err(e) = j.backfill_digest_index() {
+            tracing::warn!(error = %e, "could not backfill the secret digest index");
         }
         Ok(j)
     }
@@ -733,6 +753,118 @@ impl Journal {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Record where secret values live, by digest (012 D-4). Fed by every
+    /// redacted rendering kaed serves or journals and by every secret
+    /// event; `INSERT OR IGNORE`, so re-observation is free. Entries with
+    /// no digest (below the floor) must not reach here — the index holds
+    /// only what a redacted read would disclose anyway.
+    pub fn record_digests(&self, root: &str, path: &str, entries: &[(String, String)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let conn = self.lock();
+        for (key, digest) in entries {
+            let write = conn.execute(
+                "INSERT OR IGNORE INTO secret_digests (digest, root, path, key, first_seen)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![digest, root, path, key, now()],
+            );
+            // indexing must never break the read or write it rode on
+            if let Err(e) = write {
+                tracing::warn!(error = %e, "could not index a secret digest");
+            }
+        }
+    }
+
+    /// Where each digest's value lives, if kaed has seen it. One location
+    /// per digest (the earliest observation), which is all a refusal hint
+    /// needs; `occurrences`/`search` answer the exhaustive question.
+    pub fn known_digests(&self, digests: &[String]) -> Vec<Option<crate::leak::DigestLocation>> {
+        let conn = self.lock();
+        digests
+            .iter()
+            .map(|d| {
+                conn.query_row(
+                    "SELECT root, path, key FROM secret_digests WHERE digest = ?1
+                     ORDER BY first_seen, root, path, key LIMIT 1",
+                    [d],
+                    |row| {
+                        Ok(crate::leak::DigestLocation {
+                            root: row.get(0)?,
+                            path: row.get(1)?,
+                            key: row.get(2)?,
+                        })
+                    },
+                )
+                .optional()
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "digest index lookup failed");
+                    None
+                })
+            })
+            .collect()
+    }
+
+    /// Seed `secret_digests` from what the journal already holds: every
+    /// digest in `secret_events`, and every placeholder in a retained
+    /// redacted blob (joined back to its root and path). Idempotent and
+    /// cheap — blobs only live `blob_retention_days` — so it runs on every
+    /// open rather than tracking a migration marker.
+    pub fn backfill_digest_index(&self) -> Result<()> {
+        let conn = self.lock();
+        // leak_* rows are deliberately excluded: their root/path name the
+        // write TARGET, not where the value lives.
+        for col in ["old_digest", "new_digest"] {
+            conn.execute(
+                &format!(
+                    "INSERT OR IGNORE INTO secret_digests (digest, root, path, key, first_seen)
+                     SELECT {col}, root, path, key, created_at
+                       FROM secret_events
+                      WHERE {col} IS NOT NULL
+                        AND action IN ('generate', 'rotate', 'reveal', 'transport')"
+                ),
+                [],
+            )
+            .map_err(db_err)?;
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT b.content, t.root, tf.path, b.created_at
+                   FROM blobs b
+                   JOIN txn_files tf
+                     ON tf.new_version = b.version OR tf.old_version = b.version
+                   JOIN txns t ON t.id = tf.txn_id
+                  WHERE b.redacted = 1",
+            )
+            .map_err(db_err)?;
+        let renderings = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        for (bytes, root, path, seen) in renderings {
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue;
+            };
+            for (key, digest) in crate::secrets::extract_placeholder_digests(&content) {
+                conn.execute(
+                    "INSERT OR IGNORE INTO secret_digests (digest, root, path, key, first_seen)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![digest, root, path, key, seen],
+                )
+                .map_err(db_err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// File a friction report. Text arrives already redacted — the caller
     /// owns that, because the caller knows it is free text (D-5).
     pub fn add_feedback(
@@ -843,6 +975,21 @@ impl TxnRecorder for Journal {
                 )
                 .map_err(db_err)?;
             }
+            // A redacted rendering feeds the known-digest index (012 D-4):
+            // a write to a classified file makes its values "seen".
+            if f.redacted {
+                for blob in [&f.blob_old, &f.blob_new].into_iter().flatten() {
+                    for (key, digest) in crate::secrets::extract_placeholder_digests(blob) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO secret_digests
+                               (digest, root, path, key, first_seen)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                            rusqlite::params![digest, root.name, f.path, key, now()],
+                        )
+                        .map_err(db_err)?;
+                    }
+                }
+            }
         }
         tx.commit().map_err(db_err)?;
         Ok(txn_id)
@@ -868,6 +1015,36 @@ impl TxnRecorder for Journal {
             )
             .ok()
             .and_then(|(bytes, redacted)| Some((String::from_utf8(bytes).ok()?, redacted)))
+    }
+
+    fn known_digests(&self, digests: &[String]) -> Vec<Option<crate::leak::DigestLocation>> {
+        Journal::known_digests(self, digests)
+    }
+
+    fn leak_events(&self, author: &str, root: &ResolvedRoot, events: &[crate::txn::LeakEvent<'_>]) {
+        for e in events {
+            // `key` names the value when it is known (the digest tier);
+            // otherwise it carries the detector's disclosable detail
+            // (prefix, armor label, shape description), so the row still
+            // says what fired.
+            let intent = e.intent.map(redact_note);
+            let write = self.add_secret_event(&SecretEvent {
+                author,
+                action: e.action,
+                root: &root.name,
+                path: e.path,
+                key: e.source_key.unwrap_or(e.detail),
+                old_digest: None,
+                new_digest: e.digest,
+                disclosed: false,
+                destination: None,
+                txn_id: e.txn_id,
+                intent: intent.as_deref(),
+            });
+            if let Err(err) = write {
+                tracing::warn!(error = %err, "could not journal a leak event");
+            }
+        }
     }
 
     fn fail(&self, r: &FailedTxnRecord<'_>) {
@@ -1033,6 +1210,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!((added, removed), (2, 1));
+    }
+
+    #[test]
+    fn digest_index_round_trips_and_misses_honestly() {
+        let j = Journal::open_in_memory().unwrap();
+        j.record_digests(
+            "kai:home",
+            ".env",
+            &[("KLAMS_TOKEN".into(), "b7f3a9d2c8e14f60".into())],
+        );
+        // re-observation is free, and a second location is kept
+        j.record_digests(
+            "kai:home",
+            ".env",
+            &[("KLAMS_TOKEN".into(), "b7f3a9d2c8e14f60".into())],
+        );
+        let hits = Journal::known_digests(
+            &j,
+            &["b7f3a9d2c8e14f60".to_owned(), "0000000000000000".to_owned()],
+        );
+        let loc = hits[0].as_ref().expect("indexed digest resolves");
+        assert_eq!(
+            (loc.root.as_str(), loc.key.as_str()),
+            ("kai:home", "KLAMS_TOKEN")
+        );
+        assert!(hits[1].is_none(), "an unseen digest is honestly unknown");
+    }
+
+    /// 012 D-4 feed point: a write to a classified file indexes its
+    /// values' digests as a side effect of journaling the redacted blob.
+    #[test]
+    fn a_redacted_blob_feeds_the_digest_index_on_begin() {
+        let j = Journal::open_in_memory().unwrap();
+        let (_dir, root) = scratch_root();
+        let rendering = "TOKEN=⟨kaed:TOKEN@a3f9c2d41b7e5860⟩\nDEBUG=⟨kaed:DEBUG⟩\n";
+        let mut rec = record("svc/.env", None, rendering, None, "envver1234567890");
+        rec.redacted = true;
+        let id = j.begin("claude", None, &root, &[rec]).unwrap();
+        j.complete(id).unwrap();
+
+        let hit = Journal::known_digests(&j, &["a3f9c2d41b7e5860".to_owned()])
+            .remove(0)
+            .expect("digest from the journaled rendering is known");
+        assert_eq!(hit.path, "svc/.env");
+        assert_eq!(hit.key, "TOKEN");
+        // the below-floor DEBUG placeholder had no digest to index
+        let count: i64 = j
+            .lock()
+            .query_row("SELECT count(*) FROM secret_digests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The backfill seeds the index from what an upgraded host's journal
+    /// already holds: secret_events digests and retained redacted blobs.
+    /// leak_* rows are excluded — their path is the write target, not
+    /// where the value lives.
+    #[test]
+    fn backfill_seeds_from_events_and_redacted_blobs_only() {
+        let j = Journal::open_in_memory().unwrap();
+        j.add_secret_event(&SecretEvent {
+            author: "claude",
+            action: "rotate",
+            root: "kai:src",
+            path: "svc/.env",
+            key: "API_KEY",
+            old_digest: Some("1111111111111111"),
+            new_digest: Some("2222222222222222"),
+            ..Default::default()
+        })
+        .unwrap();
+        j.add_secret_event(&SecretEvent {
+            author: "claude",
+            action: "leak_refused",
+            root: "kai:src",
+            path: "README.md",
+            key: "sk-ant-",
+            new_digest: Some("3333333333333333"),
+            ..Default::default()
+        })
+        .unwrap();
+        let (_dir, root) = scratch_root();
+        let mut rec = record(
+            "app/.env",
+            None,
+            "TOKEN=⟨kaed:TOKEN@4444444444444444⟩\n",
+            None,
+            "blobver123456789",
+        );
+        rec.redacted = true;
+        let id = j.begin("claude", None, &root, &[rec]).unwrap();
+        j.complete(id).unwrap();
+        j.lock().execute("DELETE FROM secret_digests", []).unwrap();
+
+        j.backfill_digest_index().unwrap();
+        let hits = Journal::known_digests(
+            &j,
+            &[
+                "1111111111111111".to_owned(),
+                "2222222222222222".to_owned(),
+                "3333333333333333".to_owned(),
+                "4444444444444444".to_owned(),
+            ],
+        );
+        assert!(hits[0].is_some(), "old rotate digest backfills");
+        assert!(hits[1].is_some(), "new rotate digest backfills");
+        assert!(
+            hits[2].is_none(),
+            "a leak event's target must not become a claimed location"
+        );
+        assert_eq!(
+            hits[3].as_ref().map(|l| l.path.as_str()),
+            Some("app/.env"),
+            "redacted blob placeholders backfill with their path"
+        );
     }
 
     /// D-6, the dated boundary #1049 has to detect. From sprint 007 every
@@ -1209,6 +1501,7 @@ mod tests {
             return_diff: true,
             intent: Some("retry from a stale base".into()),
             drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
         };
         let err = txn::apply(&root, &stale, &Limits::default(), "claude", &j).unwrap_err();
         assert_eq!(err.code, ErrorCode::VersionConflict);
@@ -1279,6 +1572,7 @@ mod tests {
             return_diff: false,
             intent: None,
             drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
         };
         // one success, then two attempts still holding the pre-edit version
         txn::apply(&root, &edit(&good, "second"), &Limits::default(), "a", &j).unwrap();
@@ -1321,6 +1615,7 @@ mod tests {
             return_diff: true,
             intent: None,
             drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
         };
         assert!(txn::apply(&root, &req, &Limits::default(), "claude", &j).is_err());
         let n: i64 = j
@@ -1393,6 +1688,7 @@ mod tests {
                 return_diff: false,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1479,6 +1775,7 @@ mod tests {
             return_diff: true,
             intent: None,
             drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
         };
 
         let out = txn::apply(

@@ -140,7 +140,7 @@ pub(crate) fn provider_prefix(token: &str) -> Option<&'static str> {
     })
 }
 
-fn is_token_char(c: char) -> bool {
+pub(crate) fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '=' | '.')
 }
 
@@ -181,6 +181,32 @@ pub fn redact_free_text(text: &str) -> String {
         rest = after;
     }
     out.push_str(rest);
+    out
+}
+
+/// Every `(key, digest)` a redacted rendering disclosed — entry
+/// placeholders (`⟨kaed:KEY@digest⟩`) and comment redactions
+/// (`⟨kaed:@digest⟩`, key unknown → empty). This is what feeds the 012
+/// `secret_digests` index: digests only, and only ones the rendering
+/// already carried, so it can never disclose more than the redacted read
+/// did.
+pub fn extract_placeholder_digests(rendering: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = rendering;
+    while let Some(start) = rest.find(PLACEHOLDER_OPEN) {
+        rest = &rest[start + PLACEHOLDER_OPEN.len()..];
+        let Some(end) = rest.find(PLACEHOLDER_CLOSE) else {
+            break;
+        };
+        let body = &rest[..end];
+        rest = &rest[end + PLACEHOLDER_CLOSE.len_utf8()..];
+        if let Some((key, digest)) = body.split_once('@')
+            && digest.len() == DIGEST_LEN
+            && digest.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            out.push((key.to_owned(), digest.to_owned()));
+        }
+    }
     out
 }
 
@@ -300,6 +326,24 @@ mod tests {
         assert_eq!(redact_free_text(benign), benign);
         let benign2 = "# ordinary words that just keep going for a while here";
         assert_eq!(redact_free_text(benign2), benign2);
+    }
+
+    #[test]
+    fn extract_digests_reads_entry_and_comment_placeholders_only() {
+        let rendering = "\
+# a comment with a redacted token: ⟨kaed:@a3f9c2d41b7e5860⟩\n\
+KLAMS_TOKEN=⟨kaed:KLAMS_TOKEN@b7f3a9d2c8e14f60⟩\n\
+DEBUG=⟨kaed:DEBUG⟩\n\
+PLAIN=not-redacted\n";
+        assert_eq!(
+            extract_placeholder_digests(rendering),
+            vec![
+                ("".to_owned(), "a3f9c2d41b7e5860".to_owned()),
+                ("KLAMS_TOKEN".to_owned(), "b7f3a9d2c8e14f60".to_owned()),
+            ],
+            "below-floor placeholders have no digest and plain text has none"
+        );
+        assert!(extract_placeholder_digests("⟨kaed:K@zz⟩ truncated ⟨kaed:X").is_empty());
     }
 
     #[test]

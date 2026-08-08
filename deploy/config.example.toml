@@ -149,5 +149,11 @@ deny = [
 # — or a name declared here. Specs are validated at startup.
 # [secrets]
 # allow_reveal = true              # false refuses secret_reveal host-wide
+# leak_checks = "refuse"           # write-side leak detection (012):
+#                                  # "refuse" (default) — known-digest /
+#                                  # provider-prefix / private-key matches
+#                                  # refuse with a named allow_secrets
+#                                  # override, the entropy heuristic warns;
+#                                  # "flag" — everything warns; "off"
 # [secrets.shapes]
 # klams = "prefixed(klams-,hex(64))"

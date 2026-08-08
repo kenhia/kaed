@@ -45,7 +45,7 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai and kubs0).
 
-**Status: v0 live on kai + kubs0** (sprints 001–010, 2026-08-07):
+**Status: v0 live on kai + kubs0** (sprints 001–011, 2026-08-08):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
 auth. **kubsdb deliberately has no instance** (korg #929) — if you find
@@ -166,6 +166,22 @@ fails, and what the journal structurally cannot tell you — see
   holds the value). The audit stream is `journal` kind `"secret"`;
   `destination` on transport rows is the caller's *claim*, and D-6 says
   why that is the honest ceiling.
+- **Write-side leak detection is 012** (R12 in the contract;
+  `sprints/012-write-side-leak-detection/decisions.md`): writes to
+  **unclassified** files are scanned for newly-introduced secrets —
+  known-digest / provider-prefix / private-key matches refuse
+  (`reason: secret_leak`, override `allow_secrets` naming the exact
+  match), the entropy heuristic **warns and applies** (D-3: promote it
+  only with `leak_flagged` evidence, or it becomes a tool agents route
+  around). Three things not to re-derive: the known-digest index
+  (`secret_digests` in journal.db) holds **digests only, above-floor
+  only**, fed by redacted reads/blobs/secret-events — it is not a read
+  journal (009 D-2 intact) and not a plaintext shadow (008 D-11 intact);
+  **only newly-introduced tokens trip** (D-1), so a file already holding
+  a token stays editable, including the edit removing it; and the precise
+  tier's coverage is honestly "secrets kaed has seen", not "secrets on
+  the host" — no walk runs on the write path. Host lever:
+  `[secrets] leak_checks = refuse|flag|off`.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

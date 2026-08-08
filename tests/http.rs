@@ -446,6 +446,114 @@ async fn secrets_loop_redacted_read_env_edit_and_drop_keys() -> anyhow::Result<(
     Ok(())
 }
 
+/// Sprint 012 end to end: a redacted `read` of `.env` teaches the host the
+/// secret's digest, and the write that would paste that value into a
+/// README refuses with the named override — the incident that actually
+/// happens, caught at the choke point. Provider prefixes refuse with no
+/// index at all, and the audit stream counts every event.
+#[tokio::test]
+async fn write_side_leak_detection_catches_the_readme_incident() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    std::fs::write(
+        server.workdir_path.join(".env"),
+        format!("KLAMS_TOKEN={VALUE}\n"),
+    )?;
+    let client = connect(&server).await?;
+
+    // 1. a redacted read — this is where kaed first *sees* the value
+    let read = client
+        .call_tool(
+            CallToolRequestParams::new("read")
+                .with_arguments(args(json!({"root": ROOT, "path": ".env"}))),
+        )
+        .await?;
+    assert_eq!(structured(&read)["redacted"], true);
+
+    // 2. pasting the value into a README refuses, names the variable and
+    // the exact override — and never echoes the value
+    let refused = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "ops": [{"op": "create", "path": "README.md",
+                         "content": format!("# setup\nexport KLAMS_TOKEN={VALUE}\n")}],
+                "intent": "document the setup"
+            }))),
+        )
+        .await?;
+    assert_eq!(refused.is_error, Some(true));
+    let err = structured(&refused);
+    assert_eq!(err["code"], "invalid_input");
+    assert_eq!(err["data"]["reason"], "secret_leak");
+    assert_eq!(err["data"]["matches"][0]["kind"], "known_digest");
+    assert_eq!(err["data"]["matches"][0]["source"]["key"], "KLAMS_TOKEN");
+    assert_eq!(err["data"]["matches"][0]["source"]["path"], ".env");
+    let msg = err["message"].as_str().unwrap();
+    assert!(!msg.contains(VALUE), "the refusal echoed the secret: {msg}");
+    let overrides = err["data"]["allow_secrets"].clone();
+    assert!(!server.workdir_path.join("README.md").exists());
+
+    // 3. the named override is the retry path; the write lands with a
+    // warning instead of silently
+    let allowed = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "ops": [{"op": "create", "path": "README.md",
+                         "content": format!("# setup\nexport KLAMS_TOKEN={VALUE}\n")}],
+                "allow_secrets": overrides,
+                "intent": "deliberate: scratch root, test data"
+            }))),
+        )
+        .await?;
+    assert_ne!(allowed.is_error, Some(true));
+    let a = structured(&allowed);
+    assert_eq!(a["applied"], true);
+    assert!(
+        a["warnings"][0].as_str().unwrap().contains("allow_secrets"),
+        "{a}"
+    );
+
+    // 4. a provider token needs no index: refused on shape alone
+    let provider = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "ops": [{"op": "create", "path": "notes.md",
+                         "content": "key: sk-ant-api03-h8Xk2mQv9pLtRw4nZs7cYb1d\n"}]
+            }))),
+        )
+        .await?;
+    assert_eq!(provider.is_error, Some(true));
+    let p = structured(&provider);
+    assert_eq!(p["data"]["reason"], "secret_leak");
+    assert_eq!(p["data"]["allow_secrets"], json!(["sk-ant-"]));
+
+    // 5. every event is countable in the audit stream
+    let journal = client
+        .call_tool(
+            CallToolRequestParams::new("journal")
+                .with_arguments(args(json!({"root": ROOT, "kind": ["secret"], "max": 20}))),
+        )
+        .await?;
+    let entries = structured(&journal)["entries"].clone();
+    let actions: Vec<&str> = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["action"].as_str().unwrap())
+        .collect();
+    assert!(
+        actions.contains(&"leak_refused") && actions.contains(&"leak_allowed"),
+        "{actions:?}"
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
 /// Sprint 011's lifecycle over the wire: `secret` mints and rotates
 /// without ever disclosing a value, `describe` hands out the durable
 /// handle, `value_from` consumes one, `secret_reveal` is its own gated

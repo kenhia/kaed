@@ -16,6 +16,7 @@ use crate::config::{Limits, ResolvedRoot};
 use crate::dotenv;
 use crate::errors::{KaedError, RefusalReason, Result, VersionConflictData};
 use crate::fsops::{self, Secrecy};
+use crate::leak;
 use crate::policy;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -150,6 +151,11 @@ pub struct EditRequest {
     /// (D-10): otherwise an agent silently destroys a secret it never saw
     /// and kaed cannot restore (D-11: no shadow).
     pub drop_keys: Vec<String>,
+    /// Leak matches this transaction may write anyway (012 D-2): the exact
+    /// `detail` strings a `secret_leak` refusal reported — a digest, a
+    /// provider prefix, an armor label. Naming the specific match keeps
+    /// each secret's disclosure a per-decision act, like `drop_keys`.
+    pub allow_secrets: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -211,6 +217,29 @@ pub struct FailedTxnRecord<'a> {
     pub error: &'a KaedError,
 }
 
+/// One write-side leak detection for the secrets audit stream (012 D-3).
+/// Refusals never carry a txn id (the write never applied); flags carry
+/// the transaction they rode into the file on.
+pub struct LeakEvent<'a> {
+    /// `leak_refused` or `leak_flagged`.
+    pub action: &'a str,
+    /// The write target — where the secret was headed, not where it lives.
+    pub path: &'a str,
+    /// `known_digest` | `provider_prefix` | `private_key_block` |
+    /// `secret_shaped`.
+    pub kind: &'a str,
+    /// The match's disclosable identity: digest, prefix, armor label, or
+    /// shape description.
+    pub detail: &'a str,
+    /// `known_digest` only: the matched digest and the key it belongs to.
+    pub digest: Option<&'a str>,
+    pub source_key: Option<&'a str>,
+    pub txn_id: Option<i64>,
+    /// The edit's own `intent` — what the agent said it was doing when the
+    /// leak happened. Raw; the recorder redacts.
+    pub intent: Option<&'a str>,
+}
+
 /// Journal hook. `begin` is called after staging and before any rename —
 /// an interrupted transaction is thus always detectable; `complete` after
 /// every rename landed.
@@ -233,6 +262,16 @@ pub trait TxnRecorder: Sync {
     /// An attempt that failed. Never carries content: a failed attempt has
     /// no new bytes worth keeping, and the pre-image is the file on disk.
     fn fail(&self, _record: &FailedTxnRecord<'_>) {}
+    /// Where each digest's value lives, if this store has seen it (012
+    /// D-4). Same order as `digests`; `None` = unknown. The default —
+    /// nothing is known — degrades detection to the prefix and shape
+    /// tiers, never to silence.
+    fn known_digests(&self, digests: &[String]) -> Vec<Option<crate::leak::DigestLocation>> {
+        vec![None; digests.len()]
+    }
+    /// Write-side leak detections for the secrets audit stream (012 D-3).
+    /// Must never fail the write it rides on.
+    fn leak_events(&self, _author: &str, _root: &ResolvedRoot, _events: &[LeakEvent<'_>]) {}
 }
 
 /// Recorder for tests and journal-less operation.
@@ -632,6 +671,48 @@ fn apply_inner(
         }
     }
 
+    // Write-side leak detection (012 D-1..D-3): secrets heading into files
+    // where nothing would redact them. Classified files are exempt — they
+    // are where secrets belong. Precise tiers refuse with a named override;
+    // the heuristic tier warns; everything detected is journaled.
+    let mut leak_refused: Vec<(String, leak::LeakMatch)> = Vec::new();
+    let mut leak_applied: Vec<(String, &'static str, leak::LeakMatch)> = Vec::new();
+    let mut leak_warnings: Vec<String> = Vec::new();
+    if root.leak_checks != leak::LeakChecks::Off {
+        for (path, buf) in &touched {
+            if buf.classified.is_some() {
+                continue;
+            }
+            let matches = leak::scan(buf.old_content.as_deref(), &buf.content, |ds| {
+                recorder.known_digests(ds)
+            });
+            for m in matches {
+                let overridden = req.allow_secrets.contains(&m.detail);
+                if m.kind.refuses() && root.leak_checks == leak::LeakChecks::Refuse && !overridden {
+                    leak_refused.push(((*path).clone(), m));
+                    continue;
+                }
+                leak_warnings.push(leak_warning(path, &m, overridden));
+                let action = if overridden {
+                    "leak_allowed"
+                } else {
+                    "leak_flagged"
+                };
+                leak_applied.push(((*path).clone(), action, m));
+            }
+        }
+    }
+    if !leak_refused.is_empty() {
+        if !req.dry_run {
+            let events: Vec<LeakEvent<'_>> = leak_refused
+                .iter()
+                .map(|(path, m)| leak_event(path, "leak_refused", m, None, req.intent.as_deref()))
+                .collect();
+            recorder.leak_events(author, root, &events);
+        }
+        return Err(leak_refusal(&leak_refused));
+    }
+
     let files: Vec<FileChange> = touched
         .iter()
         .map(|(path, buf)| FileChange {
@@ -660,14 +741,22 @@ fn apply_inner(
             .collect::<Vec<_>>()
             .join("")
     });
-    let warnings: Vec<String> = touched
-        .iter()
-        .filter(|(_, buf)| buf.classified.is_some())
-        // an all-empty dotenv (a synced `.env.example`) discloses nothing,
-        // and it exists precisely to be committed — no warning for it
-        .filter(|(_, buf)| !dotenv::parse(&buf.content).is_some_and(|f| f.all_values_empty()))
-        .filter_map(|(path, buf)| policy::gitignore_warning(&buf.abs, path))
-        .collect();
+    let warnings: Vec<String> = {
+        let mut w = leak_warnings;
+        w.extend(
+            touched
+                .iter()
+                .filter(|(_, buf)| buf.classified.is_some())
+                // an all-empty dotenv (a synced `.env.example`) discloses
+                // nothing, and it exists precisely to be committed — no
+                // warning for it
+                .filter(|(_, buf)| {
+                    !dotenv::parse(&buf.content).is_some_and(|f| f.all_values_empty())
+                })
+                .filter_map(|(path, buf)| policy::gitignore_warning(&buf.abs, path)),
+        );
+        w
+    };
 
     if req.dry_run {
         return Ok(EditOutcome {
@@ -738,6 +827,18 @@ fn apply_inner(
         fsops::promote(s)?;
     }
     recorder.complete(txn_id)?;
+
+    // Flagged and override-allowed leaks are journaled with the
+    // transaction they rode into the file on (012 D-3).
+    if !leak_applied.is_empty() {
+        let events: Vec<LeakEvent<'_>> = leak_applied
+            .iter()
+            .map(|(path, action, m)| {
+                leak_event(path, action, m, Some(txn_id), req.intent.as_deref())
+            })
+            .collect();
+        recorder.leak_events(author, root, &events);
+    }
 
     Ok(EditOutcome {
         txn_id: Some(txn_id),
@@ -838,6 +939,101 @@ fn resolve_value_from(
     Ok(entry.value.clone())
 }
 
+/// What fired, for humans and audit rows. Never the token itself.
+fn leak_describe(m: &leak::LeakMatch) -> String {
+    match m.kind {
+        leak::LeakKind::KnownDigest => match &m.source {
+            Some(s) if !s.key.is_empty() => format!(
+                "the value of {} from {} {} (digest {})",
+                s.key, s.root, s.path, m.detail
+            ),
+            Some(s) => format!(
+                "a value kaed redacted out of {} {} (digest {})",
+                s.root, s.path, m.detail
+            ),
+            None => format!("a known secret (digest {})", m.detail),
+        },
+        leak::LeakKind::ProviderPrefix => format!("a {}… provider token", m.detail),
+        leak::LeakKind::PrivateKeyBlock => format!("a {} block", m.detail),
+        leak::LeakKind::SecretShaped => format!("a {}", m.detail),
+    }
+}
+
+fn leak_warning(path: &str, m: &leak::LeakMatch, overridden: bool) -> String {
+    if overridden {
+        format!(
+            "{path}:{}: {} — written under its allow_secrets override",
+            m.line,
+            leak_describe(m)
+        )
+    } else {
+        format!(
+            "{path}:{}: {} in a file nothing classifies or redacts — if this is a \
+             real secret, remove it and reference its variable instead",
+            m.line,
+            leak_describe(m)
+        )
+    }
+}
+
+fn leak_event<'a>(
+    path: &'a str,
+    action: &'a str,
+    m: &'a leak::LeakMatch,
+    txn_id: Option<i64>,
+    intent: Option<&'a str>,
+) -> LeakEvent<'a> {
+    LeakEvent {
+        action,
+        path,
+        kind: m.kind.as_str(),
+        detail: &m.detail,
+        digest: (m.kind == leak::LeakKind::KnownDigest).then_some(m.detail.as_str()),
+        source_key: m.source.as_ref().map(|s| s.key.as_str()),
+        txn_id,
+        intent,
+    }
+}
+
+/// The refusal (012 D-2): names every match, what to do instead, and the
+/// exact override — the vanish guard's shape, applied to leaks.
+fn leak_refusal(refused: &[(String, leak::LeakMatch)]) -> KaedError {
+    let described: Vec<String> = refused
+        .iter()
+        .map(|(p, m)| format!("{p}:{}: {}", m.line, leak_describe(m)))
+        .collect();
+    let mut overrides: Vec<&str> = refused.iter().map(|(_, m)| m.detail.as_str()).collect();
+    overrides.dedup();
+    let matches: Vec<serde_json::Value> = refused
+        .iter()
+        .map(|(p, m)| {
+            serde_json::json!({
+                "path": p,
+                "line": m.line,
+                "kind": m.kind,
+                "detail": m.detail,
+                "source": m.source.as_ref().map(|s| {
+                    serde_json::json!({"root": s.root, "path": s.path, "key": s.key})
+                }),
+            })
+        })
+        .collect();
+    KaedError::invalid_input(format!(
+        "this write would put secret content into files nothing classifies or \
+         redacts: {} — reference the variable instead of the value (dotenv \
+         targets take env_set with value_from or a placeholder). If writing the \
+         literal is deliberate, retry with allow_secrets: {overrides:?}; if the \
+         target file should hold secrets, add it to [security] classify so kaed \
+         serves it redacted",
+        described.join("; ")
+    ))
+    .with_data(serde_json::json!({
+        "reason": "secret_leak",
+        "matches": matches,
+        "allow_secrets": overrides,
+    }))
+}
+
 /// Parse the evolving buffer for an env op. Env ops work on any strictly
 /// dotenv-shaped file, classified or not — classification governs
 /// redaction, not the op vocabulary.
@@ -912,6 +1108,7 @@ mod tests {
             return_diff: true,
             intent: None,
             drop_keys: Vec::new(),
+            allow_secrets: Vec::new(),
         }
     }
 
@@ -1327,6 +1524,7 @@ mod tests {
                 return_diff: true,
                 intent: None,
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "test",
@@ -1514,6 +1712,7 @@ mod tests {
                 return_diff: false,
                 intent: Some("test intent".into()),
                 drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1669,6 +1868,7 @@ mod tests {
             &root,
             &EditRequest {
                 drop_keys: vec!["KLAMS_TOKEN".into()],
+                allow_secrets: Vec::new(),
                 ..req(
                     vec![base(".env", &v)],
                     vec![EditOp::EnvDelete {
@@ -2098,5 +2298,263 @@ mod tests {
         assert_eq!(err.code, ErrorCode::VersionConflict);
         // the loser is told what the file became
         assert_eq!(err.data.unwrap()["actual_version"], ok.files[0].new_version);
+    }
+
+    // ------------------------------------- write-side leak detection (012)
+
+    const ANT_TOKEN: &str = "sk-ant-api03-h8Xk2mQv9pLtRw4nZs7cYb1dFg6jVe3aU";
+
+    fn journal_recorder() -> crate::journal::Journal {
+        crate::journal::Journal::open_in_memory().unwrap()
+    }
+
+    fn secret_event_rows(j: &crate::journal::Journal) -> Vec<(String, String, Option<i64>)> {
+        j.secret_events(&crate::journal::HistoryFilter {
+            limit: 50,
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.action, r.key, r.txn_id))
+        .collect()
+    }
+
+    #[test]
+    fn a_provider_token_into_a_plain_file_refuses_then_the_override_applies() {
+        let (dir, root) = setup();
+        let j = journal_recorder();
+        let v = write(dir.path(), "README.md", "# setup\n");
+        let mut r = req(
+            vec![base("README.md", &v)],
+            vec![EditOp::AnchorReplace {
+                path: "README.md".into(),
+                old_text: "# setup".into(),
+                new_text: format!("# setup\ntoken: {ANT_TOKEN}"),
+                occurrence: None,
+            }],
+        );
+        let err = apply(&root, &r, &Limits::default(), "test", &j).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let data = err.data.as_ref().unwrap();
+        assert_eq!(data["reason"], "secret_leak");
+        assert_eq!(data["allow_secrets"], serde_json::json!(["sk-ant-"]));
+        assert_eq!(data["matches"][0]["kind"], "provider_prefix");
+        assert!(
+            !err.message.contains(ANT_TOKEN),
+            "the refusal must not echo the token"
+        );
+        assert!(
+            std::fs::read_to_string(dir.path().join("README.md"))
+                .unwrap()
+                .starts_with("# setup\n"),
+            "nothing applied"
+        );
+        // the refusal is a countable audit event (D-3)
+        assert_eq!(
+            secret_event_rows(&j),
+            vec![("leak_refused".into(), "sk-ant-".into(), None)]
+        );
+
+        // the named override is the retry path, and the write stays visible:
+        // a warning plus a leak_allowed row with the txn it rode in on
+        r.allow_secrets = vec!["sk-ant-".into()];
+        let out = apply(&root, &r, &Limits::default(), "test", &j).unwrap();
+        assert!(out.applied);
+        assert!(
+            out.warnings.iter().any(|w| w.contains("allow_secrets")),
+            "{:?}",
+            out.warnings
+        );
+        let rows = secret_event_rows(&j);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].0, "leak_allowed");
+        assert_eq!(rows[0].2, out.txn_id);
+    }
+
+    #[test]
+    fn a_known_secret_refuses_by_digest_and_names_the_variable() {
+        let (dir, root) = setup();
+        let j = journal_recorder();
+        j.record_digests(
+            "kai:home",
+            ".env",
+            &[("KLAMS_TOKEN".into(), crate::secrets::digest_of(TOKEN_VALUE))],
+        );
+        let err = apply(
+            &root,
+            &req(
+                vec![],
+                vec![EditOp::Create {
+                    path: "notes.md".into(),
+                    content: format!("the value is {TOKEN_VALUE}\n"),
+                    executable: false,
+                    overwrite: false,
+                }],
+            ),
+            &Limits::default(),
+            "test",
+            &j,
+        )
+        .unwrap_err();
+        let data = err.data.as_ref().unwrap();
+        assert_eq!(data["matches"][0]["kind"], "known_digest");
+        assert_eq!(data["matches"][0]["source"]["key"], "KLAMS_TOKEN");
+        assert!(
+            err.message.contains("KLAMS_TOKEN") && err.message.contains("kai:home"),
+            "the hint names the variable to reference instead: {}",
+            err.message
+        );
+        assert!(!err.message.contains(TOKEN_VALUE));
+        assert!(!dir.path().join("notes.md").exists());
+    }
+
+    #[test]
+    fn the_heuristic_tier_warns_applies_and_journals_the_flag() {
+        let (dir, root) = setup();
+        let j = journal_recorder();
+        let out = apply(
+            &root,
+            &req(
+                vec![],
+                vec![EditOp::Create {
+                    path: "fixture.txt".into(),
+                    content: "checksum: Qx9zPaB3cD7eF1Gh2jK4LmN6pRsT8uVwXy0ZaBcDeFg\n".into(),
+                    executable: false,
+                    overwrite: false,
+                }],
+            ),
+            &Limits::default(),
+            "test",
+            &j,
+        )
+        .unwrap();
+        assert!(out.applied, "the heuristic tier must never block");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.contains("high-entropy token")),
+            "{:?}",
+            out.warnings
+        );
+        assert!(dir.path().join("fixture.txt").exists());
+        let rows = secret_event_rows(&j);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "leak_flagged");
+        assert_eq!(rows[0].2, out.txn_id);
+    }
+
+    #[test]
+    fn classified_targets_are_exempt_because_secrets_belong_there() {
+        let (_dir, root, v) = classified_setup();
+        let j = journal_recorder();
+        let out = apply(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::EnvSet {
+                    path: ".env".into(),
+                    key: "ANTHROPIC_KEY".into(),
+                    value: Some(ANT_TOKEN.into()),
+                    value_from: None,
+                    comment: None,
+                }],
+            ),
+            &Limits::default(),
+            "test",
+            &j,
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(
+            secret_event_rows(&j)
+                .iter()
+                .all(|(a, _, _)| !a.starts_with("leak_")),
+            "writing a secret into a classified file is the expected case"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_predicts_the_refusal_without_journaling_it() {
+        let (dir, root) = setup();
+        let j = journal_recorder();
+        let v = write(dir.path(), "doc.md", "text\n");
+        let mut r = req(
+            vec![base("doc.md", &v)],
+            vec![EditOp::AnchorReplace {
+                path: "doc.md".into(),
+                old_text: "text".into(),
+                new_text: format!("text {ANT_TOKEN}"),
+                occurrence: None,
+            }],
+        );
+        r.dry_run = true;
+        let err = apply(&root, &r, &Limits::default(), "test", &j).unwrap_err();
+        assert_eq!(err.data.unwrap()["reason"], "secret_leak");
+        assert!(
+            secret_event_rows(&j).is_empty(),
+            "nothing was attempted, nothing is journaled"
+        );
+    }
+
+    #[test]
+    fn a_file_already_holding_a_token_stays_editable() {
+        let (dir, root) = setup();
+        let existing = format!("intro\ntoken: {ANT_TOKEN}\noutro\n");
+        let v = write(dir.path(), "doc.md", &existing);
+        // an unrelated edit, and the edit that removes the token, both pass
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("doc.md", &v)],
+                vec![EditOp::AnchorReplace {
+                    path: "doc.md".into(),
+                    old_text: "intro".into(),
+                    new_text: "introduction".into(),
+                    occurrence: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn the_config_lever_downgrades_and_disables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut root = ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap());
+        let v = write(dir.path(), "doc.md", "text\n");
+        let r = |new_text: String| {
+            req(
+                vec![base("doc.md", &v)],
+                vec![EditOp::AnchorReplace {
+                    path: "doc.md".into(),
+                    old_text: "text".into(),
+                    new_text,
+                    occurrence: None,
+                }],
+            )
+        };
+        root.leak_checks = crate::leak::LeakChecks::Flag;
+        let out = apply_noop(&root, &r(format!("text {ANT_TOKEN}"))).unwrap();
+        assert!(out.applied, "flag mode warns instead of refusing");
+        assert!(!out.warnings.is_empty());
+
+        let v2 = fsops::version_of(format!("text {ANT_TOKEN}\n").as_bytes());
+        root.leak_checks = crate::leak::LeakChecks::Off;
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("doc.md", &v2)],
+                vec![EditOp::AnchorReplace {
+                    path: "doc.md".into(),
+                    old_text: "text ".into(),
+                    new_text: format!("also {ANT_TOKEN} and "),
+                    occurrence: None,
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied && out.warnings.is_empty(), "off means off");
     }
 }

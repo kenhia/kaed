@@ -61,6 +61,12 @@ pub struct SecretsConfig {
     /// that surface is unwanted.
     #[serde(default = "default_true")]
     pub allow_reveal: bool,
+    /// Write-side leak detection strictness (012 D-5). `"refuse"`
+    /// (default): known-digest / provider-prefix / private-key matches
+    /// refuse with a named override, the entropy heuristic warns.
+    /// `"flag"`: everything warns, nothing blocks. `"off"`: no scanning.
+    #[serde(default)]
+    pub leak_checks: crate::leak::LeakChecks,
 }
 
 impl Default for SecretsConfig {
@@ -68,6 +74,7 @@ impl Default for SecretsConfig {
         Self {
             shapes: BTreeMap::new(),
             allow_reveal: true,
+            leak_checks: crate::leak::LeakChecks::default(),
         }
     }
 }
@@ -439,6 +446,7 @@ impl Config {
                 description: r.description.clone(),
                 deny: deny.clone(),
                 classify: classify.clone(),
+                leak_checks: self.secrets.leak_checks,
             });
         }
 
@@ -486,6 +494,7 @@ impl Config {
             secrets: ResolvedSecrets {
                 shapes,
                 allow_reveal: self.secrets.allow_reveal,
+                leak_checks: self.secrets.leak_checks,
             },
         })
     }
@@ -727,6 +736,7 @@ pub struct Resolved {
 pub struct ResolvedSecrets {
     pub shapes: BTreeMap<String, crate::shapes::Shape>,
     pub allow_reveal: bool,
+    pub leak_checks: crate::leak::LeakChecks,
 }
 
 impl Default for ResolvedSecrets {
@@ -734,6 +744,7 @@ impl Default for ResolvedSecrets {
         Self {
             shapes: BTreeMap::new(),
             allow_reveal: true,
+            leak_checks: crate::leak::LeakChecks::default(),
         }
     }
 }
@@ -755,6 +766,9 @@ pub struct ResolvedRoot {
     pub deny: Arc<DenyList>,
     /// Shared across every root: paths served redacted, not plain.
     pub classify: Arc<crate::policy::Classifier>,
+    /// Host-wide write-side leak strictness (012 D-5), stamped per root
+    /// because the engine sees the root, not the config.
+    pub leak_checks: crate::leak::LeakChecks,
 }
 
 impl ResolvedRoot {
@@ -775,6 +789,7 @@ impl ResolvedRoot {
             description: None,
             deny: Arc::new(DenyList::empty()),
             classify: Arc::new(crate::policy::Classifier::empty()),
+            leak_checks: crate::leak::LeakChecks::default(),
         }
     }
 
