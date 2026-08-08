@@ -202,10 +202,20 @@ search_max_results = 50       # default cap on search hits
 retention_days = 7
 
 [security]
-# Extends the built-in defaults (.ssh, .gnupg, .aws, .env, *.pem, id_*, …).
-# A path is refused if it or any ancestor matches.
+# Extends the built-in deny defaults, which cover credential *stores*
+# (.ssh, .gnupg, .aws, …). Secret-bearing *files* (.env, *.env, *.pem,
+# id_*, …) are handled by the classify list instead: served redacted
+# rather than refused (see the reference table below). A path is refused
+# if it or any ancestor matches.
+#
+# Write the bare form (`**/secrets`), not `**/secrets/**` — ancestor
+# matching makes the bare form cover the directory and everything under
+# it, while the `/**` form leaves the directory itself listable.
+# Absolute patterns are legal too, and `*` crosses `/`: on a host keeping
+# live state in per-service data directories, "/srv/*/data" denies every
+# one of them, including ones created after the rule was written.
 deny = [
-    "**/secrets/**",
+    "**/secrets",
     "**/*.key",
 ]
 ```
