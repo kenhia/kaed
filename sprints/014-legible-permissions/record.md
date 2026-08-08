@@ -92,17 +92,42 @@ troubleshooting table and the explainer get the public version.
 interim deny, add five classify globs, extend the root description), and
 the one behaviour change that can make a green call go red.
 
-## What did NOT ship here
+## Verified from a real client
 
-**#1094, the live-test re-run, is strictly post-deploy** — running it
-against the current build verifies the previous sprint. `live-test.md`
-beside this file is the prepared script; it must be run from cleo through
-the kai gateway, because that is the vantage point the findings came from
-and the host session that wrote the fix can prove nothing about the
-contract. Its two bookkeeping obligations (a korg report with `finding`
-edges, and a comment on #1085 turning analysis into observation) are
-listed there.
+`live-test.md` beside this file, run from cleo through the kai gateway
+against `0.1.0-88005bc` after the deploy — the vantage point the findings
+came from, and the one the kai host session that wrote the fix could not
+provide. **Every 013 finding closed, no regressions, and nothing filed:
+the first live test in this program to end that way.**
+
+It also did something better than confirming the fix. The `#1091` hint
+**corrected the original finding's own misdiagnosis** — 013 recorded
+`prometheus.yml` as a root-owned *644 file* that would not write, and
+reasoned from the file's mode to the right conclusion for the wrong
+reason. The real obstacle is the containing directory (D-2), and the
+refusal now says so in as many words. An error that tells you your model
+of it is wrong is the whole point of the sprint.
+
+And `unreadable_hidden` earned its keep on a host the sprint was not about:
+`kubs0:src` reports 1, a pre-existing condition (broken symlinks in a
+third-party checkout) that was silently invisible before. That is the
+argument for fixing the class rather than adding `lost+found` to a deny
+list, made by accident.
 
 ## Follow-ups
 
-*(filled in as they appear)*
+- **The hidden counters are lower bounds when `truncated`.** The live test
+  got 1, 2 and 6 unreadable entries for one root across three sessions and
+  ran the discrepancy down: the walk runs to exhaustion, so what it filters
+  is counted in full, but anything found by *opening* a file is only
+  counted as far as `max_results` allowed. Not a defect — the response
+  already says it is partial — but it was undocumented, and three sessions
+  disagreeing about one number is the cost of leaving it that way. Now
+  stated in R7, in the `search` tool description, and pinned by
+  `search::a_truncated_search_reports_lower_bound_counters_and_says_it_is_truncated`.
+- **The kubsdb classify globs are dormant.** Those files are 0600
+  root:root, so the OS refuses before kaed can read bytes to classify them
+  and the refusal is `not_readable_by_service_identity`. Correct ordering
+  and the more informative answer; the globs arm themselves if a mode ever
+  changes, which is the korg #1085 scenario they were added for. Worth
+  knowing before someone concludes they do nothing and removes them.
