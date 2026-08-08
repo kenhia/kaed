@@ -39,7 +39,24 @@ Nothing in kaed is designed on the assumption that it is.
   plaintext in the agent's context. The redaction extends to every derived
   surface: diffs, conflict deltas, search hits (which run over the redacted
   text, so probing for a value by searching finds nothing), and journal
-  blobs. There is no reveal operation.
+  blobs. The whole lifecycle — generate, rotate, locate every copy, copy a
+  value to another file or another host — runs without disclosure: kaed
+  mints and moves values server-side and hands back placeholders.
+
+  There **is** one reveal operation, `secret_reveal`, added after shipping
+  without one for a sprint to see how much pressure for it materialised.
+  It is deliberately its own tool, because harness permissioning is
+  per-tool and that split is the actual gate: one key per call, a required
+  `intent`, always journaled to the secrets audit stream, and refusable
+  host-wide with `[secrets] allow_reveal = false`.
+- **Secrets written *into* files that would not redact them.** The
+  higher-frequency real incident is a token pasted into a README, a
+  fixture or a doc, so writes to *unclassified* files are scanned for
+  newly-introduced secrets. Content matching a known secret's digest, a
+  provider token prefix or a private-key block is refused, naming the
+  explicit override to pass if the write is deliberate; merely
+  high-entropy content warns and applies. The honest limit: the precise
+  tier covers secrets kaed has *seen*, not every secret on the host.
 - **Accidental secret destruction.** A write that would destroy a value the
   agent never saw is refused unless the edit explicitly declares it.
 - **kaed serving its own credentials.** Its config and journal directories
@@ -82,6 +99,12 @@ Nothing in kaed is designed on the assumption that it is.
   and journals written before classification existed may hold plaintext of
   files that would be classified today. The strongest control over what
   ends up in it remains the deny and classify lists.
+
+  It also holds an index of **digests** of secrets kaed has seen, which is
+  what lets a write be recognised as leaking one. Digests only, never
+  values, and only for values above an entropy floor — precisely because a
+  digest of a low-entropy value is guessable and a digest of a
+  high-entropy one is not.
 
 ## Deployment expectations
 
