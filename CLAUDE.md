@@ -43,20 +43,21 @@ kaed — "Ken's Agent Editor": an editor whose only user is an AI agent. No
 human UI. A Rust daemon exposes reading/searching/editing files as an HTTP
 MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
-attributed journal on each host that runs it (today: kai and kubs0).
+attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0** (sprints 001–011, 2026-08-08):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–013, 2026-08-08):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
-auth. **kubsdb deliberately has no instance** (korg #929) — if you find
-none there, that is correct, not a broken rollout. The fleet installs a
+auth. kubsdb joined in 013 after two sprints deferred (korg #929) — see
+the 013 bullet below for its access model. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
 
 **kai is the fleet's gateway since 010** (R10 in the contract;
 `sprints/010-gateway-peer-mode/decisions.md`): calls to kai addressing
-`kubs0:*` roots are proxied *as the caller* — per-author peer tokens in
-`[peers.kubs0.tokens]` on kai (an author without one is refused with
+peer roots (`kubs0:*`, `kubsdb:*`) are proxied *as the caller* —
+per-author peer tokens in
+`[peers.<host>.tokens]` on kai (an author without one is refused with
 `no_peer_credential`, never impersonated; PD-4), results and errors pass
 through verbatim plus a `root` tag on errors, `roots` probes peers live
 (an outage is `status: "unreachable"` + `since`, data not failure), and
@@ -182,6 +183,20 @@ fails, and what the journal structurally cannot tell you — see
   tier's coverage is honestly "secrets kaed has seen", not "secrets on
   the host" — no walk runs on the write path. Host lever:
   `[secrets] leak_checks = refuse|flag|off`.
+- **kubsdb's broad access is 013** (`sprints/013-kubsdb-broad-access/
+  decisions.md`; live-tested from cleo, `live-test.md` beside it). Roots
+  `datastore`/`hvsim`/`src`; the config/data boundary is **lexical shape,
+  not service names** — `/datastore/*/data` denied (pinned by a `deny.rs`
+  test; globset's `*` crosses `/`, deliberately), the package store denied
+  as fleet supply chain, `/gratch` has no root, and rsync deploy targets
+  are *told, not denied* via root `description`s. Three things not to
+  re-derive: **nothing kubsdb-shaped went into `DEFAULT_DENY`** (D-7 —
+  it is per-host config); root-owned files still refuse at the OS (D-6,
+  accepted — host-side `composer`-group discussion is korg #1085, and the
+  live deny list carries a `/datastore/lost+found` interim entry for korg
+  #1088 that the sprint record predates); and the live test's two open
+  bugs are #1088 (search dies on EACCES) and #1089 (single-peer root
+  pattern proxied wholesale, misleading `hosts_unavailable`).
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

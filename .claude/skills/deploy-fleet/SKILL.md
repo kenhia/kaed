@@ -33,12 +33,17 @@ convenience copy and is allowed to be wrong; the daemon is not.
 |---|---|---|
 | `kai` | `kai:src`, `kai:scratch` | the build/publish host — the only clone |
 | `kubs0` | `kubs0:src`, `kubs0:k-homelab` | `secrets/` denied; **no checkout** |
+| `kubsdb` | `kubsdb:datastore`, `kubsdb:hvsim`, `kubsdb:src` | in the fleet since 013; **no checkout**; data dirs + the package store denied by config |
 
-**kubsdb is deliberately NOT in the fleet** — deferred, korg #929. If you find
-no kaed there, that is correct and expected, not a broken rollout. Do not
-"fix" it by installing one; that needs a broad-access decision first, on a
-host whose roots would sit next to `/datastore/*` and `/gratch`. (kubsdb
-*hosts* the store; that is a different thing from running kaed.)
+**kubsdb also hosts the store it installs from** — sprint 013's broad-access
+decision (`sprints/013-kubsdb-broad-access/decisions.md`) put it in the fleet
+with `/datastore` rooted and `/datastore/packages` *denied*, so kaed on kubsdb
+cannot edit the artifacts the fleet deploys. Its config is the one place the
+deny list does real per-host work; do not "simplify" it to match the others.
+One dependency to know: the store service is a dependency of *deploys*, not of
+running kaed — if it is down, installs fail on every host (kubsdb included,
+even though the artifacts sit on its own disk), while every running kaed is
+unaffected.
 
 > **Post-007 deploy step:** `install.sh` never rewrites an existing config, so
 > it will not add the `[peers]` block that makes the above true on the host.
