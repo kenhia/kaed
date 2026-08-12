@@ -19,7 +19,9 @@
 use crate::config::{Peer, PeerStatus};
 use crate::errors::KaedError;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, CallToolResult, ClientInfo, Implementation, JsonObject};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientInfo, Implementation, JsonObject, ProtocolVersion,
+};
 use rmcp::service::{RoleClient, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
@@ -34,6 +36,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// An in-flight proxied call. Expiry here is NOT a connect failure: the
 /// peer may have applied the call, and the error says so (D-8).
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The revision the gateway asks a peer for — pinned, and deliberately
+/// **below** what kaed's own server serves (016 D-2).
+///
+/// This is sprint 015's D-3 hazard from the other side. `ClientInfo::default()`
+/// requests `ProtocolVersion::LATEST`, which is what the *SDK* knows; rmcp
+/// 3.1.0's client cannot actually drive a `2026-07-28` session, because it
+/// omits the per-request `_meta` and SEP-2243 headers that revision requires
+/// of every non-`initialize` request — its own server rejects it with
+/// `-32602`. Today `LATEST` is `2025-11-25` and the default happens to work.
+/// The bump that promotes `2026-07-28` would break every proxied call on the
+/// gateway through a dependency update, with no code change to review.
+///
+/// So the ask is stated here. Raise it when rmcp's *client* can drive the
+/// newer lifecycle — `an_rmcp_client_cannot_yet_drive_2026_07_28` in
+/// `tests/http.rs` fails when that becomes true, which is the signal.
+const PEER_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 type Session = RunningService<RoleClient, ClientInfo>;
 
@@ -282,6 +301,7 @@ impl Peers {
             StreamableHttpClientTransportConfig::with_uri(url.to_string()).auth_header(token),
         );
         let mut info = ClientInfo::default();
+        info.protocol_version = PEER_PROTOCOL_VERSION;
         info.client_info = Implementation::new("kaed", crate::version::FULL);
         let svc = match tokio::time::timeout(CONNECT_TIMEOUT, info.serve(transport)).await {
             Err(_elapsed) => {

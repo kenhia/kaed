@@ -45,14 +45,26 @@ src/
 
 Version pins decided at sprint 001; prefer current stable of each.
 
-**Protocol revision: kaed serves MCP `2025-11-25`** and negotiates down to
+**Protocol revision: kaed serves MCP `2026-07-28`** and negotiates down to
 `2024-11-05`. That is a deliberate, declared list (`SUPPORTED_PROTOCOL_VERSIONS`
 in `server.rs`), not rmcp's default — rmcp advertises every revision the *SDK*
-knows, which in 3.1.0 includes `2026-07-28`, whose `tools/list` result kaed does
-not emit. A client asking for something newer is clamped to the ceiling at the
-HTTP boundary and told `2025-11-25` in the handshake; sprint 015 has the whole
-story. Moving the ceiling means implementing the newer revision's response
-shapes first.
+knows, which is a claim about the SDK rather than about kaed. Sprint 015 has the
+story of what that default cost; sprint 016 moved the ceiling by emitting what
+`2026-07-28` requires. **The rule survives the move: the ceiling goes up when
+the response shapes do, and never as a side effect of a dependency bump** — a
+client asking for something newer still gets the ceiling, not an echo.
+
+Two constants, deliberately different:
+
+| | asks/answers | pinned to |
+|---|---|---|
+| `server::PROTOCOL_VERSION` | what kaed serves | `2026-07-28` |
+| `fleet::PEER_PROTOCOL_VERSION` | what the gateway asks a peer for | `2025-11-25` |
+
+The gateway is lower because rmcp 3.1.0's *client* cannot drive a `2026-07-28`
+session — it omits the per-request `_meta` and SEP-2243 headers that revision
+requires, and its own server rejects it. Both constants are stated rather than
+defaulted, for the same reason in both directions.
 
 ## Core mechanics
 
