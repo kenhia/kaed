@@ -45,10 +45,10 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–014, 2026-08-08):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–015, 2026-08-12):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
-auth. kubsdb joined in 013 after two sprints deferred (korg #929) — see
+auth, serving **MCP `2025-11-25`** (015 — see the protocol bullet below). kubsdb joined in 013 after two sprints deferred (korg #929) — see
 the 013 bullet below for its access model. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
