@@ -99,8 +99,29 @@ rule that survives the move, and the two-constant table.
 
 `just check` green: fmt, clippy `-D warnings`, 305 tests.
 
-## Deploy
+## Canary on kai — `0.1.0-57cf254`
 
-Not yet. Per 015 D-1 the cap is not lifted and deployed in one motion: the
-gate is a live test from a **fresh** cleo Claude Code ≥2.1.227 session, kai
-first with the 015 build as the rollback target.
+Published `--no-latest` (branch build; the justfile enforces that rule) and
+installed on kai alone. kubs0 and kubsdb stay on `0.1.0-0743ff0`, which is
+also the rollback target — `~/.local/bin/kaed.prev` on kai, or `--version
+0.1.0-0743ff0` from the store.
+
+The server-side battery, over kai's real URL:
+
+| Check | Result |
+|---|---|
+| `initialize` asking `2026-07-28` | → `2026-07-28`, **no session id** (inline lifecycle — correct for this revision) |
+| `tools/list` at `2026-07-28` | 12 tools, `ttlMs: 3600000`, `cacheScope: "public"`, `resultType: "complete"` |
+| `initialize` asking `2025-11-25` | → itself, session id issued |
+| `tools/list` on that session | 12 tools, **no** `ttlMs`/`cacheScope`/`resultType` (D-1, plus rmcp's own legacy strip) |
+| `roots` through the gateway | 7 roots; both peers probed `ok` and `verified` |
+| `list kubs0:src` through the gateway | 12 entries, no error |
+
+The last two are the D-2 case running for real: kai on the new build
+proxying to peers still on the old one, which is also exactly the state a
+staged fleet upgrade passes through.
+
+That is everything this side of the wire. **The client half is the gate that
+matters** and cannot be run from kai — a *fresh* Claude Code ≥2.1.227 session
+on cleo listing `mcp__kaed-kai__*` and completing one real call. Per 015 D-1
+the fleet does not move until it passes.
