@@ -125,5 +125,10 @@ Two things were checked before choosing, rather than assumed:
   the fleet would have spread the build without closing the hole, as §"Consequence
   for the rollout" says.
 
-Second canary: `0.1.0-<see record.md>`, kai only, same battery plus the
-proxied-call check this document is about.
+Second canary: **`0.1.0-a7f81ef`**, kai only. Every call listed as FAIL above
+now returns `resultType: "complete"` — both hosts, both tools, and the
+proxied *refusal* path too. `record.md` has the table.
+
+**Still needs a re-run from cleo.** Server-side is as green as it can be
+made from kai, and the whole point of this document is that green-from-kai
+is not the gate.

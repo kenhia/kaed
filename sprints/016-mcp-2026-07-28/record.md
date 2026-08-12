@@ -160,3 +160,25 @@ upgraded peer is still asked at `2025-11-25` and still answers without the
 field. Confirmed by asking kai's own new build for a `2025-11-25` session and
 watching it omit `resultType` too. Deploying further would have spread the
 build without closing the hole.
+
+## Second canary on kai — `0.1.0-a7f81ef`
+
+D-4's fix, kai only again. The paths the live test failed on, re-run raw at
+`2026-07-28`:
+
+| Call | `resultType` |
+|---|---|
+| `stat kai:src …` (local control) | `complete` |
+| `stat kubs0:k-homelab` | `complete` |
+| `list kubs0:k-homelab` | `complete` |
+| `stat kubsdb:src` | `complete` |
+| `stat kubs0:src` on a missing path (proxied **refusal**) | `complete`, `isError: true` |
+
+And the regression sweep, unchanged from the first canary: `2026-07-28`
+`tools/list` still 12 tools with `ttlMs: 3600000` / `cacheScope: "public"`; a
+`2025-11-25` session still gets 12 tools with no cache metadata, and a
+proxied call on it still has **no** `resultType` — which is correct, and is
+the assertion that would catch this fix over-reaching.
+
+Rollback is unchanged: `kaed.prev` on kai, or `--version 0.1.0-0743ff0` from
+the store. kubs0 and kubsdb have still never moved.
