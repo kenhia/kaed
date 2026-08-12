@@ -225,6 +225,23 @@ fails, and what the journal structurally cannot tell you — see
   changes); and **the hidden counters are lower bounds when `truncated`**,
   which is why one root reported 1, 2 and 6 unreadable entries across
   three sessions.
+- **kaed serves MCP `2025-11-25`, deliberately, since 015**
+  (`sprints/015-protocol-version-negotiation/decisions.md`; korg #1212).
+  rmcp's default advertises every revision the *SDK* knows — 3.1.0 includes
+  `2026-07-28`, whose `tools/list` requires SEP-2549 `ttlMs`/`cacheScope`
+  that kaed does not emit — so Claude Code ≥2.1.227 asked for it, got it
+  echoed, failed result validation and registered **zero tools**. Three
+  things not to re-derive: narrowing `supported_protocol_versions()` is
+  **not sufficient alone** (D-2 — rmcp routes on the version *asked for*
+  before dispatch, so a 2026-07-28 body takes the sessionless inline
+  lifecycle and the client's next call has no session to belong to; the
+  handler-only fix turns "zero tools" into "cannot connect"), which is why
+  `clamp_protocol_middleware` rewrites the requested version at the HTTP
+  boundary; `get_info` pins the fallback to the same constant so an rmcp
+  bump promoting `LATEST` cannot reintroduce it silently (D-3); and the cap
+  is **tonight's answer, not forever's** — implementing `2026-07-28` is
+  #1221, and D-1 says the blocker is verifiability from this repo, not
+  effort.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

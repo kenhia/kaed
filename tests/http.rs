@@ -5,7 +5,7 @@
 use kaed::config::{AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use kaed::fsops;
 use rmcp::ServiceExt;
-use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
@@ -256,6 +256,115 @@ async fn lists_the_tool_surface() -> anyhow::Result<()> {
             "stat"
         ]
     );
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// One raw JSON-RPC POST, bypassing the rmcp client — the only way to ask
+/// for a protocol revision the client-side SDK would never request. The
+/// streamable-http server answers with SSE; the first non-empty `data:`
+/// frame is the payload (an empty one is the retry-priming event).
+async fn raw_post(server: &TestServer, body: Value) -> anyhow::Result<(Option<String>, Value)> {
+    let resp = reqwest::Client::new()
+        .post(format!("http://{}/mcp", server.addr))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await?;
+    let session = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let text = resp.text().await?;
+    let frame = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|frame| !frame.trim().is_empty())
+        .unwrap_or(&text);
+    Ok((
+        session,
+        serde_json::from_str(frame).map_err(|e| anyhow::anyhow!("{e}: not JSON-RPC: {text:?}"))?,
+    ))
+}
+
+fn initialize(protocol_version: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {"name": "probe", "version": "0"}
+        }
+    })
+}
+
+/// #1212: kaed echoed 2026-07-28 back to anyone who asked, because rmcp's
+/// default supported list is every revision the *SDK* knows — not every
+/// revision this server implements. Claude Code ≥2.1.227 asks for it, then
+/// validates `tools/list` against that revision's schema, whose required
+/// `ttlMs`/`cacheScope` kaed does not emit, and registers zero tools. An
+/// advertised version is a promise about response shape, so kaed answers
+/// with the newest one it can actually keep.
+#[tokio::test]
+async fn negotiation_caps_at_the_revision_kaed_implements() -> anyhow::Result<()> {
+    let server = start_server().await?;
+
+    for requested in ["2026-07-28", "9999-12-31"] {
+        let (session, answer) = raw_post(&server, initialize(requested)).await?;
+        assert_eq!(
+            answer["result"]["protocolVersion"], "2025-11-25",
+            "requested {requested}: kaed must not claim a revision it does not implement"
+        );
+        // and the session is a real one. Refusing the version in the handler
+        // alone left the transport still routing on what was *asked for*,
+        // which issues no session id — so the client's next call, now
+        // speaking the version it was given, had no session to belong to.
+        assert!(
+            session.is_some(),
+            "requested {requested}: no session id, so nothing after initialize can work"
+        );
+    }
+
+    // and the revisions it does implement still negotiate as themselves
+    for requested in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
+        let (_, answer) = raw_post(&server, initialize(requested)).await?;
+        assert_eq!(
+            answer["result"]["protocolVersion"], requested,
+            "requested {requested}"
+        );
+    }
+
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The whole failure as the client met it: connected, instructions
+/// delivered, and then not one tool callable. This drives a real MCP client
+/// through the real transport, asking for the revision Claude Code asks for.
+#[tokio::test]
+async fn a_client_asking_for_2026_07_28_still_gets_the_tools() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", server.addr))
+            .auth_header(TOKEN),
+    );
+    let mut info = ClientInfo::default();
+    info.protocol_version = ProtocolVersion::V_2026_07_28;
+    let client = info.serve(transport).await?;
+
+    let negotiated = client
+        .peer_info()
+        .map(|info| info.protocol_version.clone())
+        .expect("the handshake completed");
+    assert_eq!(negotiated, ProtocolVersion::V_2025_11_25);
+    assert_eq!(client.list_all_tools().await?.len(), 12);
+
     let _ = client.cancel().await;
     server.ct.cancel();
     Ok(())

@@ -45,6 +45,15 @@ src/
 
 Version pins decided at sprint 001; prefer current stable of each.
 
+**Protocol revision: kaed serves MCP `2025-11-25`** and negotiates down to
+`2024-11-05`. That is a deliberate, declared list (`SUPPORTED_PROTOCOL_VERSIONS`
+in `server.rs`), not rmcp's default — rmcp advertises every revision the *SDK*
+knows, which in 3.1.0 includes `2026-07-28`, whose `tools/list` result kaed does
+not emit. A client asking for something newer is clamped to the ceiling at the
+HTTP boundary and told `2025-11-25` in the handshake; sprint 015 has the whole
+story. Moving the ceiling means implementing the newer revision's response
+shapes first.
+
 ## Core mechanics
 
 **Versions & truth.** Disk is the source of truth — no long-lived in-memory
