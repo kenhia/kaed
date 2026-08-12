@@ -239,9 +239,12 @@ fails, and what the journal structurally cannot tell you — see
   `clamp_protocol_middleware` rewrites the requested version at the HTTP
   boundary; `get_info` pins the fallback to the same constant so an rmcp
   bump promoting `LATEST` cannot reintroduce it silently (D-3); and the cap
-  is **tonight's answer, not forever's** — implementing `2026-07-28` is
-  #1221, and D-1 says the blocker is verifiability from this repo, not
-  effort.
+  is **tonight's answer, not forever's** — D-1 says the blocker is
+  verifiability from this repo, not effort. Lifting it is **korg program
+  1220**, which spans all three homelab rmcp servers (korg-mcp and klams-mcp
+  escaped only because their rmcp still tops out at `2025-11-25`); kaed is
+  slice 1, proposal 1217 / WI #1214. **Live-tested from cleo** before the
+  ship (`015-.../live-test.md`) — passed, nothing filed.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

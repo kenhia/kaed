@@ -85,9 +85,19 @@ down, with the rule for moving it.
 
 ## Follow-up
 
-Implementing `2026-07-28` properly is filed as its own work item rather than
-folded in here — see D-1 for why the cap is the right answer *tonight* and
-not the right answer *forever*.
+Implementing `2026-07-28` properly is filed separately rather than folded in
+here — see D-1 for why the cap is the right answer *tonight* and not the right
+answer *forever*.
+
+It turned out to be bigger than kaed. Ken had independently filed the same
+follow-on from another session, and it is now **korg program 1220** — "MCP
+2026-07-28 across the fleet" — spanning all three homelab rmcp servers, since
+korg-mcp and klams-mcp escaped only because their rmcp still tops out at
+`2025-11-25` and the same trap is armed for them on any bump. kaed is slice 1
+(proposal 1217 / WI **#1214**), which removes this sprint's cap; korg-mcp
+(#1215) and klams-mcp (#1216) follow. This sprint's session filed #1221 for
+the same thing; it was closed as a duplicate after its repo-level analysis was
+folded into #1214 and the program notes.
 
 ## Deployed 2026-08-12 — `0.1.0-0743ff0`
 
@@ -113,7 +123,8 @@ two plus both peers', so gateway proxying survived the change), 2 on kubs0, 3
 on kubsdb. Asking for `2025-11-25` still negotiates as itself, so nothing was
 downgraded that did not need to be.
 
-That is the whole fix verified server-side. What it does not prove is the
-client half — a **new** Claude Code session on cleo listing `mcp__kaed-kai__*`
-and completing one real call. That is the check this sprint exists for, and it
-belongs in a live-test record beside this one.
+That is the whole fix verified server-side. The client half — a **new** Claude
+Code session on cleo enumerating the tools and completing a real call, which
+is the only check that can see this bug's actual failure mode — passed against
+the canary before the ship, and the canary is the shipped code (`live-test.md`
+has the equivalence and the battery).
