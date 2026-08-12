@@ -90,3 +90,59 @@ survives by being hard to argue against rather than by being needed. The
 protection it provided now lives where it belongs: in
 `SUPPORTED_PROTOCOL_VERSIONS` and the `get_info` pin, both of which 015 D-3
 put there and both of which stay.
+
+## D-4 — a gateway translates protocol revisions in both directions
+
+**Found by the live test from cleo, and by nothing else** — see
+`live-test.md`. From a `2026-07-28` client, every call addressed to a peer
+root (`kubs0:*`, `kubsdb:*`) was rejected *by the client*, before the result
+was seen:
+
+```
+Invalid result for tools/call: missing required resultType — servers
+implementing protocol revision 2026-07-28 MUST include it (the
+absent-means-complete bridge applies only to earlier-revision servers)
+```
+
+D-1 and D-2 are each correct alone and collide in the gateway. kai **serves**
+`2026-07-28`, where `resultType` is mandatory. kai **asks** peers at
+`PEER_PROTOCOL_VERSION = 2025-11-25`, where a peer correctly omits it — rmcp
+strips it for legacy peers by design. The gateway then returned that envelope
+verbatim, so a legitimately-absent field rode out onto a session where it was
+not legitimate.
+
+rmcp's `strip_result_type_for_legacy_peer` handles modern→legacy for results
+rmcp *builds*. Nothing stamps one that arrived from a peer already
+deserialized, and nothing could: rmcp cannot know the result was relayed.
+
+**Decided:** `proxy_to_peer` fills an absent `result_type` with `COMPLETE`
+when the *serving* session is `2026-07-28`+ — the mirror of rmcp's strip.
+
+Faithful, not inventive: absent **means** complete at the revision the peer
+answered, and the other discriminators (`input_required`, `task`) are gated
+to sessions the peer never negotiated, so an absent field cannot be hiding
+one. Only an absent value is filled; a peer that names its own keeps it.
+
+R10's "results pass through verbatim" is unchanged in the sense that mattered
+— the *content* is still the peer's, untouched. What was never verbatim, and
+should not be, is the protocol framing: the two ends of a proxy hop can sit
+on different revisions, and reconciling that is the gateway's job. D-2 half
+made this decision by pinning the two ends apart; this is the other half.
+
+**Upgrading the fleet does not fix it, and that is the trap to remember.**
+The pin is on what kai *asks for*, not on what a peer *can serve*: an
+upgraded kubs0 is still asked at `2025-11-25` and still answers without the
+field. Verified directly rather than reasoned — kai on the new build,
+answering a `2025-11-25` session, omits `resultType` exactly as the old build
+does.
+
+**Why the kai battery missed it.** `record.md`'s "list kubs0:src through the
+gateway → 12 entries, no error" ran from an rmcp client, which per D-2
+*cannot* drive a `2026-07-28` session, so it necessarily ran at `2025-11-25`
+where the passthrough is correct. The failing combination is *2026-07-28
+client* **and** *proxied call* — structurally unreachable from kai, because
+it needs the one client D-2 says rmcp cannot be. The regression test
+therefore drives raw JSON-RPC
+(`a_proxied_result_is_stamped_for_the_revision_it_is_returned_on`), and the
+lesson generalises: **anything this gateway does to a response needs a raw
+client to test, not rmcp's.**

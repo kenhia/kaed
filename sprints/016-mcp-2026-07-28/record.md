@@ -66,6 +66,11 @@ rmcp catches up.
 - `clamp_protocol_middleware` deleted (D-3), along with
   `MAX_REQUEST_BODY_BYTES`, which existed only to bound its buffering.
 
+- `proxy_to_peer` stamps an absent `result_type` with `COMPLETE` when the
+  serving session is `2026-07-28`+ (D-4) — the mirror of rmcp's
+  `strip_result_type_for_legacy_peer`, and the fix for the one thing the
+  live test caught.
+
 **`src/fleet.rs`**
 
 - `PEER_PROTOCOL_VERSION` — the revision the gateway *asks* a peer for,
@@ -93,6 +98,14 @@ rmcp catches up.
 
 `raw_post` grew a `raw_post_with` variant taking extra headers; `connect`
 grew `connect_at` for a specific revision.
+
+**`tests/gateway.rs`** — `a_proxied_result_is_stamped_for_the_revision_it_
+is_returned_on`, D-4's regression test, over a raw `2026-07-28` session
+against the two-instance fixture: local call and proxied call both carry
+`resultType`, proxied error results included. Raw because the failing
+combination — a `2026-07-28` client making a *proxied* call — is structurally
+unreachable from rmcp's client, which is exactly why the first canary battery
+missed it.
 
 **Docs** — `sprints/planning/architecture.md` records the new ceiling, the
 rule that survives the move, and the two-constant table.
@@ -125,3 +138,25 @@ That is everything this side of the wire. **The client half is the gate that
 matters** and cannot be run from kai — a *fresh* Claude Code ≥2.1.227 session
 on cleo listing `mcp__kaed-kai__*` and completing one real call. Per 015 D-1
 the fleet does not move until it passes.
+
+### It didn't pass — and the battery above is why
+
+`live-test.md` has it: tool registration was green (12 tools, so the #1212
+gate itself passed), and **every call to a peer root failed at the client**.
+The gateway was returning peer envelopes without `resultType` onto a
+`2026-07-28` session. D-4 has the mechanism and the fix.
+
+The row `list kubs0:src through the gateway → 12 entries, no error` is the
+one to distrust in hindsight. It ran from an rmcp client, which per D-2
+cannot drive a `2026-07-28` session — so it silently tested the `2025-11-25`
+path, where the passthrough is correct. **The battery was not wrong; it was
+answering a different question than it appeared to.** Any check written from
+kai carries that caveat, because the client D-2 describes is the only one
+that can ask the other one.
+
+Worth noting the hypothesis that did *not* hold: that this was an artifact of
+only kai being upgraded. It is not — the pin is on what kai *asks for*, so an
+upgraded peer is still asked at `2025-11-25` and still answers without the
+field. Confirmed by asking kai's own new build for a `2025-11-25` session and
+watching it omit `resultType` too. Deploying further would have spread the
+build without closing the hole.

@@ -1277,7 +1277,7 @@ impl KaedServer {
             author = author.0,
             "proxying to peer"
         );
-        match self
+        let mut result = match self
             .state
             .fleet
             .call(
@@ -1289,9 +1289,35 @@ impl KaedServer {
             )
             .await
         {
-            Ok(result) => Ok(result),
-            Err(e) => kaed_error_result(e),
+            Ok(result) => result,
+            Err(e) => kaed_error_result(e)?,
+        };
+        // A peer envelope is verbatim in its *content* (R10), not in its
+        // protocol framing — the two ends of this hop can be on different
+        // revisions, and translating between them is the gateway's job in
+        // BOTH directions (016 D-4).
+        //
+        // rmcp strips `resultType: "complete"` for legacy peers, but only
+        // for results it built itself; one that arrived from a peer already
+        // deserialized is nobody's to stamp. So a peer asked at
+        // `PEER_PROTOCOL_VERSION` correctly omits the field, and returning
+        // that unchanged onto a 2026-07-28 session — where the field is
+        // mandatory and the absent-means-complete bridge is explicitly
+        // unavailable — makes the client reject the whole result, outcome
+        // and all.
+        //
+        // Filling it in is faithful rather than inventive: absent *means*
+        // complete at the revision the peer answered, and any other value
+        // is gated to sessions the peer never negotiated. Only an absent
+        // one is filled; a peer that names its own discriminator keeps it.
+        if result.result_type.is_none()
+            && context
+                .protocol_version()
+                .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+        {
+            result.result_type = Some(ResultType::COMPLETE);
         }
+        Ok(result)
     }
 
     /// `secret` / `rotate`: the primary and every same-root `also` target
