@@ -89,9 +89,31 @@ Implementing `2026-07-28` properly is filed as its own work item rather than
 folded in here — see D-1 for why the cap is the right answer *tonight* and
 not the right answer *forever*.
 
-## Deploy
+## Deployed 2026-08-12 — `0.1.0-0743ff0`
 
-Store-native, per `deploy-fleet`: kai first (it is the gateway the cleo
-sessions go through), then kubs0 and kubsdb. The verification that matters is
-not `kaed --version` — it is a **new** Claude Code session on cleo listing
-`mcp__kaed-kai__*` and completing one real call.
+Store-native, whole fleet. Rollback target: `0.1.0-88005bc` (the build that
+had the bug) via `--version`, or `~/.local/bin/kaed.prev` on each host.
+
+A branch canary (`0.1.0-bc87367`) went to kai first, published `--no-latest`
+per the justfile's branch rule, and was superseded by the merged build. It is
+still in the store as a build that names no commit on `main` — a rollback
+target nobody should pick.
+
+| Host | `kaed --version` | check-config | unit | `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0 (0743ff0 …)` | ok | active | matches |
+| kubs0 | `0.1.0 (0743ff0 …)` | ok | active | matches |
+| kubsdb | `0.1.0 (0743ff0 …)` | ok | active | matches |
+
+**The sprint-specific check, on all three over their real URLs:** `initialize`
+asking for `2026-07-28` answers `2025-11-25` **and issues a session id**, then
+the full client sequence — `notifications/initialized` → `tools/list` →
+`tools/call roots` — completes: 12 tools everywhere, 7 roots on kai (its own
+two plus both peers', so gateway proxying survived the change), 2 on kubs0, 3
+on kubsdb. Asking for `2025-11-25` still negotiates as itself, so nothing was
+downgraded that did not need to be.
+
+That is the whole fix verified server-side. What it does not prove is the
+client half — a **new** Claude Code session on cleo listing `mcp__kaed-kai__*`
+and completing one real call. That is the check this sprint exists for, and it
+belongs in a live-test record beside this one.
