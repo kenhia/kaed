@@ -132,3 +132,53 @@ proxied *refusal* path too. `record.md` has the table.
 **Still needs a re-run from cleo.** Server-side is as green as it can be
 made from kai, and the whole point of this document is that green-from-kai
 is not the gate.
+
+---
+
+## Re-test from cleo — `0.1.0-a7f81ef`: PASS
+
+*2026-08-12, fresh Claude Code session on cleo after an app restart. kai on
+`a7f81ef`; kubs0 and kubsdb still on `0743ff0` — deliberately the same
+mixed-build state that produced the failure above.*
+
+**Every call that failed in the first pass now succeeds.** The new gate — a
+real `kubs0:*` / `kubsdb:*` call, not tool registration — is met.
+
+| Call | Result |
+|---|---|
+| tool registration | 12 tools, schemas resolve |
+| `stat kubs0:k-homelab` | ok — **was FAIL** |
+| `list kubs0:k-homelab` | ok, 18 entries, `denied_hidden: 1` — **was FAIL** |
+| `stat kubsdb:src` | ok — **was FAIL** |
+| `read kubs0:k-homelab inventory.yml` | ok, 45 lines, `version eaad82eb5715155a` |
+| `list kubs0:k-homelab secrets` | `denied` — correct refusal, full `data` |
+| `stat kubsdb:src no/such/path` | `not_found` — correct refusal |
+| `edit kubs0:k-homelab` (dry run) | ok — diff + `old_version`/`new_version` |
+| `edit kubs0:k-homelab` (stale base) | `version_conflict` with `actual_version` |
+| `search *:*` | ok — all 7 roots, 36,868 files, per-root hidden counters |
+
+Both edits were `dry_run`. Nothing was written to any peer.
+
+The refusal rows are the ones worth having. A proxied `denied` came back
+with its `reason`, `rule` and `hint` intact, and a proxied `version_conflict`
+with its `actual_version` — so the fix carries error *data* across the hop,
+not just success envelopes. In the first pass these were unreachable: the
+client rejected the envelope, so a refusal and a success were
+indistinguishable from cleo.
+
+### What this test can and cannot see
+
+It observes that **the client accepts the envelope** — it does not read the
+`resultType` field directly. The raw-JSON assertion that the field says
+`"complete"` lives in `tests/gateway.rs`; this pass confirms the thing that
+test cannot, which is that a real client on a real `2026-07-28` session is
+satisfied. Stating it that way on purpose: mistaking one test for a
+neighbouring one is what this sprint was about twice.
+
+### Cleared for the fleet move
+
+The post-`deploy-fleet` state should be indistinguishable from what was just
+tested — upgraded peers are still *asked* at `PEER_PROTOCOL_VERSION =
+2025-11-25` and will still answer as legacy, so the stamp in `proxy_to_peer`
+stays on the same path it is on now. Worth one confirming `kubs0:*` call
+after the deploy anyway, on the same principle as everything above.

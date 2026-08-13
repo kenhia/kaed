@@ -182,3 +182,12 @@ the assertion that would catch this fix over-reaching.
 
 Rollback is unchanged: `kaed.prev` on kai, or `--version 0.1.0-0743ff0` from
 the store. kubs0 and kubsdb have still never moved.
+
+**Re-tested from cleo: PASS** (`live-test.md`). Every first-pass failure now
+succeeds, in the same mixed-build state that produced it — and the rows worth
+having are the refusals: a proxied `denied` arrived with its `reason`/`rule`/
+`hint`, a proxied `version_conflict` with its `actual_version`. In the first
+pass those were unreachable, because a rejected envelope makes a refusal and
+a success indistinguishable. That is the sprint's own lesson landing on
+itself: the failure mode to fear is not an error, it is an outcome that never
+arrives.
