@@ -45,12 +45,11 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–015, 2026-08-12):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–016, 2026-08-12):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
-auth, serving **MCP `2026-07-28`** since 016 — but the fleet still runs the
-015 build until 016 deploys, so a live host answers `2025-11-25`; see the
-protocol bullet below. kubsdb joined in 013 after two sprints deferred (korg #929) — see
+auth, serving **MCP `2026-07-28`** fleet-wide since 016 (`0.1.0-af51376`) —
+see the protocol bullet below. kubsdb joined in 013 after two sprints deferred (korg #929) — see
 the 013 bullet below for its access model. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
@@ -249,6 +248,18 @@ fails, and what the journal structurally cannot tell you — see
   fails when that stops being true, which is the signal to raise it); and
   `get_info` still pins its fallback to `PROTOCOL_VERSION` explicitly (015
   D-3), which is load-bearing on its own, not a leftover of the cap.
+  **R10's "passthrough is verbatim" means content, not protocol framing**
+  (016 D-4): the two ends of a proxy hop sit on different revisions *by
+  design*, so `proxy_to_peer` stamps an absent `resultType` when the serving
+  session is 2026-07-28+ — returning a peer envelope unadapted made the
+  client reject the result whole, so a refusal and a success were
+  indistinguishable. Found only by the live test from cleo, because the
+  failing combination — a 2026-07-28 client making a *proxied* call — is
+  unreachable from an rmcp client. **The general rule that cost two rounds
+  to learn: a green rmcp-client test says nothing about 2026-07-28
+  behaviour.** Anything about this revision, or anything the gateway does to
+  a response, needs raw JSON-RPC (`tests/gateway.rs` and `tests/http.rs`
+  have the exact `_meta` + header combination).
   016 is slice 1 of **korg program 1220**, which spans all three homelab rmcp
   servers — korg-mcp (#1215) and klams-mcp (#1216) escaped only because their
   rmcp still tops out at `2025-11-25`, and D-2 is the trap most likely to bite
