@@ -30,8 +30,9 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{Extension, ToolCallContext};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, Implementation, ProtocolVersion,
-    ServerCapabilities, ServerInfo,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ResultType, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -51,29 +52,33 @@ const SEARCH_MAX_RESULTS_CEILING: usize = 1000;
 /// agree to, and the answer to a client that asks for something else.
 ///
 /// rmcp defaults both the advertised set and the fallback to what the *SDK*
-/// knows, which is a different claim: 3.1.0 knows 2026-07-28, whose
-/// `tools/list` result requires the SEP-2549 cache metadata (`ttlMs`,
-/// `cacheScope`) kaed does not emit. A client that asked for 2026-07-28 got
-/// it echoed back, validated the tool list against that revision's schema,
-/// and registered zero tools — connected, instructions delivered, nothing
-/// callable, no disconnect to explain it (korg #1212). An advertised version
-/// is a promise about response *shape*, so this constant moves when the
-/// implementation does and not before.
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+/// knows, which is a different claim about a different piece of software.
+/// That default is how kaed once echoed 2026-07-28 back to a client while
+/// omitting the SEP-2549 cache metadata that revision's `tools/list`
+/// requires, leaving Claude Code connected with zero registered tools and no
+/// disconnect to explain it (korg #1212, sprint 015). An advertised version
+/// is a promise about response *shape*, so this constant is stated here and
+/// moves when the implementation does — never as a side effect of an SDK
+/// bump. It moved to 2026-07-28 in sprint 016, once [`KaedServer::list_tools`]
+/// kept that promise (korg #1214).
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 /// Every revision kaed will negotiate down to, oldest first, ending at
-/// [`PROTOCOL_VERSION`]. Older revisions are a subset of 2025-11-25's shape,
-/// so serving them costs nothing; the newer one is the one that lies.
+/// [`PROTOCOL_VERSION`]. The older ones are a subset of the newest's shape,
+/// so serving them costs nothing.
 const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2024_11_05,
     ProtocolVersion::V_2025_03_26,
     ProtocolVersion::V_2025_06_18,
+    ProtocolVersion::V_2025_11_25,
     PROTOCOL_VERSION,
 ];
 
-/// rmcp's own `DEFAULT_MAX_REQUEST_BODY_BYTES`, which the clamp middleware
-/// matches so it never refuses a body the MCP layer would have accepted.
-const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// How long a client may treat `tools/list` as fresh (SEP-2549). kaed's tool
+/// catalog is fixed at compile time, so the honest bound is not a duration
+/// at all — it is "until this process restarts", and a restart means a new
+/// build stamp and a new session. An hour is a conservative reading of that.
+const TOOLS_TTL_MS: u64 = 60 * 60 * 1000;
 
 /// What every root on this instance supports. Advertised per-root because
 /// under peer mode (korg:1050) a fleet can be mid-upgrade, and the rule from
@@ -1272,7 +1277,7 @@ impl KaedServer {
             author = author.0,
             "proxying to peer"
         );
-        match self
+        let mut result = match self
             .state
             .fleet
             .call(
@@ -1284,9 +1289,35 @@ impl KaedServer {
             )
             .await
         {
-            Ok(result) => Ok(result),
-            Err(e) => kaed_error_result(e),
+            Ok(result) => result,
+            Err(e) => kaed_error_result(e)?,
+        };
+        // A peer envelope is verbatim in its *content* (R10), not in its
+        // protocol framing — the two ends of this hop can be on different
+        // revisions, and translating between them is the gateway's job in
+        // BOTH directions (016 D-4).
+        //
+        // rmcp strips `resultType: "complete"` for legacy peers, but only
+        // for results it built itself; one that arrived from a peer already
+        // deserialized is nobody's to stamp. So a peer asked at
+        // `PEER_PROTOCOL_VERSION` correctly omits the field, and returning
+        // that unchanged onto a 2026-07-28 session — where the field is
+        // mandatory and the absent-means-complete bridge is explicitly
+        // unavailable — makes the client reject the whole result, outcome
+        // and all.
+        //
+        // Filling it in is faithful rather than inventive: absent *means*
+        // complete at the revision the peer answered, and any other value
+        // is gated to sessions the peer never negotiated. Only an absent
+        // one is filled; a peer that names its own discriminator keeps it.
+        if result.result_type.is_none()
+            && context
+                .protocol_version()
+                .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+        {
+            result.result_type = Some(ResultType::COMPLETE);
         }
+        Ok(result)
     }
 
     /// `secret` / `rotate`: the primary and every same-root `also` target
@@ -1898,6 +1929,44 @@ impl ServerHandler for KaedServer {
         self.tool_router.call(tcc).await
     }
 
+    /// Hand-written for the SEP-2549 cache metadata (#1214) — the same trick
+    /// `call_tool` uses above: `#[tool_handler]` generates this only when it
+    /// is absent, so the router plumbing is otherwise unchanged. rmcp's
+    /// generated body sets `ttl_ms`/`cache_scope` to `None`, which is
+    /// precisely what made a 2026-07-28 client reject the result and register
+    /// zero tools.
+    ///
+    /// The fields are emitted **only** for peers that negotiated a revision
+    /// that defines them (D-1), mirroring rmcp's own
+    /// `strip_result_type_for_legacy_peer`: a 2025-11-25 client is answered in
+    /// the shape 2025-11-25 describes.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let mut result = ListToolsResult {
+            result_type: Some(ResultType::COMPLETE),
+            tools: self.tool_router.list_all(),
+            meta: None,
+            next_cursor: None,
+            ttl_ms: None,
+            cache_scope: None,
+        };
+        if context
+            .protocol_version()
+            .is_some_and(|v| v.as_str() >= ProtocolVersion::V_2026_07_28.as_str())
+        {
+            result.ttl_ms = Some(TOOLS_TTL_MS);
+            // Public, not private: the catalog is compiled in and identical
+            // for every author this instance serves, so nothing about it is
+            // scoped to a credential. Peer roots change what a *call* can
+            // reach, never which tools exist.
+            result.cache_scope = Some(CacheScope::Public);
+        }
+        Ok(result)
+    }
+
     /// Narrow rmcp's default — every revision the SDK knows — to the ones
     /// kaed's responses actually satisfy (#1212). This bounds what
     /// `initialize` may agree to and what `discover` advertises.
@@ -2127,87 +2196,6 @@ async fn auth_middleware(
     }
 }
 
-/// Clamp an over-new `initialize` down to [`PROTOCOL_VERSION`] *before* the
-/// MCP service sees it (#1212).
-///
-/// Refusing the version in the handler is not enough on its own, and the
-/// reason is that rmcp routes the request on what the client *asked for*,
-/// not on what was agreed: a body naming 2026-07-28 selects the inline
-/// lifecycle, which issues no session id. The handler then answers
-/// 2025-11-25 — correctly — and the client's next call, now carrying
-/// `MCP-Protocol-Version: 2025-11-25` and no session id, is a legacy-shaped
-/// request with no session to belong to. `400 Unexpected message, expect
-/// initialize request` — a worse failure than the one we set out to fix.
-/// Rewriting the request makes the transport and the handler agree on the
-/// revision that gets served, so the session is created exactly as it was
-/// for clients before Claude Code 2.1.227.
-///
-/// The client is not misled: it is told 2025-11-25 in the response, which is
-/// what the spec says a server does with a version it does not support.
-async fn clamp_protocol_middleware(req: axum::extract::Request, next: Next) -> Response {
-    // An `initialize` never carries a session id, so every request already
-    // belonging to one — which is every tool call, including the large ones
-    // — passes through without being buffered.
-    if req.method() != http::Method::POST || req.headers().contains_key("mcp-session-id") {
-        return next.run(req).await;
-    }
-    let (mut parts, body) = req.into_parts();
-    let Ok(bytes) = axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await else {
-        return (
-            http::StatusCode::PAYLOAD_TOO_LARGE,
-            "request body too large",
-        )
-            .into_response();
-    };
-    let mut json: Value = match serde_json::from_slice(&bytes) {
-        Ok(json) => json,
-        // Not JSON, or not ours to interpret: hand it on untouched and let
-        // the MCP layer produce its own error.
-        Err(_) => {
-            return next
-                .run(axum::extract::Request::from_parts(parts, bytes.into()))
-                .await;
-        }
-    };
-
-    let requested = (json["method"] == "initialize")
-        .then(|| json["params"]["protocolVersion"].as_str())
-        .flatten()
-        .map(str::to_string);
-    let body = match requested {
-        Some(requested)
-            if !SUPPORTED_PROTOCOL_VERSIONS
-                .iter()
-                .any(|v| v.as_str() == requested) =>
-        {
-            tracing::info!(
-                requested = %requested,
-                serving = %PROTOCOL_VERSION.as_str(),
-                "client asked for a protocol revision kaed does not implement"
-            );
-            json["params"]["protocolVersion"] = json!(PROTOCOL_VERSION.as_str());
-            // rmcp rejects an initialize whose header and body disagree, so
-            // a client that sent both gets both moved.
-            if parts
-                .headers
-                .get("mcp-protocol-version")
-                .and_then(|v| v.to_str().ok())
-                == Some(requested.as_str())
-            {
-                parts.headers.insert(
-                    "mcp-protocol-version",
-                    http::HeaderValue::from_str(PROTOCOL_VERSION.as_str())
-                        .expect("a protocol version is a valid header value"),
-                );
-            }
-            axum::body::Body::from(json.to_string())
-        }
-        _ => axum::body::Body::from(bytes),
-    };
-    next.run(axum::extract::Request::from_parts(parts, body))
-        .await
-}
-
 /// A 401 that says what is actually wrong (RFC 6750 §3). A bare 401 gets
 /// rendered with the client's own generic story — cleo's said "token
 /// expired", which sent the live test hunting for a TTL kaed has never
@@ -2301,13 +2289,13 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
         StreamableHttpServerConfig::default().with_allowed_hosts(allowed_hosts),
     );
 
-    let router = axum::Router::new()
-        .nest_service("/mcp", mcp)
-        .layer(axum::middleware::from_fn(clamp_protocol_middleware))
-        .layer(axum::middleware::from_fn_with_state(
-            auth.clone(),
-            auth_middleware,
-        ));
+    let router =
+        axum::Router::new()
+            .nest_service("/mcp", mcp)
+            .layer(axum::middleware::from_fn_with_state(
+                auth.clone(),
+                auth_middleware,
+            ));
     Ok((router, auth))
 }
 

@@ -110,11 +110,23 @@ async fn start_server_with(
 async fn connect(
     server: &TestServer,
 ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
+    connect_at(server, ClientInfo::default().protocol_version).await
+}
+
+/// As [`connect`], asking for a specific revision — the rmcp client requests
+/// `ProtocolVersion::LATEST` by default, which is a claim about the SDK and
+/// not about what either end here implements.
+async fn connect_at(
+    server: &TestServer,
+    protocol_version: ProtocolVersion,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", server.addr))
             .auth_header(TOKEN),
     );
-    Ok(ClientInfo::default().serve(transport).await?)
+    let mut info = ClientInfo::default();
+    info.protocol_version = protocol_version;
+    Ok(info.serve(transport).await?)
 }
 
 fn structured(result: &rmcp::model::CallToolResult) -> Value {
@@ -266,14 +278,26 @@ async fn lists_the_tool_surface() -> anyhow::Result<()> {
 /// streamable-http server answers with SSE; the first non-empty `data:`
 /// frame is the payload (an empty one is the retry-priming event).
 async fn raw_post(server: &TestServer, body: Value) -> anyhow::Result<(Option<String>, Value)> {
-    let resp = reqwest::Client::new()
+    raw_post_with(server, body, &[]).await
+}
+
+/// As [`raw_post`], plus extra request headers. A conformant `2026-07-28`
+/// request carries `MCP-Protocol-Version` as well as the `_meta` keys, and
+/// rmcp refuses the two disagreeing — so the header cannot be implicit.
+async fn raw_post_with(
+    server: &TestServer,
+    body: Value,
+    headers: &[(&str, &str)],
+) -> anyhow::Result<(Option<String>, Value)> {
+    let mut req = reqwest::Client::new()
         .post(format!("http://{}/mcp", server.addr))
         .header("authorization", format!("Bearer {TOKEN}"))
         .header("accept", "application/json, text/event-stream")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await?;
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        req = req.header(*name, *value);
+    }
+    let resp = req.json(&body).send().await?;
     let session = resp
         .headers()
         .get("mcp-session-id")
@@ -306,37 +330,37 @@ fn initialize(protocol_version: &str) -> Value {
 
 /// #1212: kaed echoed 2026-07-28 back to anyone who asked, because rmcp's
 /// default supported list is every revision the *SDK* knows — not every
-/// revision this server implements. Claude Code ≥2.1.227 asks for it, then
-/// validates `tools/list` against that revision's schema, whose required
-/// `ttlMs`/`cacheScope` kaed does not emit, and registers zero tools. An
-/// advertised version is a promise about response shape, so kaed answers
-/// with the newest one it can actually keep.
+/// revision this server implements. An advertised version is a promise about
+/// response shape, so kaed answers with the newest one it can actually keep
+/// — which since #1214 includes 2026-07-28.
 #[tokio::test]
-async fn negotiation_caps_at_the_revision_kaed_implements() -> anyhow::Result<()> {
+async fn negotiation_answers_the_revision_kaed_implements() -> anyhow::Result<()> {
     let server = start_server().await?;
 
-    for requested in ["2026-07-28", "9999-12-31"] {
-        let (session, answer) = raw_post(&server, initialize(requested)).await?;
-        assert_eq!(
-            answer["result"]["protocolVersion"], "2025-11-25",
-            "requested {requested}: kaed must not claim a revision it does not implement"
-        );
-        // and the session is a real one. Refusing the version in the handler
-        // alone left the transport still routing on what was *asked for*,
-        // which issues no session id — so the client's next call, now
-        // speaking the version it was given, had no session to belong to.
-        assert!(
-            session.is_some(),
-            "requested {requested}: no session id, so nothing after initialize can work"
-        );
-    }
+    // A version kaed has never heard of still gets the ceiling, not an echo.
+    let (_, answer) = raw_post(&server, initialize("9999-12-31")).await?;
+    assert_eq!(
+        answer["result"]["protocolVersion"], "2026-07-28",
+        "kaed must answer with its own ceiling, not repeat back a version it does not implement"
+    );
 
-    // and the revisions it does implement still negotiate as themselves
+    // 2026-07-28 negotiates as itself now that the result shape keeps the
+    // promise (SEP-2549 cache metadata — see the cache-metadata test).
+    let (_, answer) = raw_post(&server, initialize("2026-07-28")).await?;
+    assert_eq!(answer["result"]["protocolVersion"], "2026-07-28");
+
+    // and the older revisions still negotiate as themselves, over the legacy
+    // lifecycle: a session id, which is what everything after initialize
+    // needs to belong to.
     for requested in ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"] {
-        let (_, answer) = raw_post(&server, initialize(requested)).await?;
+        let (session, answer) = raw_post(&server, initialize(requested)).await?;
         assert_eq!(
             answer["result"]["protocolVersion"], requested,
             "requested {requested}"
+        );
+        assert!(
+            session.is_some(),
+            "requested {requested}: no session id, so nothing after initialize can work"
         );
     }
 
@@ -344,19 +368,70 @@ async fn negotiation_caps_at_the_revision_kaed_implements() -> anyhow::Result<()
     Ok(())
 }
 
-/// The whole failure as the client met it: connected, instructions
-/// delivered, and then not one tool callable. This drives a real MCP client
-/// through the real transport, asking for the revision Claude Code asks for.
+/// #1214, the whole point of the sprint: at 2026-07-28 a paginated result
+/// must carry the SEP-2549 cache metadata. Missing it is what made Claude
+/// Code ≥2.1.227 fail `tools/list` validation and register zero tools.
+///
+/// Driven raw because rmcp's own client cannot speak this revision
+/// conformantly — it omits the `_meta` keys its own server requires. That is
+/// exactly the gap the live test from cleo covers; this asserts wire shape.
 #[tokio::test]
-async fn a_client_asking_for_2026_07_28_still_gets_the_tools() -> anyhow::Result<()> {
+async fn tools_list_carries_cache_metadata_at_2026_07_28() -> anyhow::Result<()> {
     let server = start_server().await?;
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", server.addr))
-            .auth_header(TOKEN),
+
+    let (_, answer) = raw_post(&server, initialize("2026-07-28")).await?;
+    assert_eq!(answer["result"]["protocolVersion"], "2026-07-28");
+
+    // 2026-07-28 is the inline (sessionless) lifecycle: every request carries
+    // its own protocol version and client capabilities in `_meta`, and the
+    // header must agree with them.
+    let (_, answer) = raw_post_with(
+        &server,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"}
+                }
+            }
+        }),
+        &[
+            ("mcp-protocol-version", "2026-07-28"),
+            // SEP-2243 standard headers, which the revision also requires.
+            ("mcp-method", "tools/list"),
+        ],
+    )
+    .await?;
+
+    let result = &answer["result"];
+    assert!(
+        result["tools"].as_array().is_some_and(|t| t.len() == 12),
+        "tools/list did not answer with the catalog: {answer}"
     );
-    let mut info = ClientInfo::default();
-    info.protocol_version = ProtocolVersion::V_2026_07_28;
-    let client = info.serve(transport).await?;
+    assert!(
+        result["ttlMs"].is_number(),
+        "ttlMs must be a number at 2026-07-28: {result}"
+    );
+    assert_eq!(
+        result["cacheScope"], "public",
+        "the tool catalog is static per build and identical for every author"
+    );
+
+    server.ct.cancel();
+    Ok(())
+}
+
+/// A real MCP client over the real transport, asking for the revision the
+/// gateway pins (`fleet::PEER_PROTOCOL_VERSION`) — the path every proxied
+/// call to a peer takes. It negotiates as itself and enumerates the catalog.
+#[tokio::test]
+async fn an_rmcp_client_negotiates_its_revision_and_gets_the_tools() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect_at(&server, ProtocolVersion::V_2025_11_25).await?;
 
     let negotiated = client
         .peer_info()
@@ -366,6 +441,85 @@ async fn a_client_asking_for_2026_07_28_still_gets_the_tools() -> anyhow::Result
     assert_eq!(client.list_all_tools().await?.len(), 12);
 
     let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// **A pin on a dependency limitation, not on kaed.** rmcp 3.1.0's client
+/// cannot drive a conformant `2026-07-28` session: the handshake succeeds,
+/// and then every non-`initialize` request is rejected by rmcp's *own*
+/// server for the per-request `_meta` the revision requires and the client
+/// never sends.
+///
+/// That is why `fleet::PEER_PROTOCOL_VERSION` asks a peer for `2025-11-25`
+/// even though kaed serves `2026-07-28`, and why the sprint's real gate is a
+/// live test from a client that does implement the revision. **When this test
+/// starts failing, rmcp has caught up and the gateway pin can be raised.**
+#[tokio::test]
+async fn an_rmcp_client_cannot_yet_drive_2026_07_28() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect_at(&server, ProtocolVersion::V_2026_07_28).await?;
+
+    // The handshake itself is fine — `initialize` is exempt from the
+    // per-request metadata rules, so the failure hides until the first call.
+    assert_eq!(
+        client.peer_info().map(|i| i.protocol_version.clone()),
+        Some(ProtocolVersion::V_2026_07_28)
+    );
+
+    let err = client
+        .list_all_tools()
+        .await
+        .expect_err("rmcp 3.1.0's client omits the _meta its own server requires");
+    let err = err.to_string();
+    assert!(
+        err.contains("_meta") && err.contains("io.modelcontextprotocol/protocolVersion"),
+        "expected the missing-request-metadata rejection, got: {err}"
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The other side of D-1: a peer that negotiated a pre-SEP-2549 revision
+/// gets no cache metadata, the same way rmcp strips `resultType` for legacy
+/// peers.
+#[tokio::test]
+async fn tools_list_omits_cache_metadata_for_legacy_peers() -> anyhow::Result<()> {
+    let server = start_server().await?;
+
+    let (session, _) = raw_post(&server, initialize("2025-11-25")).await?;
+    let session = session.expect("the legacy lifecycle issues a session id");
+    let headers = [
+        ("mcp-session-id", session.as_str()),
+        ("mcp-protocol-version", "2025-11-25"),
+    ];
+    raw_post_with(
+        &server,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        &headers,
+    )
+    .await
+    .ok();
+
+    let (_, answer) = raw_post_with(
+        &server,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        &headers,
+    )
+    .await?;
+
+    let result = &answer["result"];
+    assert!(
+        result["tools"].as_array().is_some_and(|t| t.len() == 12),
+        "tools/list did not answer with the catalog: {answer}"
+    );
+    assert!(
+        result.get("ttlMs").is_none() && result.get("cacheScope").is_none(),
+        "a 2025-11-25 peer must get the wire shape that revision defines: {result}"
+    );
+
     server.ct.cancel();
     Ok(())
 }

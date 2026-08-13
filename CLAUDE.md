@@ -48,7 +48,9 @@ attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 **Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–015, 2026-08-12):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
-auth, serving **MCP `2025-11-25`** (015 — see the protocol bullet below). kubsdb joined in 013 after two sprints deferred (korg #929) — see
+auth, serving **MCP `2026-07-28`** since 016 — but the fleet still runs the
+015 build until 016 deploys, so a live host answers `2025-11-25`; see the
+protocol bullet below. kubsdb joined in 013 after two sprints deferred (korg #929) — see
 the 013 bullet below for its access model. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
 checkout**, so any instruction to `git pull` on a host is wrong.
@@ -225,26 +227,32 @@ fails, and what the journal structurally cannot tell you — see
   changes); and **the hidden counters are lower bounds when `truncated`**,
   which is why one root reported 1, 2 and 6 unreadable entries across
   three sessions.
-- **kaed serves MCP `2025-11-25`, deliberately, since 015**
-  (`sprints/015-protocol-version-negotiation/decisions.md`; korg #1212).
-  rmcp's default advertises every revision the *SDK* knows — 3.1.0 includes
-  `2026-07-28`, whose `tools/list` requires SEP-2549 `ttlMs`/`cacheScope`
-  that kaed does not emit — so Claude Code ≥2.1.227 asked for it, got it
-  echoed, failed result validation and registered **zero tools**. Three
-  things not to re-derive: narrowing `supported_protocol_versions()` is
-  **not sufficient alone** (D-2 — rmcp routes on the version *asked for*
-  before dispatch, so a 2026-07-28 body takes the sessionless inline
-  lifecycle and the client's next call has no session to belong to; the
-  handler-only fix turns "zero tools" into "cannot connect"), which is why
-  `clamp_protocol_middleware` rewrites the requested version at the HTTP
-  boundary; `get_info` pins the fallback to the same constant so an rmcp
-  bump promoting `LATEST` cannot reintroduce it silently (D-3); and the cap
-  is **tonight's answer, not forever's** — D-1 says the blocker is
-  verifiability from this repo, not effort. Lifting it is **korg program
-  1220**, which spans all three homelab rmcp servers (korg-mcp and klams-mcp
-  escaped only because their rmcp still tops out at `2025-11-25`); kaed is
-  slice 1, proposal 1217 / WI #1214. **Live-tested from cleo** before the
-  ship (`015-.../live-test.md`) — passed, nothing filed.
+- **The protocol revision is stated, never defaulted** — 015 capped kaed at
+  `2025-11-25`, 016 lifted the cap to `2026-07-28`
+  (`sprints/01{5,6}-*/decisions.md`; korg #1212, #1214). rmcp's defaults
+  advertise every revision the *SDK* knows, which is a claim about rmcp; kaed
+  serving it as a claim about itself is what left Claude Code ≥2.1.227
+  connected with **zero tools** (it validated `tools/list` against
+  `2026-07-28`, whose SEP-2549 `ttlMs`/`cacheScope` kaed did not emit).
+  015 is history now — `clamp_protocol_middleware` is **gone** (016 D-3), so
+  don't go looking for it. Four things not to re-derive: the gap really was
+  **two fields on one result**, fixed by hand-writing `list_tools` (the same
+  "macro only generates it when absent" trick `call_tool` uses), and rmcp
+  already implements the revision's other server-side pieces; those fields are
+  emitted **only to peers that negotiated 2026-07-28+** (016 D-1 — a
+  `2025-11-25` peer is entitled to `2025-11-25`'s shape, the same reason rmcp
+  strips `resultType` for legacy peers); **`fleet::PEER_PROTOCOL_VERSION` is
+  pinned BELOW what kaed serves, at `2025-11-25`, and that is not a mistake**
+  (016 D-2 — rmcp 3.1.0's *client* cannot drive a 2026-07-28 session, and the
+  gateway proxies through one, so an rmcp bump promoting `LATEST` would break
+  every proxied call on kai; `an_rmcp_client_cannot_yet_drive_2026_07_28`
+  fails when that stops being true, which is the signal to raise it); and
+  `get_info` still pins its fallback to `PROTOCOL_VERSION` explicitly (015
+  D-3), which is load-bearing on its own, not a leftover of the cap.
+  016 is slice 1 of **korg program 1220**, which spans all three homelab rmcp
+  servers — korg-mcp (#1215) and klams-mcp (#1216) escaped only because their
+  rmcp still tops out at `2025-11-25`, and D-2 is the trap most likely to bite
+  them.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

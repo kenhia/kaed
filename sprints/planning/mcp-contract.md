@@ -264,11 +264,19 @@ agent-filed feedback. Nothing here is frozen.
     `kubsdb:*`, `kai:*` and `*:*` are one code path. A host the pattern
     excludes by name is not probed and therefore never reported
     unavailable; a host it *includes* still reports an honest gap.
-  - **Passthrough is verbatim.** Arguments are forwarded as received
-    (routing reads only `root`), results return untouched, and error
-    objects pass through whole plus a top-level `root` tag —
-    `version_conflict` deltas and `ambiguous_anchor` candidates survive
-    the hop by construction.
+  - **Passthrough is verbatim — of content, not of protocol framing
+    (016 D-4).** Arguments are forwarded as received (routing reads only
+    `root`), results return untouched, and error objects pass through
+    whole plus a top-level `root` tag — `version_conflict` deltas and
+    `ambiguous_anchor` candidates survive the hop by construction. The
+    envelope is a different matter: the two ends of a hop can sit on
+    different MCP revisions, because the gateway pins the revision it
+    *asks* a peer for independently of the one it *serves*. Reconciling
+    that is the gateway's job in both directions, and returning a peer
+    envelope unadapted is a bug, not fidelity — it once put a
+    legitimately-absent `resultType` onto a session where the field is
+    mandatory, and the client rejected the result whole, so the call's
+    outcome never arrived at all.
   - **Reachability is data.** A declared peer that does not answer is
     `not_found` / `host_unreachable` with an observed `since` on the call
     path, and `status: "unreachable"` in `roots` — not a transport

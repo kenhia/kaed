@@ -156,6 +156,66 @@ async fn call(
         .expect("tool call completes")
 }
 
+/// One raw `tools/call` on a conformant `2026-07-28` session, returning the
+/// JSON-RPC `result` object as it goes on the wire.
+///
+/// Raw because rmcp's client cannot make this request — it omits the
+/// per-request `_meta` its own server requires (016 D-2), which is precisely
+/// why the bug this guards against was invisible from the Rust test suite
+/// and only showed up from cleo.
+async fn raw_call_at_2026_07_28(
+    addr: std::net::SocketAddr,
+    token: &str,
+    tool: &str,
+    arguments: Value,
+) -> anyhow::Result<Value> {
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "0"}
+    });
+    let http = reqwest::Client::new();
+    let url = format!("http://{addr}/mcp");
+    let common = |req: reqwest::RequestBuilder| {
+        req.header("authorization", format!("Bearer {token}"))
+            .header("accept", "application/json, text/event-stream")
+            .header("content-type", "application/json")
+    };
+    // 2026-07-28 is the inline lifecycle: initialize issues no session id,
+    // and each later request carries its own version and capabilities.
+    common(http.post(&url))
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2026-07-28",
+                "capabilities": {},
+                "clientInfo": {"name": "probe", "version": "0"}
+            }
+        }))
+        .send()
+        .await?;
+    let resp = common(http.post(&url))
+        .header("mcp-protocol-version", "2026-07-28")
+        // SEP-2243 standard headers, which the revision also requires.
+        .header("mcp-method", "tools/call")
+        .header("mcp-name", tool)
+        .json(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments, "_meta": meta}
+        }))
+        .send()
+        .await?;
+    let text = resp.text().await?;
+    let frame = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|frame| !frame.trim().is_empty())
+        .unwrap_or(&text);
+    let answer: Value =
+        serde_json::from_str(frame).map_err(|e| anyhow::anyhow!("{e}: not JSON-RPC: {text:?}"))?;
+    Ok(answer["result"].clone())
+}
+
 /// PD-4, the invariant the whole design turned on: an edit proxied through
 /// the gateway is journaled on the BACKEND, under the CALLER's identity —
 /// and nowhere on the gateway (D-7).
@@ -945,6 +1005,65 @@ async fn rotate_writes_both_hosts_via_a_remote_also_target() -> anyhow::Result<(
 
     let _ = gw.cancel().await;
     let _ = direct.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// 016, found by the live test from cleo and not by any of the above: a
+/// gateway that serves a NEWER revision than it asks its peers for has to
+/// translate in **both** directions.
+///
+/// kai serves `2026-07-28`, where `resultType` is mandatory and the
+/// absent-means-complete bridge is explicitly unavailable. It asks peers at
+/// `PEER_PROTOCOL_VERSION` (016 D-2), where a peer correctly omits the
+/// field. Returning that envelope verbatim put a legitimately-absent field
+/// onto a session where it is not legitimate, and the client rejected the
+/// whole result — so the call's real outcome never arrived.
+///
+/// rmcp's `strip_result_type_for_legacy_peer` covers modern→legacy for
+/// results rmcp builds itself. Nothing stamped one that arrived from a peer
+/// already deserialized.
+#[tokio::test]
+async fn a_proxied_result_is_stamped_for_the_revision_it_is_returned_on() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+
+    // the local half, as the control: kai's own result is rmcp's to build
+    let local = raw_call_at_2026_07_28(
+        alpha.addr,
+        "tok-alpha-claude",
+        "stat",
+        json!({"root": "alpha:scratch", "path": "hello.txt"}),
+    )
+    .await?;
+    assert_eq!(local["isError"], false, "local stat failed: {local}");
+    assert_eq!(local["resultType"], "complete");
+
+    // and the proxied half, which is the one that regressed
+    let proxied = raw_call_at_2026_07_28(
+        alpha.addr,
+        "tok-alpha-claude",
+        "stat",
+        json!({"root": "beta:scratch", "path": "hello.txt"}),
+    )
+    .await?;
+    assert_eq!(proxied["isError"], false, "proxied stat failed: {proxied}");
+    assert_eq!(
+        proxied["resultType"], "complete",
+        "a peer result returned on a 2026-07-28 session must carry resultType: {proxied}"
+    );
+
+    // a proxied ERROR result travels the same path and needs the same stamp
+    let refused = raw_call_at_2026_07_28(
+        alpha.addr,
+        "tok-alpha-claude",
+        "stat",
+        json!({"root": "beta:scratch", "path": "nope.txt"}),
+    )
+    .await?;
+    assert_eq!(refused["isError"], true, "expected a refusal: {refused}");
+    assert_eq!(refused["resultType"], "complete");
+
     alpha.ct.cancel();
     beta.ct.cancel();
     Ok(())
