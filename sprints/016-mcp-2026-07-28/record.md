@@ -191,3 +191,36 @@ pass those were unreachable, because a rejected envelope makes a refusal and
 a success indistinguishable. That is the sprint's own lesson landing on
 itself: the failure mode to fear is not an error, it is an outcome that never
 arrives.
+
+## Deployed 2026-08-12 — `0.1.0-af51376`
+
+Store-native, whole fleet, from merged `main`. `latest` moved this time (the
+two canaries were published `--no-latest` per the justfile's branch rule).
+Rollback target: `0.1.0-0743ff0` — the 015 build with the cap — via
+`--version`, or `~/.local/bin/kaed.prev` on each host, which is the
+`a7f81ef` canary on kai and `0743ff0` on the peers.
+
+The two canaries (`57cf254`, `a7f81ef`) remain in the store as builds naming
+no commit on `main`. `a7f81ef` is the one the cleo re-test actually passed
+against; its content is `af51376`, but it is not a rollback target anyone
+should pick.
+
+| Host | `kaed --version` | check-config | unit | `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0 (af51376 …)` | ok | active | matches |
+| kubs0 | `0.1.0 (af51376 …)` | ok | active | matches |
+| kubsdb | `0.1.0 (af51376 …)` | ok | active | matches |
+
+**The sprint-specific checks, on all three over their real URLs:**
+`initialize` asking `2026-07-28` negotiates as itself, and `tools/list`
+returns 12 tools with `ttlMs: 3600000` / `cacheScope: "public"`. That is the
+thing #1212 was about, live on every host.
+
+**And D-4 in the state no live test could reach.** Until now the fix had only
+ever run with kai new and its peers old. With the whole fleet on `af51376`,
+proxied `stat kubs0:k-homelab`, `list kubsdb:src` and a proxied *refusal* all
+still carry `resultType: "complete"` — because kai still *asks* peers at
+`PEER_PROTOCOL_VERSION = 2025-11-25` regardless of what they can serve, so
+the stamp stays on exactly the path it was on before. That is the prediction
+D-4 made about the fleet move, now measured rather than reasoned. `roots`
+reports 7 roots, all three hosts `verified` on the same build.
