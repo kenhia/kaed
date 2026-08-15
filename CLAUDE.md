@@ -273,6 +273,25 @@ fails, and what the journal structurally cannot tell you — see
   servers — korg-mcp (#1215) and klams-mcp (#1216) escaped only because their
   rmcp still tops out at `2025-11-25`, and D-2 is the trap most likely to bite
   them.
+- **The feedback loop has a reader since 017** (`sprints/017-feedback-triage/
+  decisions.md`): the `triage-feedback` skill reads `feedback` on every host,
+  triages what is new, and **files the WIs itself — Ken is not the gate**
+  (D-1; a loop that asks him to rule on each report re-creates the bottleneck
+  kaed exists to remove). State is `docs/feedback-triage.md`: per-host
+  high-water marks plus one line per report, dispositions only, never the
+  verbatim prose (D-2). Read it with `scripts/feedback-dump.py`, not by hand
+  — `immutable=1` reports an **empty table** rather than an error, because
+  the rows live in the WAL. Three things not to re-derive: **`feedback`
+  takes no `root`, so it never proxies** — a report lands on whichever host
+  served the connection, which is why every one so far is on kai including
+  the ones about kubsdb; the modal disposition is **"already fixed"** (three
+  of the first five), so check that before anything else, but verify against
+  current `main` regardless, because #1231 was filed in 013 and still
+  reproduces at 016; and **`with_feedback_invite()` is attached only in
+  `kaed_error_result`**, so the invite fires on errors alone — the
+  bug-heavy category mix is a fact about that placement, not a verdict on
+  the contract (D-4). Whether that leaves a real gap is #1233, an
+  experiment, not a settled finding.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is
