@@ -120,7 +120,11 @@ fails, and what the journal structurally cannot tell you — see
   deliberately not committed — placeholder `<tailnet>`; real value in klams
   or `tailscale status` (whose `--json` pretty-prints: grep
   `'"MagicDNSSuffix": *"'`, with the space, or you get an empty string
-  instead of an error).
+  instead of an error — and **`grep -m1`**, because the key appears twice,
+  so without it you get a two-line variable and every URL built from it is
+  malformed; curl reports that as `000`, or as a plausible-looking HTTP
+  status, never as a parse error. Cost a round of chasing a nonexistent
+  auth failure in 018).
 - **Never hand-write another application's config file**, especially from
   PowerShell on cleo: `Set-Content -Encoding UTF8` writes a BOM on PS 5.1,
   and that wiped every MCP server on cleo once (korg #931). Prefer the
@@ -292,6 +296,28 @@ fails, and what the journal structurally cannot tell you — see
   bug-heavy category mix is a fact about that placement, not a verdict on
   the contract (D-4). Whether that leaves a real gap is #1233, an
   experiment, not a settled finding.
+- **kai and kubs0 are kaed clients since 018** (`sprints/
+  018-client-wiring-per-host-authors/`; korg #1350). Both register one MCP
+  server named `kaed-kai`, and **kubs0's points at kai, not at its own
+  kaed** — kubs0 is a plain backend with no peer tokens, so a localhost
+  entry would serve only the two roots that host already edits natively.
+  It takes cleo's exposure knowingly: kai down means kubs0 has no kaed at
+  all, and the fallback is kubs0's own direct URL. **PD-7 is the identity
+  rule** — one author per *machine* (`claude-kai`, `claude-kubs0`; cleo
+  keeps bare `claude`), never per harness or per human, because the
+  credential is a file on a host and that is what gets revoked. Three
+  things not to re-derive: **credentials grow as authors × endpoints**
+  (PD-4 means the gateway holds a token per *(author, backend)* pair, so
+  two authors cost six files; the fleet is at nine with no inventory —
+  `krot` doesn't know about kaed yet); **a backend's `[auth]` must list
+  authors that never dial it**, since they arrive proxied, and `config.rs`
+  refuses to start on the converse; and **adding an identity is a RESTART,
+  not a SIGHUP** (D-3 — `AuthState` captures the `[auth]` spec at startup
+  and `reload()` only re-reads the token files it already knows, so the
+  symptom is a `401` that reads as "wrong token"). The live test found
+  nothing and went beyond its gate: `bin/apply kai kaed-service` was run
+  for real, leaving the config byte-identical, so korg #1072's preservation
+  fix is now observed rather than inferred.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

@@ -290,7 +290,28 @@ claude = { token_file = "/home/you/.config/kaed/peer-tokens/buildbox-claude" }
 ```
 
 The token value is the same bearer token that identity uses when talking to
-`buildbox` directly. Token files re-read on `SIGHUP`, like every other
+`buildbox` directly.
+
+**Give each machine its own identity, not each person or each tool.** Once
+more than one client exists, a shared identity means the journal can only
+say "some agent somewhere" — and the point of the journal is to answer
+"which machine changed this". It also ties the clients together for
+revocation: one compromised client costs all of them a rotation. Name the
+identity after the host the credential lives on (`claude-buildbox`), since
+that is the thing that can actually be stolen and the thing that can
+actually be revoked.
+
+Budget for the multiplication before you start: with a gateway, credentials
+grow as **identities × endpoints**, because the gateway holds a separate
+token per (identity, peer) pair rather than one per peer. Two identities
+across a gateway and two backends is six token files. That is the price of
+proxying as the caller instead of substituting a shared credential, and it
+is worth paying — but decide where you will keep track of them first.
+
+Note the backends must list identities that never dial them directly: they
+arrive proxied. kaed refuses to start on the converse mistake — a
+`[peers.<host>.tokens]` entry for an identity missing from this host's
+`[auth]` — since nobody could authenticate as it anyway. Token files re-read on `SIGHUP`, like every other
 credential; `token_env` works but needs a restart. With routing configured,
 `roots` **probes** peers live (under the caller's credential): an answering
 peer shows up `verified: true` with its version and its roots merged in; one
@@ -317,7 +338,7 @@ fallback.
 | `roots[]` | `name` (local, no `:` or `/`), `path`, optional `description`. `path` may use `~/`. Canonicalized at startup; duplicates and denied roots are refused. |
 | `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. With a `url`, calls addressing that host's roots are proxied there. Omit the whole table to declare nothing. |
 | `peers.<host>.tokens.<identity>` | That identity's bearer token *for this peer* (`token_file` re-reads on `SIGHUP`; `token_env` needs a restart). The gateway proxies as the caller — an identity with no entry is refused, never impersonated. |
-| `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. |
+| `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. **Adding a new identity is not** — see below. |
 | `auth.<identity>.token_env` | Alternative: an env var. Works, but **cannot be reloaded** — see [rotation](#rotating-a-token). |
 | `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. |
 | `limits.*` | Response and file size budgets. |
@@ -330,6 +351,28 @@ fallback.
 | `secrets.shapes.<name>` | Named entry for the `secret` tool's shape registry — a spec from the closed grammar (`hex(N)`, `base64url(N)`, `uuid4`, `prefixed(tag,inner)`), e.g. `klams = "prefixed(klams-,hex(64))"`. Validated at startup. |
 | `secrets.allow_reveal` | Set `false` to refuse `secret_reveal` on this host entirely (structured `reveal_disabled` refusal). The default is `true`: the tool being separately permissioned at the harness is the primary gate. |
 | `secrets.leak_checks` | Write-side leak detection strictness. `"refuse"` (default): writing content that matches a known secret's digest, a provider token prefix, or a private-key block into an **unclassified** file refuses with a named `allow_secrets` override, while merely secret-shaped content applies with a warning. `"flag"`: everything warns, nothing blocks. `"off"`: no scanning. |
+
+### What reloads, and what needs a restart
+
+`SIGHUP` re-reads the token **files** the running process already knows
+about. It does not re-read the config, so anything that changes the *shape*
+of `[auth]` or `[peers]` needs `systemctl --user restart kaed`:
+
+| Change | `systemctl --user reload` is enough |
+|---|---|
+| New value in an existing token file | **yes** — this is what rotation uses |
+| New `[auth]` identity | no — restart |
+| New `[peers.<host>.tokens]` entry | no — restart |
+| New peer, or a changed peer `url` | no — restart |
+
+Rotation got the hot path because rotation is the frequent operation.
+Adding an identity is rare, and a restart is the honest cost of loading a
+config that might not validate.
+
+The failure this prevents is mildly misleading if you hit it: SIGHUP
+succeeds, the new identity never appears, and the client gets a `401`
+saying the token matches no configured identity — which reads as "wrong
+token" rather than "the server never loaded your identity."
 
 ### Validate it
 
@@ -617,7 +660,7 @@ seeing what torn states actually look like.
 | Symptom | Cause |
 |---|---|
 | 4xx before auth, only via the proxy | `Host` not in `server.allowed_hosts`. Add both bare and `:port` forms. |
-| `401` with a token you believe is right | Client hasn't restarted since the token changed, or you're sending the old one. Tokens do not expire. |
+| `401` with a token you believe is right | Client hasn't restarted since the token changed, or you're sending the old one. Tokens do not expire. If you just *added* the identity, the daemon needs a **restart**, not a reload — SIGHUP does not re-read `[auth]`. |
 | `denied` on a path you expected to read | The deny list. Run `kaed check-config` to see every active rule. This is permanent — no path correction will work. |
 | `outside_root` | The path escapes its root, or is absolute. Paths are always root-relative. |
 | `list`/`search` results look short | Check `denied_hidden` (the deny list), `classified_hidden` (secret-bearing files with no redacted surface) and `unreadable_hidden` (the OS refused) in the response. |
