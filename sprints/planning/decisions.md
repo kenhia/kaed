@@ -257,3 +257,52 @@ channel dies.
 The deliverable is the roadmap's second clause: *the first contract revision
 driven by a real agent friction report.* An unread channel is worse than none,
 because it looks like a channel.
+
+---
+
+## PD-7 — One kaed identity per machine, not per harness or per human
+
+*2026-08-16. Sprint 018 (korg #1350). Extends PD-4, which decided that the
+gateway proxies as the caller; this decides what "the caller" is named
+after.*
+
+kaed had one client identity, `claude`, because it had one client. Wiring a
+second and third — Claude Code on kai and on kubs0 — forced the question the
+single-client era never asked: **what is an author an author *of*?**
+
+**Decided: the machine.** `claude-kai`, `claude-kubs0`, cleo keeping bare
+`claude`. Not `claude-code` (harness-shaped), not `ken` (human-shaped), and
+emphatically not one shared `claude` for all three.
+
+The reason is that a credential's name should describe the thing that can be
+stolen and the thing that can be revoked, and both of those are *a file on a
+host*. Machine-grain identity makes the credential's scope and its name the
+same fact. Harness-grain does not — two Claude Code sessions on different
+boxes would be indistinguishable, and the machine is the axis that actually
+varies. Human-grain carries no information at all when there is one human.
+
+Two consequences that outlive this sprint:
+
+- **Attribution is the product, so sharing an identity forfeits it.** A
+  journal that answers "some Claude somewhere" cannot answer "which machine
+  changed this", which is the first question anyone asks of a cross-host
+  edit. kaed sells verified attributed writes; a shared token is the one
+  configuration choice that silently unsells it while every test still
+  passes.
+- **Revocation gets a blast radius equal to the identity's span.** One
+  identity for three clients means one compromised client costs all three a
+  rotation. Per-machine identity makes the fleet's credential graph a set of
+  independent edges.
+
+The cost is real and should be stated: **credentials multiply as
+authors × endpoints**, because PD-4 means the gateway holds a distinct token
+per (author, backend) pair rather than one per backend. Two new authors cost
+six token files, and the fleet is now at nine with no inventory anywhere.
+That is the honest price of PD-4 + PD-7 together, and it is the argument for
+`krot` learning about kaed before a fourth client is added — not an argument
+for going back to a shared token.
+
+A backend must list authors that never dial it, because they arrive proxied.
+`config.rs` already refuses to start on the converse mistake — a
+`[peers.x.tokens]` entry for an author absent from `[auth]` — on the grounds
+that nobody can authenticate as an identity the host does not know.
