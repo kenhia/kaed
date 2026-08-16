@@ -907,17 +907,17 @@ figcaption {
     <div class="fleet reveal">
       <div class="host host--client">
         <span class="name">cleo</span>
-        <span class="role">Workstation. Where the agent runs — and the one machine that doesn't need a daemon.</span>
+        <span class="role">Workstation. Runs an agent and no daemon — the only machine here that is purely a client.</span>
         <span class="state">client</span>
       </div>
       <div class="host host--live">
         <span class="name">kai</span>
-        <span class="role">Primary homelab host. Two roots — <code>kai:src</code>, <code>kai:scratch</code> — one identity, dogfooded daily.</span>
+        <span class="role">Primary homelab host, and the fleet's gateway. Two roots — <code>kai:src</code>, <code>kai:scratch</code> — dogfooded daily. Also a client of itself.</span>
         <span class="state">live</span>
       </div>
       <div class="host host--live">
         <span class="name">kubs0</span>
-        <span class="role">Second host, installed from the same published bundle rather than a hand-built one. No checkout on it at all.</span>
+        <span class="role">Second host, installed from the same published bundle rather than a hand-built one. No checkout on it at all. Its own agent talks to the gateway, not to the daemon under its feet.</span>
         <span class="state">live</span>
       </div>
       <div class="host host--planned">
