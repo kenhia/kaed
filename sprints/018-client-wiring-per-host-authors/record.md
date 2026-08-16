@@ -105,3 +105,51 @@ revision by hand should not have to rediscover the handshake.
   Six were minted today. `krot` is the project that should hold them; it
   does not know about kaed yet. Not filed — flagging it here rather than
   inventing scope.
+
+## Deployed
+
+**2026-08-16. `0.1.0-aeae142` on kai, kubs0 and kubsdb.** Published from
+merged `main` (`aeae142`) with `just publish`; every host installed that
+artifact with `install.sh --from-store`, kai included.
+
+Worth being honest about what this deploy was: sprint 018 changed **no
+server code**, so `aeae142`'s binary is functionally identical to the
+`af51376` it replaced. It was deployed anyway so the fleet's version stamp
+names a commit on `main` — this project treats "which build is running" as
+answerable from the tool surface, and leaving three hosts stamped with a
+commit two sprints back quietly costs that.
+
+Rollback target: `0.1.0-af51376`, either from `~/.local/bin/kaed.prev` on
+any host or `install.sh --from-store --version 0.1.0-af51376`.
+
+### Verified live
+
+| Host | `kaed --version` | `check-config` | unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0 (aeae142 2026-08-16)` | exit 0 | active | `0.1.0 (aeae142 2026-08-16)` |
+| kubs0 | `0.1.0 (aeae142 2026-08-16)` | exit 0 | active | `0.1.0 (aeae142 2026-08-16)` |
+| kubsdb | `0.1.0 (aeae142 2026-08-16)` | exit 0 | active | `0.1.0 (aeae142 2026-08-16)` |
+
+All three exact matches against the published version, and the MCP column
+closes the loop: the binary on disk and the server answering the network are
+the same build.
+
+### Re-verified this sprint's own work, because the deploy restarted it
+
+A deploy restarts every daemon, which drops exactly the wiring this sprint
+installed — so the health check above proves the service is up, not that 018
+is still live. Re-checked afterwards:
+
+- `install.sh` reported **`config exists, left untouched`** on kai, and all
+  three hosts still resolve `claude`, `claude-kai` and `claude-kubs0`. The
+  six new credentials survived, which is the claim `install.sh` makes about
+  itself and the one worth checking on the deploy that first depends on it.
+- A **fresh Claude Code session on kai**: 7 roots, all three hosts verified,
+  every fleet entry reporting `aeae142`.
+- A **fresh Claude Code session on kubs0**: 7 roots, all verified, and an
+  edit to `kubsdb:src` applied as txn 10 — journaled on kubsdb under
+  `claude-kubs0`, verified on disk, then removed.
+
+So the end-to-end path this sprint built — kubs0's agent editing kubsdb
+through kai's gateway under its own identity — was exercised again *after*
+the redeploy, not just before it.
