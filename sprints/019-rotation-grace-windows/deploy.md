@@ -50,25 +50,44 @@ systemctl --user restart kaed          # kai
   Declaring the slot is inert until then, which is why it can be rolled out
   ahead of need.
 
-## Binary rollout — pending
+## Binary rollout — done 2026-08-17, `0.1.0-9518bff`
 
-`just publish` + `install.sh --from-store` per host at ship time. Two things
-to check afterwards, in this order:
+Published from merged `main` (`9518bff`) and installed from the store on all
+three hosts — kai first, then kubs0 and kubsdb, each bootstrapping the
+installer from the artifact and checking it against `SHA256SUMS`.
 
-1. `kaed check-config` on each host emits **no** grace-window warning. Before
-   this sprint's config rollout it would have named two identities on kai and
-   three on each backend; silence is the verification.
-2. `kaed-new-token --identity claude-kai --close` on each host. With no
-   rotation in flight it must fail with
+| Host | Installed | `kaed --version` | Unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0-9518bff` | match | active | `0.1.0 (9518bff 2026-08-16)` |
+| kubs0 | `0.1.0-9518bff` | match | active | `0.1.0 (9518bff 2026-08-16)` |
+| kubsdb | `0.1.0-9518bff` | match | active | `0.1.0 (9518bff 2026-08-16)` |
+
+Rollback target: `0.1.0-aeae142` (sprint 018), still in the store and on each
+host as `~/.local/bin/kaed.prev`.
+
+### Verified live — the sprint's own behaviour, not just a healthy service
+
+1. **The warning is silent fleet-wide.** `check-config` on all three hosts
+   emits zero `HARD CUT` lines, with 3 of 3 identities resolving on each. The
+   check is not vacuous: run against kai's pre-fix config during the sprint
+   the same code named `["claude-kai", "claude-kubs0"]`, and each backend
+   would have named all three. Silence *is* the verification.
+2. **`--identity` resolves each host's real config.** The read-only probe
+   `kaed-new-token --identity claude-kai --close` fails on every host with
 
    ```
    ERROR: no /home/ken/.config/kaed/token-claude-kai.prev — no grace window is open
    ```
 
-   which is the read-only probe worth running: it changes nothing, and the
-   path in the message proves `--identity` resolved that identity out of the
-   host's real `config.toml` rather than guessing a filename. A message
-   naming plain `token.prev` would mean the parser missed the entry.
+   naming the identity-specific path. A message naming plain `token.prev`
+   would have meant the parser missed the entry and fell back — it does not
+   fall back, and this proves it on the live configs rather than on fixtures.
+3. **Nothing was rotated**: zero `.prev` files on any host afterwards, which
+   is also the state that makes claim 2 a *refusal* rather than a deletion.
+4. **The gateway still proxies.** `roots` through kai reports both peers
+   `probe: ok`, `verified: true`, all seven roots addressable, every host
+   reporting `9518bff`. This is the check that covers the six
+   gateway-consumed credentials end to end.
 
-Do **not** rotate anything as a deploy check. The live rotation is krot's
-scheduled 2026-08-21 test, which this sprint exists to precede.
+No rotation was performed as a deploy check, deliberately. The live rotation
+is krot's scheduled 2026-08-21 test, which this sprint exists to precede.

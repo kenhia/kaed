@@ -117,3 +117,14 @@ the routes, the backups and what was checked. The binary half ships at
 - **The rotation is still two-ended for gateway-consumed credentials** and
   the second end is manual: copy the new value into kai's peer-token file.
   Documented in `docs/setup.md`; deliberately not automated (D-7).
+
+## Deployed 2026-08-17 — `0.1.0-9518bff`, merged `main`
+
+Config half went out during the sprint; the binary half shipped after the
+squash-merge. Both are on kai, kubs0 and kubsdb, verified: the grace-window
+warning is silent fleet-wide (it named two or three identities per host
+before), `--identity` resolves each host's real config, no `.prev` file
+exists anywhere, and `roots` through the gateway reports every host on
+`9518bff` with both peers probing ok. Rollback target `0.1.0-aeae142`.
+
+Full table and the exact probes in `deploy.md`.
