@@ -318,6 +318,32 @@ fails, and what the journal structurally cannot tell you — see
   nothing and went beyond its gate: `bin/apply kai kaed-service` was run
   for real, leaving the config byte-identical, so korg #1072's preservation
   fix is now observed rather than inferred.
+- **Every identity has a rotation grace window since 019** (`sprints/
+  019-rotation-grace-windows/decisions.md`; korg #1375, krot program 1374
+  slice 9). krot's audit found `prev_token_file` on **one of nine**
+  (backend × author) credentials, so rotating the other eight was a hard
+  cut. All nine are configured now, and three things stop the tenth being
+  added bare: `kaed-new-token --rotate` **refuses** without a window
+  (`--force` overrides, and deliberately writes no `.prev` — one nothing
+  honours is a live-looking credential on disk), `config.example.toml`
+  ships the window on, and `Config::resolve` warns at startup naming the
+  uncovered identities. Four things not to re-derive: **`prev_token_file`
+  is NOT defaulted to `<token_file>.prev`** (D-2 — the file's existence is
+  what makes a token valid, so a default would silently re-arm a
+  half-abandoned rotation's leftovers as a live credential nobody
+  declared); the warning is in `resolve()`, **not** `resolve_identities()`
+  (D-3 — grace windows are config *shape*, which SIGHUP cannot change, so
+  per-reload warnings would report something no reload could have altered);
+  **`--identity` reads paths out of `config.toml` and never derives them**
+  (D-6 — the original `claude` sits at plain `token` on all three hosts, so
+  any convention needs a special case, and a wrong guess mints a
+  real-looking credential at a path nothing references; an entry the
+  literal one-line-inline-table parser cannot read is a *refusal*, never a
+  fallback); and **peer tokens still get no grace slot** (D-7 — a window is
+  a server-side affordance and `[peers.*.tokens]` is the client half; what
+  the gateway needs is the *ordering* the backend's window supplies, which
+  `docs/setup.md` now spells out). Adding `prev_token_file` is a config-shape
+  change, so it is a **restart**, not a SIGHUP — same trap as 018 D-3.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

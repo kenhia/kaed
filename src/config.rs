@@ -465,6 +465,20 @@ impl Config {
                 );
             }
         }
+        // Startup only, deliberately not in `resolve_identities`: whether a
+        // grace window exists is a property of the config *shape*, which
+        // SIGHUP cannot change (D-3), so repeating this on every reload
+        // would be noise about something no reload can have altered.
+        let ungraced = identities_without_grace_window(&self.auth);
+        if !ungraced.is_empty() {
+            tracing::warn!(
+                identities = ?ungraced,
+                "no prev_token_file: rotating these is a HARD CUT — the old token \
+                 stops authenticating the instant kaed reloads, and live sessions \
+                 401 until they restart. Add prev_token_file = \"<token_file>.prev\" \
+                 and restart (config shape, not a reload)"
+            );
+        }
         let identities = resolve_identities(&self.auth);
         let peers = self.resolve_peers(&host)?;
 
@@ -580,6 +594,20 @@ impl Config {
         }
         Ok(Some(peers))
     }
+}
+
+/// Identities whose rotation would be a hard cut: a reloadable `token_file`
+/// with no `prev_token_file` beside it.
+///
+/// `token_env` identities are excluded rather than overlooked — `resolve`
+/// refuses `prev_token_file` without `token_file`, so they cannot have a
+/// window at all, and their rotation already needs a restart for unrelated
+/// reasons (#914).
+pub fn identities_without_grace_window(auth: &BTreeMap<String, AuthEntry>) -> Vec<&str> {
+    auth.iter()
+        .filter(|(_, e)| e.token_file.is_some() && e.prev_token_file.is_none())
+        .map(|(author, _)| author.as_str())
+        .collect()
 }
 
 /// Read every identity's current (and grace) token from wherever it lives.
@@ -951,6 +979,29 @@ mod tests {
                 .to_string()
                 .contains("prev_token_file needs token_file")
         );
+    }
+
+    // The gap sprint 019 was filed about: eight of nine credentials were
+    // configured without a grace window across three sprints, and nothing
+    // said so — the only way anyone found out was reading three config
+    // files on three hosts. kaed now names them itself at startup.
+    #[test]
+    fn identities_without_a_grace_window_are_named() {
+        let cfg: Config = toml::from_str(
+            "[auth]\n\
+             with = { token_file = \"/t\", prev_token_file = \"/t.prev\" }\n\
+             without = { token_file = \"/u\" }\n\
+             enved = { token_env = \"E\" }\n",
+        )
+        .unwrap();
+        // `enved` is excluded, not overlooked: prev_token_file needs
+        // token_file, so an env identity cannot have a window at all.
+        assert_eq!(identities_without_grace_window(&cfg.auth), ["without"]);
+
+        let all: Config =
+            toml::from_str("[auth]\nc = { token_file = \"/t\", prev_token_file = \"/t.prev\" }\n")
+                .unwrap();
+        assert!(identities_without_grace_window(&all.auth).is_empty());
     }
 
     #[test]
