@@ -90,14 +90,33 @@ description = "scratch space"
 #
 # Generate the token with `deploy/new-token.sh` — never by hand, and never
 # somewhere it gets printed.
+#
+# Give EVERY identity a prev_token_file, before it ever needs one. It names
+# the grace-window slot `--rotate` writes the old value into, and without it
+# a rotation is a hard cut: the old token dies at reload and every live
+# session on it 401s. The file itself only exists while a rotation is in
+# flight, so declaring it costs nothing — and sprint 019 exists because
+# eight of nine fleet credentials were configured without one and nothing
+# said so until a human read three config files on three hosts. kaed now
+# warns at startup for any identity missing it; `--rotate` refuses.
 
 [auth]
-claude = { token_file = "~/.config/kaed/token" }
+claude = { token_file = "~/.config/kaed/token", prev_token_file = "~/.config/kaed/token.prev" }
 
-# During a rotation, `deploy/new-token.sh --rotate` writes the old value to
-# token.prev and it keeps working until you close the window. Uncomment to
-# enable the grace window:
-# claude = { token_file = "~/.config/kaed/token", prev_token_file = "~/.config/kaed/token.prev" }
+# One identity per client MACHINE, not per harness or per human (PD-7): the
+# credential is a file on a host, and that is what gets revoked. A backend
+# behind the kai gateway must list the authors that reach it *proxied*, even
+# though they never dial it directly.
+#
+# claude-kai   = { token_file = "~/.config/kaed/token-claude-kai",   prev_token_file = "~/.config/kaed/token-claude-kai.prev" }
+# claude-kubs0 = { token_file = "~/.config/kaed/token-claude-kubs0", prev_token_file = "~/.config/kaed/token-claude-kubs0.prev" }
+#
+# Mint and rotate those with `kaed-new-token --identity claude-kai`, which
+# reads the two paths above out of this file rather than guessing them.
+#
+# Adding or removing an identity — or adding prev_token_file to one — is a
+# change to the config *shape*, so it needs `systemctl --user restart kaed`.
+# SIGHUP only re-reads the token files of identities already known.
 
 [limits]
 max_read_bytes = 262144       # per-response byte budget

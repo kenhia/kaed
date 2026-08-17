@@ -73,8 +73,11 @@ Nothing in kaed is designed on the assumption that it is.
 
 - **A compromised or injected agent.** See above.
 - **A stolen token.** Tokens are bearer credentials with **no expiry**. A
-  leaked token is valid until you rotate it. (Rotation is non-breaking; see
-  [docs/setup.md](docs/setup.md).)
+  leaked token is valid until you rotate it. (Rotation is non-breaking when
+  the identity has a grace window configured, which the config template ships
+  by default and `kaed-new-token --rotate` refuses to proceed without — see
+  [docs/setup.md](docs/setup.md). Cutting a leaked token off *immediately* is
+  the one case where you want `--force`.)
 - **An untrusted network.** kaed binds loopback by default and expects to be
   fronted by something that provides transport security and network-level
   access control — the reference deployment uses `tailscale serve`. Do not

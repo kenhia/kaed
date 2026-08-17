@@ -147,6 +147,17 @@ directory is refused unconditionally.
 when you are ready to paste it into a client. This project's first token had
 to be rotated because it landed in a transcript.
 
+For any identity beyond the first, name it and let the script read its paths
+out of your config rather than inventing a filename:
+
+```sh
+kaed-new-token --identity claude-kai
+```
+
+It refuses an identity `[auth]` does not declare — minting to a path nothing
+references gives you a credential that authenticates nothing and looks
+exactly like one that does.
+
 ## 3. Write the config
 
 `install.sh` drops [`deploy/config.example.toml`](../deploy/config.example.toml)
@@ -340,7 +351,7 @@ fallback.
 | `peers.<host>.tokens.<identity>` | That identity's bearer token *for this peer* (`token_file` re-reads on `SIGHUP`; `token_env` needs a restart). The gateway proxies as the caller — an identity with no entry is refused, never impersonated. |
 | `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. **Adding a new identity is not** — see below. |
 | `auth.<identity>.token_env` | Alternative: an env var. Works, but **cannot be reloaded** — see [rotation](#rotating-a-token). |
-| `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. |
+| `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. **Set it on every identity**, before it is needed: without it a rotation is a hard cut, `kaed-new-token --rotate` refuses, and kaed warns at startup naming each identity that lacks one. |
 | `limits.*` | Response and file size budgets. |
 | `journal.path` | Defaults to `$XDG_DATA_HOME/kaed/journal.db`. |
 | `journal.retention_days` | Blob content retention. Metadata is kept forever — so past this window `journal` still shows what changed and when, while `diff`/`revert` can name a version they can no longer reconstruct (they say so, with the window, rather than returning an empty diff). |
@@ -362,6 +373,7 @@ of `[auth]` or `[peers]` needs `systemctl --user restart kaed`:
 |---|---|
 | New value in an existing token file | **yes** — this is what rotation uses |
 | New `[auth]` identity | no — restart |
+| Adding `prev_token_file` to an identity | no — restart |
 | New `[peers.<host>.tokens]` entry | no — restart |
 | New peer, or a changed peer `url` | no — restart |
 
@@ -587,9 +599,39 @@ kaed-new-token --close     # old token stops working
 host to still have a checkout. From a checkout, `./deploy/new-token.sh` is
 the same script.)
 
-`--rotate` requires `prev_token_file` to be set for that identity, or the old
-token dies immediately and the window buys you nothing. The script says so;
-it cannot edit your config for you.
+To rotate one of several identities, name it — the script reads that
+identity's `token_file` and `prev_token_file` out of `config.toml` instead of
+assuming the default pair:
+
+```sh
+kaed-new-token --identity claude-kai --rotate
+kaed-new-token --identity claude-kai --close
+```
+
+`--rotate` **refuses** unless `prev_token_file` is configured for that token,
+because without it the old value dies at reload and the window buys you
+nothing. The script cannot edit your config for you, so it stops and tells
+you the line to add. `--force` rotates anyway, deliberately cutting every
+live session off; it writes no `.prev` file, since one nothing honours is
+just a live-looking credential lying on disk.
+
+That refusal replaces a printed reminder that did not work: sprint 019 found
+eight of this fleet's nine credentials configured with no grace window at
+all. kaed also names them at startup now, so the state is visible from the
+host rather than by reading every config by hand:
+
+```
+WARN kaed::config: no prev_token_file: rotating these is a HARD CUT …
+     identities=["claude-kai", "claude-kubs0"]
+```
+
+**If the credential is consumed by a gateway, the rotation has two ends.**
+kai proxies to its peers as the caller (`[peers.<host>.tokens]`), so a
+backend identity's new value has to reach kai's copy too. Rotate on the
+backend, copy the new value into kai's peer-token file, `systemctl --user
+reload kaed` there, then `--close` on the backend. The grace window is
+exactly what makes that an ordered sequence you can take your time over
+rather than a race in which both orderings `401`.
 
 Longhand, which is what those two commands do:
 
