@@ -130,3 +130,22 @@ URLs intact — plus the agent-facing payoff, which is the reason the
 gateway exists at all: one connection and twelve tool schemas in the
 agent's context no matter how many machines join, instead of one MCP
 server per host.
+
+## Deployed
+
+2026-08-19 (UTC 2026-08-20), version `0.1.0-fdd8647` — the squash-merge
+commit of PR #24 — published to the package store and installed on all
+three hosts (kai, kubs0, kubsdb) with `install.sh --from-store`. Verified
+on each: binary version asserts equal to the published stamp,
+`check-config` clean, unit active, and an authenticated MCP `initialize`
+over the host's real URL returning the same build stamp.
+
+Smoke-tested the sprint's own fix against the deployed daemon on kai:
+`secret rotate` with primary `kai:scratch` and an `also` target on
+`kai:src` — the same-host cross-root shape that failed `unknown_root`
+before 020 — applied cleanly with the target in its own transaction
+(`targets[]` txn 108 vs primary 107, the D-1 discriminator live), both
+throwaway files landing on the same new digest. Files removed after.
+
+Rollback target: `0.1.0-9518bff` (the 019 build, still `kaed.prev` on
+every host and in the store).
