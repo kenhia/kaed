@@ -566,10 +566,15 @@ The lifecycle — four actions, none of which ever returns a value.
 - `rotate` → same shape (detected from the current value; undetectable
   refuses without an explicit `shape` — kaed does not guess, and
   provider-issued tokens are deliberately undetectable), new entropy.
-  Primary plus same-root `also` targets land in ONE transaction; targets
-  on other hosts are proxied writes under the caller's identity,
-  reported per-target (`targets[].applied/error`) — not atomic, and it
-  says so. Rotation's overwrite needs no `drop_keys`: it *is* the verb.
+  `also` targets land by class (020, #1231): primary plus same-root
+  targets in ONE transaction; a same-host target on another root as its
+  own local transaction (single-root by schema — not atomic with the
+  primary, and the response says so); targets on other hosts as proxied
+  writes under the caller's identity. All reported per-target
+  (`targets[].applied/error/txn_id` — `txn_id` equal to the top-level id
+  means atomic with the primary, a different id is this host's separate
+  transaction, absent means journaled on the target's own host).
+  Rotation's overwrite needs no `drop_keys`: it *is* the verb.
 - `occurrences` → every classified-dotenv entry on this host sealing the
   same value, by digest equality over redacted renderings; feeds
   `rotate.also`. Fleet-wide is deliberately not a second mechanism:

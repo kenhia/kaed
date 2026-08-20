@@ -232,8 +232,10 @@ pub fn generate(ctx: &Ctx<'_>, p: &GenerateParams<'_>) -> Result<GenerateResult>
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AlsoTarget {
-    /// Defaults to the primary's root. May name another host's root: the
-    /// gateway then writes it via peer mode (PD-3's rotate-both-places).
+    /// Defaults to the primary's root. May name another root: on the same
+    /// host it is written locally in its own transaction (020 D-3); on
+    /// another host the gateway writes it via peer mode (PD-3's
+    /// rotate-both-places).
     pub root: Option<String>,
     pub path: String,
     /// Defaults to the primary's key.
@@ -248,10 +250,20 @@ pub struct RotatedTarget {
     pub path: String,
     pub key: String,
     pub applied: bool,
-    /// Why, when `applied` is false (remote targets fail independently —
-    /// cross-host rotation is not atomic, and says so).
+    /// Why, when `applied` is false (targets beyond the primary's root
+    /// fail independently — rotation across roots is not atomic, and
+    /// says so).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<serde_json::Value>,
+    /// This host's transaction that wrote the target, when there is one
+    /// (020 D-1): equal to the top-level `txn_id` for same-root targets
+    /// (atomic with the primary); a different id for a same-host target
+    /// on another root, which gets its OWN transaction — a transaction is
+    /// single-root by schema, so it cannot join the primary's (D-3), and
+    /// this field is how the response says so. Absent for targets on
+    /// other hosts, which journal there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -268,9 +280,10 @@ pub struct RotateResult {
     pub placeholder: String,
     pub handle: Handle,
     pub handle_line: String,
-    /// Every location written (or attempted): primary first, then `also`
-    /// in request order. Local targets share `txn_id`; remote targets are
-    /// separate transactions on their own hosts, journaled there.
+    /// Every location written (or attempted): primary first, then
+    /// same-root `also` targets (sharing the primary's `txn_id`), then
+    /// same-host targets on other roots (each its own transaction), then
+    /// remote targets (transactions on their own hosts, journaled there).
     pub targets: Vec<RotatedTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
@@ -346,6 +359,7 @@ pub fn rotate_local(
         key: p.key.to_owned(),
         applied: true,
         error: None,
+        txn_id: None, // stamped with the shared txn after apply
     }];
     for t in p.also {
         if t.root.as_deref().is_some_and(|r| r != ctx.root.name) {
@@ -389,6 +403,7 @@ pub fn rotate_local(
             key: key.to_owned(),
             applied: true,
             error: None,
+            txn_id: None, // stamped with the shared txn after apply
         });
     }
     drop_keys.sort();
@@ -413,6 +428,9 @@ pub fn rotate_local(
         ctx.author,
         ctx.journal,
     )?;
+    for t in &mut targets {
+        t.txn_id = outcome.txn_id;
+    }
 
     for t in &targets {
         ctx.journal.add_secret_event(&SecretEvent {
@@ -452,6 +470,53 @@ pub fn rotate_local(
         },
         value,
     ))
+}
+
+/// The same-host sibling of the server's `write_value_to_peer` (#1231):
+/// write an already-minted value into one key of a LOCAL root as that
+/// root's own transaction, returning the txn id. A transaction is
+/// single-root by schema (`txns.root`), so a cross-root `also` target
+/// cannot join the primary's atomic write (020 D-3) — it lands here
+/// instead, ordered after it and able to fail independently, exactly the
+/// semantics a remote target already has minus the network. `ctx.root`
+/// is the TARGET root, not the rotation's primary.
+pub fn write_value_local(
+    ctx: &Ctx<'_>,
+    path: &str,
+    key: &str,
+    version: &str,
+    value: &str,
+    intent: Option<&str>,
+) -> Result<Option<i64>> {
+    let outcome = txn::apply(
+        ctx.root,
+        &EditRequest {
+            base: vec![BaseVersion {
+                path: path.to_owned(),
+                version: version.to_owned(),
+            }],
+            ops: vec![EditOp::EnvSet {
+                path: path.to_owned(),
+                key: key.to_owned(),
+                value: Some(value.to_owned()),
+                value_from: None,
+                comment: None,
+            }],
+            dry_run: false,
+            return_diff: false,
+            intent: Some(
+                intent
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("rotate {key} (cross-root, same host)")),
+            ),
+            drop_keys: vec![key.to_owned()],
+            allow_secrets: Vec::new(),
+        },
+        ctx.limits,
+        ctx.author,
+        ctx.journal,
+    )?;
+    Ok(outcome.txn_id)
 }
 
 // ----------------------------------------------------------- `occurrences`
@@ -1020,8 +1085,10 @@ mod tests {
             },
         )
         .unwrap();
-        // one txn, both files, same fresh value in both places
+        // one txn, both files, same fresh value in both places — and every
+        // target says so by carrying the shared txn id (020 D-1)
         assert_eq!(out.targets.len(), 2);
+        assert!(out.targets.iter().all(|t| t.txn_id == out.txn_id));
         let a = f.disk(".env");
         let b = f.disk("svc.env");
         let va = a

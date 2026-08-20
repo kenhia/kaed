@@ -1337,10 +1337,24 @@ impl KaedServer {
                  stat (R2: every mutation declares its base)",
             ));
         };
-        let (local_also, remote_also): (Vec<_>, Vec<_>) = p
+        // Three target classes, partitioned on the axis that decides how a
+        // write lands (#1231 — this used to compare whole root strings, so
+        // a same-host sibling root was classed remote and the peer path
+        // asked the executing host for itself as a peer):
+        //   same root             → joins the primary's atomic transaction;
+        //   same host, other root → a local write in its OWN transaction
+        //                           (single-root by schema, 020 D-3);
+        //   other host            → proxied to that peer under the caller.
+        let (local_also, elsewhere): (Vec<_>, Vec<_>) = p
             .also
             .into_iter()
             .partition(|t| t.root.as_deref().is_none_or(|r| r == p.root));
+        let (same_host_also, remote_also): (Vec<_>, Vec<_>) =
+            elsewhere.into_iter().partition(|t| {
+                t.root
+                    .as_deref()
+                    .is_some_and(|r| r.split_once(':').is_some_and(|(h, _)| h == self.state.host))
+            });
 
         let (mut result, value) = {
             let state = state.clone();
@@ -1376,6 +1390,76 @@ impl KaedServer {
                 Err(e) => return kaed_error_result(e),
             }
         };
+
+        for t in same_host_also {
+            let target_root = t.root.clone().expect("same-host targets carry a root");
+            let key = t.key.as_deref().unwrap_or(&p.key).to_owned();
+            let joined = {
+                let state = state.clone();
+                let author = author.0.clone();
+                let (root_name, path, key) = (target_root.clone(), t.path.clone(), key.clone());
+                let (version, intent) = (t.version.clone(), p.intent.clone());
+                let value = value.clone();
+                tokio::task::spawn_blocking(move || {
+                    let root = state.root(&root_name)?;
+                    let ctx = secret_tool::Ctx {
+                        root: &root,
+                        roots: &state.roots,
+                        limits: &state.limits,
+                        author: &author,
+                        journal: &state.journal,
+                        secrets: &state.secrets,
+                    };
+                    secret_tool::write_value_local(
+                        &ctx,
+                        &path,
+                        &key,
+                        &version,
+                        &value,
+                        intent.as_deref(),
+                    )
+                })
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("task panicked: {e}"), None))?
+            };
+            let (applied, error, txn_id) = match joined {
+                Ok(txn_id) => {
+                    // A second `rotate` row on this host, never `transport`:
+                    // the value never left it (020 D-2).
+                    let _ = state.journal.add_secret_event(&SecretEvent {
+                        author: &author.0,
+                        action: "rotate",
+                        root: &target_root,
+                        path: &t.path,
+                        key: &key,
+                        old_digest: result.old_digest.as_deref(),
+                        new_digest: result.new_digest.as_deref(),
+                        disclosed: false,
+                        destination: None,
+                        txn_id,
+                        intent: p
+                            .intent
+                            .as_deref()
+                            .map(secrets::redact_free_text)
+                            .as_deref(),
+                    });
+                    (true, None, txn_id)
+                }
+                Err(e) => (
+                    false,
+                    Some(serde_json::to_value(&e).unwrap_or_default()),
+                    None,
+                ),
+            };
+            result.targets.push(secret_tool::RotatedTarget {
+                root: target_root,
+                path: t.path,
+                key,
+                applied,
+                error,
+                txn_id,
+            });
+        }
 
         for t in remote_also {
             let target_root = t.root.clone().expect("remote targets carry a root");
@@ -1419,6 +1503,7 @@ impl KaedServer {
                 key,
                 applied,
                 error,
+                txn_id: None, // journaled on the target's own host
             });
         }
         drop(value); // zeroized (PD-3)
