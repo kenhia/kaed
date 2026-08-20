@@ -118,3 +118,15 @@ What changed in `docs/kaed-explained.html`:
   deny-vs-classify split) and the SVG's refused box. The dogfood-report
   row was also updated honestly: the usage report exists and is
   re-runnable, the ssh head-to-head is still owed.
+
+Ken's review caught one more: the fleet section ("One instance per
+machine, no coordination") read as if the hosts don't know about each
+other, which the gateway makes false. Reworked in place — the header is
+now "one front door", the independence story stays as the foundation
+(nothing shared, nothing to agree), and two paragraphs layer the gateway
+on top: proxying under the caller's own identity with per-caller
+credentials and no impersonation, gateway-as-convenience with direct
+URLs intact — plus the agent-facing payoff, which is the reason the
+gateway exists at all: one connection and twelve tool schemas in the
+agent's context no matter how many machines join, instead of one MCP
+server per host.

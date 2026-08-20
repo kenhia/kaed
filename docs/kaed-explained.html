@@ -896,7 +896,7 @@ figcaption {
   <div class="wrap">
     <p class="eyebrow">Deployment</p>
     <div class="prose">
-      <h2>One instance per machine, no coordination</h2>
+      <h2>One instance per machine, one front door</h2>
       <p class="dim">
         Each host runs its own daemon with its own roots, its own journal, and
         its own tokens. Nothing is shared, so nothing has to agree. Roots are
@@ -904,6 +904,23 @@ figcaption {
         each daemon also states which hosts are <em>supposed</em> to be
         running one, so a machine deliberately left out never looks like a
         rollout that failed.
+      </p>
+      <p class="dim">
+        On top of that independence, one host acts as the gateway. A call
+        naming another host's root is forwarded to that host's daemon and
+        journaled there — under the caller's own identity, using a credential
+        issued to that caller for that host. No shared state and no
+        impersonation: a caller without a credential for the target is
+        refused, never proxied as someone else. The gateway is a convenience,
+        not a dependency — every daemon still answers at its own URL.
+      </p>
+      <p class="dim">
+        The reason to bother is the client. Tool definitions are context an
+        agent pays for, so three hosts wired directly would mean three MCP
+        servers and three copies of every tool schema in the agent's window.
+        Through the gateway it is one connection and twelve tools no matter
+        how many machines join — the root name already says where the work
+        happens.
       </p>
     </div>
 
