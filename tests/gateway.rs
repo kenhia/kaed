@@ -29,20 +29,42 @@ async fn start_instance(
     auth_spec: BTreeMap<String, AuthEntry>,
     peers: Option<Vec<Peer>>,
 ) -> anyhow::Result<Instance> {
+    start_instance_with_roots(host, vec![], identities, auth_spec, peers).await
+}
+
+/// `start_instance` plus extra roots beyond `{host}:scratch` — each a
+/// local root name and an existing directory the caller keeps alive.
+/// Every fixture host having exactly ONE root is how #1231 (an `also`
+/// target on the same host but a different root) stayed inexpressible in
+/// this file until sprint 020.
+async fn start_instance_with_roots(
+    host: &str,
+    extra_roots: Vec<(&str, std::path::PathBuf)>,
+    identities: Vec<Identity>,
+    auth_spec: BTreeMap<String, AuthEntry>,
+    peers: Option<Vec<Peer>>,
+) -> anyhow::Result<Instance> {
     let workdir = tempfile::tempdir()?;
     let workdir_path = workdir.path().canonicalize()?;
     std::fs::write(
         workdir_path.join("hello.txt"),
         "fn old_name() {\n    body\n}\n",
     )?;
+    let mut roots = vec![ResolvedRoot {
+        description: Some(format!("{host} scratch")),
+        ..ResolvedRoot::with_default_classify(format!("{host}:scratch"), workdir_path.clone())
+    }];
+    for (name, path) in extra_roots {
+        roots.push(ResolvedRoot::with_default_classify(
+            format!("{host}:{name}"),
+            path,
+        ));
+    }
     let resolved = Resolved {
         bind: "127.0.0.1:0".parse()?,
         allowed_hosts: vec![],
         host: host.into(),
-        roots: vec![ResolvedRoot {
-            description: Some(format!("{host} scratch")),
-            ..ResolvedRoot::with_default_classify(format!("{host}:scratch"), workdir_path.clone())
-        }],
+        roots,
         peers,
         identities,
         limits: Limits::default(),
@@ -86,8 +108,17 @@ fn identity(author: &str, token: &str) -> Identity {
 /// credential for it in a rotatable file — and a ghcp identity that has
 /// deliberately NO beta credential.
 async fn start_pair() -> anyhow::Result<(Instance, Instance, tempfile::TempDir)> {
-    let beta = start_instance(
+    start_pair_with_beta_roots(vec![]).await
+}
+
+/// `start_pair` with extra roots on beta — the two-root peer #1231's
+/// regression test needs.
+async fn start_pair_with_beta_roots(
+    beta_extra_roots: Vec<(&str, std::path::PathBuf)>,
+) -> anyhow::Result<(Instance, Instance, tempfile::TempDir)> {
+    let beta = start_instance_with_roots(
         "beta",
+        beta_extra_roots,
         vec![identity("claude", "tok-beta-claude")],
         BTreeMap::new(),
         None,
@@ -1002,6 +1033,100 @@ async fn rotate_writes_both_hosts_via_a_remote_also_target() -> anyhow::Result<(
     let direct = connect(beta.addr, "tok-beta-claude").await?;
     let beta_journal = structured(&call(&direct, "journal", json!({})).await);
     assert_eq!(beta_journal["entries"][0]["author"], "claude");
+
+    let _ = gw.cancel().await;
+    let _ = direct.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// #1231 (sprint 020): an `also` target on the SAME host as the primary
+/// but a DIFFERENT root used to be classed remote by the whole-root-string
+/// partition — `write_value_to_peer` then asked the executing host for
+/// itself as a peer, got `None`, and refused with an `unknown_root` that
+/// listed the root it claimed not to serve. The fix routes it as a local
+/// write in its own transaction: applied independently, reported
+/// per-target with its OWN `txn_id` (020 D-1/D-3), journaled as a second
+/// `rotate` row and never a `transport` row, because the value never
+/// left the host (020 D-2).
+#[tokio::test]
+async fn rotate_writes_a_same_host_cross_root_also_target_locally() -> anyhow::Result<()> {
+    const VALUE: &str = "b7f3a9d2c8e14f60b7f3a9d2c8e14f60";
+    let etc = tempfile::tempdir()?;
+    let etc_path = etc.path().canonicalize()?;
+    std::fs::write(etc_path.join("svc.env"), format!("SHARED_TOKEN={VALUE}\n"))?;
+    let (alpha, beta, _secrets) =
+        start_pair_with_beta_roots(vec![("etc", etc_path.clone())]).await?;
+    std::fs::write(
+        beta.workdir_path.join(".env"),
+        format!("SHARED_TOKEN={VALUE}\n"),
+    )?;
+    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+
+    let version = kaed::fsops::version_of(format!("SHARED_TOKEN={VALUE}\n").as_bytes());
+    let rotated = call(
+        &gw,
+        "secret",
+        json!({
+            "action": "rotate", "root": "beta:scratch", "path": ".env",
+            "key": "SHARED_TOKEN", "version": version,
+            "also": [{"root": "beta:etc", "path": "svc.env", "version": version}],
+        }),
+    )
+    .await;
+    assert_ne!(
+        rotated.is_error,
+        Some(true),
+        "{:?}",
+        rotated.structured_content
+    );
+    let r = structured(&rotated);
+
+    // Per-target report: the primary shares the top-level txn_id; the
+    // cross-root target applied in its own transaction and says which.
+    let targets = r["targets"].as_array().unwrap();
+    assert_eq!(targets.len(), 2, "{r}");
+    assert_eq!(targets[0]["txn_id"], r["txn_id"], "{r}");
+    assert!(targets[1]["applied"].as_bool().unwrap(), "{r}");
+    assert!(targets[1]["txn_id"].is_i64(), "{r}");
+    assert_ne!(targets[1]["txn_id"], r["txn_id"], "{r}");
+
+    // Both files hold the same new value, and the response never held it.
+    let on_scratch = std::fs::read_to_string(beta.workdir_path.join(".env"))?;
+    let on_etc = std::fs::read_to_string(etc_path.join("svc.env"))?;
+    let new_value = on_scratch
+        .lines()
+        .find_map(|l| l.strip_prefix("SHARED_TOKEN="))
+        .expect("rotated key");
+    assert_ne!(new_value, VALUE);
+    assert_eq!(
+        on_etc.lines().find_map(|l| l.strip_prefix("SHARED_TOKEN=")),
+        Some(new_value)
+    );
+    assert!(
+        !serde_json::to_string(&r)?.contains(new_value),
+        "the rotate response leaked the value"
+    );
+
+    // beta journaled one rotate row per location and NO transport; the
+    // gateway's secret stream stays empty — the value never touched alpha.
+    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let stream = structured(&call(&direct, "journal", json!({"kind": ["secret"]})).await);
+    let mut rows: Vec<(&str, &str)> = stream["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["action"].as_str().unwrap(), e["root"].as_str().unwrap()))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        [("rotate", "beta:etc"), ("rotate", "beta:scratch")],
+        "{stream}"
+    );
+    let on_gateway = structured(&call(&gw, "journal", json!({"kind": ["secret"]})).await);
+    assert_eq!(on_gateway["entries"].as_array().unwrap().len(), 0);
 
     let _ = gw.cancel().await;
     let _ = direct.cancel().await;

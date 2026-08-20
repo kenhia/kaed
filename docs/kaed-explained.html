@@ -793,7 +793,7 @@ figcaption {
           <path d="M642 182 V 214" class="svg-line"/>
           <rect x="566" y="218" width="150" height="66" rx="3" class="svg-box"/>
           <text x="584" y="244" class="svg-t--k">refused</text>
-          <text x="584" y="263" class="svg-t--sm">.ssh · .env · *.pem</text>
+          <text x="584" y="263" class="svg-t--sm">.ssh · .aws · .netrc</text>
           <text x="584" y="278" class="svg-t--sm">kaed's own config</text>
 
           <!-- journal -->
@@ -809,7 +809,10 @@ figcaption {
         happens; every path is resolved against the configured roots and the
         deny list before it touches disk; every applied transaction — and
         every failed one — lands in the journal under the identity that made
-        it.
+        it. This is the simple case: one agent, one host. The same connection
+        also reaches the rest of the fleet — a call naming another host's
+        root is proxied to that host's daemon under the caller's own
+        identity, and journaled there.
       </figcaption>
     </figure>
   </div>
@@ -841,7 +844,7 @@ figcaption {
         <span class="bar"></span>
         <div>
           <h3>Default deny globs</h3>
-          <p><code>.ssh</code>, <code>.gnupg</code>, <code>.aws</code>, <code>.env</code>, <code>*.pem</code>, <code>id_*</code> and friends — matched against a path and every one of its ancestors.</p>
+          <p><code>.ssh</code>, <code>.gnupg</code>, <code>.aws</code>, <code>.netrc</code>, <code>.git-credentials</code> and friends — credential stores, matched against a path and every one of its ancestors. Secret-bearing <em>files</em> (<code>.env*</code>, <code>*.pem</code>, <code>id_*</code>) are deliberately not here: they classify instead — served redacted or refused as opaque, edited through typed ops — because a file agents can never touch is a file agents route around.</p>
           <span class="hard">on unless you turn them off</span>
         </div>
       </div>
@@ -893,7 +896,7 @@ figcaption {
   <div class="wrap">
     <p class="eyebrow">Deployment</p>
     <div class="prose">
-      <h2>One instance per machine, no coordination</h2>
+      <h2>One instance per machine, one front door</h2>
       <p class="dim">
         Each host runs its own daemon with its own roots, its own journal, and
         its own tokens. Nothing is shared, so nothing has to agree. Roots are
@@ -901,6 +904,23 @@ figcaption {
         each daemon also states which hosts are <em>supposed</em> to be
         running one, so a machine deliberately left out never looks like a
         rollout that failed.
+      </p>
+      <p class="dim">
+        On top of that independence, one host acts as the gateway. A call
+        naming another host's root is forwarded to that host's daemon and
+        journaled there — under the caller's own identity, using a credential
+        issued to that caller for that host. No shared state and no
+        impersonation: a caller without a credential for the target is
+        refused, never proxied as someone else. The gateway is a convenience,
+        not a dependency — every daemon still answers at its own URL.
+      </p>
+      <p class="dim">
+        The reason to bother is the client. Tool definitions are context an
+        agent pays for, so three hosts wired directly would mean three MCP
+        servers and three copies of every tool schema in the agent's window.
+        Through the gateway it is one connection and twelve tools no matter
+        how many machines join — the root name already says where the work
+        happens.
       </p>
     </div>
 
@@ -920,10 +940,10 @@ figcaption {
         <span class="role">Second host, installed from the same published bundle rather than a hand-built one. No checkout on it at all. Its own agent talks to the gateway, not to the daemon under its feet.</span>
         <span class="state">live</span>
       </div>
-      <div class="host host--planned">
+      <div class="host host--live">
         <span class="name">kubsdb</span>
-        <span class="role">Database host — deliberately <em>without</em> an instance until broad access next to live data is a decision rather than a default. That is why the fleet is declared, not inferred.</span>
-        <span class="state">deferred by design</span>
+        <span class="role">Database host. Joined last and deliberately late — broad access next to live data was made a decision rather than a default: one wide <code>/datastore</code> root with the data directories and the package store denied by shape, and rendered config labeled with where it is managed from.</span>
+        <span class="state">live</span>
       </div>
     </div>
   </div>
@@ -936,29 +956,40 @@ figcaption {
     <div class="prose">
       <h2>Early beta, and honest about it</h2>
       <p class="dim">
-        Six tools — <code>roots</code>, <code>stat</code>, <code>list</code>,
-        <code>read</code>, <code>search</code>, <code>edit</code> — working
-        end to end from a remote agent, on two hosts, used every day by the
-        person who wrote it and essentially nobody else.
+        Twelve tools — <code>roots</code>, <code>stat</code>, <code>list</code>,
+        <code>read</code>, <code>search</code>, <code>edit</code>, history
+        (<code>diff</code>, <code>journal</code>, <code>revert</code>),
+        <code>feedback</code>, and a secret lifecycle (<code>secret</code>,
+        <code>secret_reveal</code>) — working end to end from a remote agent,
+        on three hosts, used every day by the person who wrote it and
+        essentially nobody else.
       </p>
     </div>
 
     <div class="status reveal">
       <div class="row row--done">
         <span class="when">shipped</span>
-        <span class="what"><b>Walking skeleton.</b> The six tools, versioned reads, atomic apply, the journal, bearer auth over streamable HTTP. Deployed and verified from a remote agent.</span>
+        <span class="what"><b>Walking skeleton.</b> The first six tools, versioned reads, atomic apply, the journal, bearer auth over streamable HTTP. Deployed and verified from a remote agent.</span>
       </div>
       <div class="row row--done">
         <span class="when">shipped</span>
         <span class="what"><b>Blast-radius hardening.</b> Everything the first live test exposed: the deny list, self-describing 401s, failed transactions in the journal, real blob retention, non-breaking token rotation.</span>
       </div>
-      <div class="row row--now">
-        <span class="when">next</span>
-        <span class="what"><b>Fleet deploy.</b> More than one host, and an install you can repeat.</span>
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>Fleet deploy.</b> One published bundle in a package store; every host installs that. Three hosts, no checkout or toolchain on two of them.</span>
       </div>
-      <div class="row row--now">
-        <span class="when">next</span>
-        <span class="what"><b>History tools.</b> <code>journal</code>, <code>diff</code>, <code>revert</code>. The data is already being written; nothing reads it yet.</span>
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>History tools.</b> <code>journal</code>, <code>diff</code>, <code>revert</code> — the data was already being written; now it reads back through the contract, plus a <code>feedback</code> tool wired into every error.</span>
+      </div>
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>Secrets.</b> Dotenv files are classified, not denied: served redacted, edited through typed ops, rotated by a lifecycle that never hands the agent a value — and writes elsewhere are scanned so a known secret can't quietly land in an ordinary file.</span>
+      </div>
+      <div class="row row--done">
+        <span class="when">shipped</span>
+        <span class="what"><b>Gateway.</b> One connection reaches the fleet: a call naming another host's root is proxied under the caller's own identity and journaled on the host that serves it — never impersonated, never silently rerouted.</span>
       </div>
       <div class="row row--now">
         <span class="when">next</span>
@@ -966,7 +997,7 @@ figcaption {
       </div>
       <div class="row">
         <span class="when">the test</span>
-        <span class="what"><b>The dogfood report.</b> A written comparison against ssh-piping and mounts on real tasks: round-trips, failures, token cost. Until that exists, "kaed is better" is a hypothesis.</span>
+        <span class="what"><b>The dogfood report.</b> A usage report now exists — every call journaled, analyzed, re-runnable from the journal itself. The head-to-head against ssh-piping and mounts (round-trips, failures, token cost) is still owed; until then, "kaed is better" is a hypothesis.</span>
       </div>
     </div>
   </div>
