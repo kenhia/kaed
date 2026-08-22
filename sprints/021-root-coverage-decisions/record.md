@@ -165,3 +165,24 @@ PD-9's limit. kaed would not have helped here: a commit message is not a file
 in a root, so this is squarely in the "kaed does not cover X — for those, do Y"
 list that slice 2 is about to write. Worth handing over as a concrete example
 rather than a category.
+
+### No fleet deploy, deliberately
+
+`/sprint-ship` Phase 7 was **skipped**, so the fleet stays on
+`0.1.0 (fdd8647 2026-08-19)` while `main` is `0484c84`. That gap is a decision,
+not a missed step.
+
+Nothing code-bearing changed: `git diff --name-only fdd8647..main` is two sprint
+records, `sprints/planning/decisions.md` and a local skill file that is not in
+the deploy bundle. `src/`, `Cargo.toml`, `Cargo.lock`, `deploy/` and `build.rs`
+are untouched, so a published bundle would differ from the running one only in
+its embedded commit stamp — bought at the price of restarting kaed on three
+hosts and dropping every live MCP session.
+
+What this sprint actually changed *is* live: the root came from a k-homelab
+config change applied directly to kubs0, which needs no new binary.
+
+Redeploy on the next sprint that touches code. If a provenance check ever reads
+the lag as a stale install, this paragraph is the answer — and note the honest
+limit of `min_build_date` here: it cannot distinguish "behind main because
+nothing needed shipping" from "behind main because a deploy was missed".
