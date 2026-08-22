@@ -32,7 +32,7 @@ convenience copy and is allowed to be wrong; the daemon is not.
 | Host | Roots (host-qualified since 007) | Notes |
 |---|---|---|
 | `kai` | `kai:src`, `kai:scratch` | the build/publish host — the only clone |
-| `kubs0` | `kubs0:src`, `kubs0:k-homelab` | `secrets/` denied; **no checkout** |
+| `kubs0` | `kubs0:src`, `kubs0:k-homelab`, `kubs0:scratch` | `secrets/` denied; **no checkout**; `scratch` added in 021 (PD-8) |
 | `kubsdb` | `kubsdb:datastore`, `kubsdb:hvsim`, `kubsdb:src` | in the fleet since 013; **no checkout**; data dirs + the package store denied by config |
 
 **kubsdb also hosts the store it installs from** — sprint 013's broad-access

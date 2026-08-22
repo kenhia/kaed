@@ -306,3 +306,134 @@ A backend must list authors that never dial it, because they arrive proxied.
 `config.rs` already refuses to start on the converse mistake — a
 `[peers.x.tokens]` entry for an author absent from `[auth]` — on the grounds
 that nobody can authenticate as an identity the host does not know.
+
+---
+
+## PD-8 — Root a scratch directory where one exists and is used; never invent one
+
+*2026-08-22. Sprint 021 (korg #1560). Reverses the `scratch` half of sprint
+004's D1 on the grounds that its stated premise expired.*
+
+kai has had `kai:scratch` since sprint 001. kubs0 has not, and sprint 004's
+D1 gave a reason: *"there is no scratch directory there, and inventing one to
+match kai would be symmetry for its own sake."*
+
+That reason was correct when written and is no longer true. `/home/ken/scratch`
+exists on kubs0 as of 2026-08-20, `ken:ken 0775`, created by a real session
+doing real work — the same session (korg k-homelab WI-1503) that authored ~12
+files across kai and kubs0 and made **zero kaed calls**. So the decision is not
+being overturned because symmetry became more appealing. It is being re-taken
+because the fact it rested on changed.
+
+**Decided: `kubs0:scratch` → `/home/ken/scratch`. kubsdb still gets none** —
+it has no `~/scratch`, so 004's rationale holds there verbatim, and that is the
+rule generalised: *root a scratch directory where one exists and is used.* An
+empty asymmetry needs no defence; a root pointing at a directory nobody uses is
+the thing 004 was right to refuse.
+
+Two things this closes that pure symmetry would not have:
+
+- **`kai:scratch` is load-bearing, not decorative.** Its four journalled
+  transactions are all fleet verification: the 011 secret smoke test, the 012
+  leak-detection refusal, the 018 cross-host live test and the 020 rotate smoke
+  test. It is where a deploy proves itself against a target that is not
+  somebody's repo.
+- **kubs0 had nowhere to do that, so it reached back to kai.** The 018 live
+  test wrote `.kaed-018-from-kubs0.md` into `kai:scratch` as `claude-kubs0` —
+  correct behaviour for what it was testing, but it is also the only writable
+  non-repo target kubs0 could address. Without this root, a kubs0-local smoke
+  write has to land in `kubs0:src` or `kubs0:k-homelab`, i.e. in a real
+  checkout.
+
+**The generalisable finding, which is the part worth carrying forward:**
+partial coverage of a *symmetric* task selects against kaed harder than no
+coverage would. Faced with "kaed for kai's copy, ssh for kubs0's identical
+copy", an agent takes the single route that covers both, and it takes it for
+the whole task — including the half kaed did cover. A gap in one host's roots
+is therefore not a local cost; it is a fleet-wide one, discounted by how often
+work is host-symmetric. Weigh new roots that way.
+
+Mechanics, because they bite: `roots` are owned as an exact set by k-homelab's
+`kaed-service` recipe from `manifests/<host>.yml`, so a hand-added root is
+**deleted** on the next apply — the declaration goes in the manifest. And roots
+are resolved once at startup, so landing it is a **restart**, not a SIGHUP,
+which drops every live session on that host. Same trap as PD-7's companion
+(018 D-3) and 019's `prev_token_file`.
+
+---
+
+## PD-9 — `~/.config/systemd/user/` is out of scope: it is a deploy target, not a source
+
+*2026-08-22. Sprint 021 (korg #1560). The second of the two root questions
+#1560 raised, and the one that was genuinely open.*
+
+Agent-authored user units are a real recurring pattern, not a hypothetical:
+WI-1503 created `copyparty-trial.service` on two hosts through three iterations
+(`setsid` → transient `systemd-run` → enabled unit), every one of them editing
+a unit definition over unverified ssh. The case for a root is the one kaed was
+built on — config-as-text on a managed host, where the alternative is the
+base64/heredoc route that is a known failure mode and where an `ExecStart` typo
+is exactly what a verified diff catches.
+
+**Decided: no root. Not primarily on blast-radius grounds — on
+source-of-truth grounds.**
+
+`~/.config/systemd/user/` is a **rendered install target on every host in the
+fleet**, and k-homelab's recipes say so in as many words:
+
+| Unit | Source of truth | Already in a root? |
+|---|---|---|
+| `kaed.service` | kaed's published bundle, from this repo's `deploy/` | `kai:src` |
+| `kfdc-curator.{service,timer}` | `~/src/tools/kfdc/systemd/` | `kai:src` |
+| `kdeskdash-claude-poll.{service,timer}` | kdeskdash's package-store bundle | `kai:src` |
+| `kpidash-client.service` | rendered by `recipes/kpidash-client/apply.sh` | `kubs0:k-homelab` |
+
+The recipes assert the installed copies match their source and **reinstall when
+they do not**. So an edit made there through kaed is overwritten on the next
+`bin/apply`, and in the meantime the host copy is out of sync with the repo
+that owns it. That is precisely the shape sprint 004's D1 refused for kubsdb:
+*"editing those in place through kaed would put the host copy out of sync with
+the repo, which is worse than not being able to edit them."* Nothing new is
+being decided here; an existing principle is being applied to a directory
+nobody had looked at through it.
+
+**So this is a routing answer, not a reach gap.** Every unit's source is
+already addressable through kaed today. The agent that edited units over ssh
+was not blocked by kaed's roots — it was editing the wrong copy, and a root
+would have let it do so more conveniently.
+
+The rejected alternative was to root it *with a warning*, the way 013 rooted
+`kubsdb:hvsim` and `kubsdb:datastore` as declared deploy targets carrying an
+"edit the source" `description` (surfaced since 014 D-3 as `root_advisory`).
+That precedent does not transfer, for two reasons:
+
+1. **Those roots existed because nothing else on the host was addressable.**
+   Live triage of a running service had no other route. Here every source is
+   already in a root, so the advisory would buy a convenience that has no
+   correct use.
+2. **kaed's own launch vector lives in this directory.** `kaed.service` carries
+   `ExecStart=%h/.local/bin/kaed serve`, and kaed runs as a systemd *user*
+   service as `ken` with linger on. `deny.rs`'s first layer is non-configurable
+   specifically so kaed "can never serve or rewrite its own credential"; the
+   binary it execs at boot belongs in the same class. And the hole cannot be
+   closed lexically — denying `kaed.service` leaves every other enabled unit
+   (`kvllm`, `kfdc-curator.timer`, `kdeskdash-claude-poll.timer`) reaching
+   execution at its next timer fire.
+
+#1560 argues the status quo is not neutral — agents edit these over ssh with
+the same blast radius and no journal — and that is fair as far as it goes. But
+it assumes the caller already has a shell. **The set of kaed callers is larger
+than the set with ssh**, and the identity kaed was built for is exactly the
+counterexample: Desktop Claude on cleo has kaed and no exec at all. For that
+caller a root here is not a wash on blast radius, it is a new capability —
+boot-time execution as `ken` — granted to the one client deliberately without
+one.
+
+**What replaces it, and it must be said out loud rather than left as a
+silence:** a unit worth surviving a reboot is worth an owner. Author it in the
+owning repo under `kai:src` / `kubs0:src` / `kubs0:k-homelab` — all roots — and
+install it from there. A genuinely throwaway unit (`copyparty-trial.service`
+was one) is throwaway precisely because nothing owns it, and if it stops being
+throwaway the first step is giving it a home, not editing it in place. This is
+input to the agent-skills slice (korg #1559 / proposal 1562), whose "kaed does
+not cover X — for those, do Y" list is where an agent will actually read it.
