@@ -124,3 +124,44 @@ No kaed source changed; `just check` is unaffected but was run.
   from here: the root list gains `kubs0:scratch`, and its "kaed does not cover
   X — for those, do Y" list gains `~/.config/systemd/user/` with PD-9's
   routing answer attached, not just the exclusion.
+
+## Deployed
+
+**2026-08-22.** kubs0 only — no kaed binary changed, so there was no fleet
+deploy. What landed:
+
+- **k-homelab `497f4bf`** (`chore(1560): declare the kubs0 scratch root`),
+  committed on `main` and pushed. `manifests/kubs0.yml` + the
+  `kaed-service` README roots table.
+- **`bin/apply kubs0 kaed-service`** → `changed`, with the recipe's own
+  warning that it was restarting the daemon because kaed reads config only at
+  startup.
+
+Verified live, not assumed:
+
+| Check | Result |
+|---|---|
+| `bin/audit kubs0 kaed-service` | `ok` (was `WOULD CHANGE — config has no root 'scratch'`) |
+| `kaed check-config` on kubs0 | lists `kubs0:scratch /home/ken/scratch` |
+| `systemctl --user is-active kaed` | `active` |
+| `roots` from kai through the gateway | `kubs0:scratch` present, `description` carried through |
+| write through the new root | `create kaed-021-smoke.md` on **both** `kubs0:scratch` and `kai:scratch`, from kai, as `claude-kai` — txn 31 (kubs0) and 142 (kai) |
+
+The last one is the one that mattered: the symmetric two-host write that
+started this WI, done through one route this time. Both smoke files removed
+afterwards; the journal is the durable record.
+
+## One thing worth keeping, from doing the work
+
+The k-homelab commit was first attempted by inlining the message through a
+quoted `ssh` heredoc. It committed a **mangled, truncated message** — the body
+cut off after one line and `004's` came through as `004s`, the apostrophe eaten
+by the layered quoting. Amended via the `base64 -w0 | ssh 'base64 -d'` route the
+global CLAUDE.md prescribes, verified by matching md5.
+
+That is WI-1503's "heredoc that broke on apostrophes" reproducing verbatim,
+inside the sprint filed to answer WI-1503 — and it is a good illustration of
+PD-9's limit. kaed would not have helped here: a commit message is not a file
+in a root, so this is squarely in the "kaed does not cover X — for those, do Y"
+list that slice 2 is about to write. Worth handing over as a concrete example
+rather than a category.
