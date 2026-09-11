@@ -1502,6 +1502,7 @@ mod tests {
             intent: Some("retry from a stale base".into()),
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         };
         let err = txn::apply(&root, &stale, &Limits::default(), "claude", &j).unwrap_err();
         assert_eq!(err.code, ErrorCode::VersionConflict);
@@ -1573,6 +1574,7 @@ mod tests {
             intent: None,
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         };
         // one success, then two attempts still holding the pre-edit version
         txn::apply(&root, &edit(&good, "second"), &Limits::default(), "a", &j).unwrap();
@@ -1616,6 +1618,7 @@ mod tests {
             intent: None,
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         };
         assert!(txn::apply(&root, &req, &Limits::default(), "claude", &j).is_err());
         let n: i64 = j
@@ -1689,6 +1692,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1697,7 +1701,7 @@ mod tests {
         .unwrap();
 
         // both blobs exist, both are redacted renderings, flagged as such
-        let new_v = &out.files[0].new_version;
+        let new_v = out.files[0].new_version.as_ref().unwrap();
         for version in [&v, new_v] {
             let (blob, redacted) = TxnRecorder::blob(&j, version).expect("blob retained");
             assert!(redacted, "blob for {version} not flagged redacted");
@@ -1776,6 +1780,7 @@ mod tests {
             intent: None,
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         };
 
         let out = txn::apply(

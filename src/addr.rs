@@ -111,7 +111,9 @@ pub fn find_anchor(content: &str, anchor: &str) -> Vec<AnchorHit> {
 }
 
 /// Resolve an anchor to exactly one hit. `occurrence` is 1-based; without
-/// it, more than one match is `ambiguous_anchor` (R4: candidates in data).
+/// it, more than one match is `ambiguous_anchor` (R4: candidates in data —
+/// each with its line's content since 022, so the error can be acted on
+/// without a second read).
 pub fn resolve_anchor(
     content: &str,
     anchor: &str,
@@ -125,10 +127,11 @@ pub fn resolve_anchor(
     match (hits.len(), occurrence) {
         (0, _) => Err(KaedError::anchor_not_found(path)),
         (1, None) => Ok(hits[0]),
-        (_, None) => Err(KaedError::ambiguous_anchor(AmbiguousAnchorData {
-            path: path.to_owned(),
-            occurrences: hits.iter().map(|h| h.line).collect(),
-        })),
+        (_, None) => Err(KaedError::ambiguous_anchor(AmbiguousAnchorData::new(
+            path,
+            Lines::split(content).as_slice(),
+            &hits.iter().map(|h| h.line).collect::<Vec<_>>(),
+        ))),
         (n, Some(o)) => {
             if o == 0 || o > n {
                 return Err(KaedError::invalid_input(format!(
@@ -235,12 +238,62 @@ mod tests {
         assert_eq!(err.code, ErrorCode::AnchorNotFound);
     }
 
+    /// The whole point of 022 D-1: the payload has to be pickable *from*,
+    /// not merely indicative. A line number alone sent agents guessing at a
+    /// range around it, which cost two reads instead of one.
     #[test]
-    fn resolve_anchor_ambiguous_lists_lines() {
-        let err = resolve_anchor("dup\nx\ndup\n", "dup", None, "f.txt").unwrap_err();
+    fn resolve_anchor_ambiguous_carries_each_line_content() {
+        let err = resolve_anchor("dup here\nx\ndup there\n", "dup", None, "f.txt").unwrap_err();
         assert_eq!(err.code, ErrorCode::AmbiguousAnchor);
         let data = err.data.unwrap();
-        assert_eq!(data["occurrences"], serde_json::json!([1, 3]));
+        assert_eq!(data["total"], 2);
+        assert_eq!(data["truncated"], false);
+        assert_eq!(
+            data["occurrences"],
+            serde_json::json!([
+                {"line": 1, "text": "dup here"},
+                {"line": 3, "text": "dup there"},
+            ])
+        );
+        assert!(
+            data["hint"].as_str().unwrap().contains("occurrence"),
+            "the hint names the field that resolves this"
+        );
+    }
+
+    /// Truncation is explicit, never silent — a core invariant — and the
+    /// hint changes to name `search`, which answers in one call where a
+    /// guessed range costs two.
+    #[test]
+    fn resolve_anchor_ambiguous_caps_occurrences_and_says_so() {
+        let content = "dup\n".repeat(crate::errors::ANCHOR_OCCURRENCE_MAX + 5);
+        let err = resolve_anchor(&content, "dup", None, "f.txt").unwrap_err();
+        let data = err.data.unwrap();
+        assert_eq!(data["total"], crate::errors::ANCHOR_OCCURRENCE_MAX + 5);
+        assert_eq!(data["truncated"], true);
+        assert_eq!(
+            data["occurrences"].as_array().unwrap().len(),
+            crate::errors::ANCHOR_OCCURRENCE_MAX
+        );
+        assert!(data["hint"].as_str().unwrap().contains("search"));
+        // and the message says it is showing a subset rather than implying
+        // the list is the whole truth
+        assert!(err.message.contains("first"));
+    }
+
+    /// A minified file's one enormous line must not become the payload.
+    #[test]
+    fn resolve_anchor_ambiguous_clips_long_lines_on_a_char_boundary() {
+        let long = format!("dup{}", "é".repeat(400));
+        let err = resolve_anchor(&format!("{long}\n{long}\n"), "dup", None, "f.txt").unwrap_err();
+        let data = err.data.unwrap();
+        let text = data["occurrences"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            text.chars().count(),
+            crate::errors::ANCHOR_LINE_MAX_CHARS + 1,
+            "capped content plus the ellipsis marking the cut"
+        );
+        assert!(text.ends_with('…'));
     }
 
     #[test]

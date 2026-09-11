@@ -308,7 +308,11 @@ What this instance serves, and which hosts are supposed to.
       {"name": "kai:src", "host": "kai", "path": "/home/ken/src",
        "description": "code repos", "status": "active",
        "capabilities": ["stat", "list", "read", "search", "edit",
-                        "secrets", "history", "feedback"]}
+                        "secrets", "history", "feedback"],
+       "policy": {"deny": ["**/.ssh", "**/secrets"],
+                  "deny_prefixes": [],
+                  "classify": ["**/.env", "**/*.pem"],
+                  "also_enforced": [".kaedignore files (…)", "…"]}}
     ],
     "fleet": {
       "declared": true,
@@ -331,6 +335,27 @@ What this instance serves, and which hosts are supposed to.
   most-updated host. Calling a root that lacks one gets
   `unsupported_capability` (reserved; nothing lacks one on a single
   instance).
+- **`policy` says what the root refuses and what it redacts (022).** An
+  agent that cannot see this routes around kaed on a *guess* whenever a
+  path looks policy-adjacent — and the guess is free, wrong in the
+  direction of not calling, and produces no error anyone can see. One
+  reported instance guessed `.git` was denied (it never was) and wrote a
+  cross-tool lock file over ssh instead.
+  - Disclosing the patterns is safe by construction: deny and classify
+    matching are **lexical and absolute** (R7), so they answer identically
+    for paths that exist and paths that do not. The patterns are *policy*,
+    never filesystem contents.
+  - `classify` is published too. It does not refuse, it redacts — and an
+    agent that knows a path comes back redacted does not route around kaed
+    to dodge a refusal that was never going to happen.
+  - `also_enforced` names the layers this **cannot** list up front —
+    `.kaedignore` files, the in-file marker, unix ownership — so the list
+    is read as partial rather than exhaustive. For those, and for
+    writability, `edit` with `dry_run` is the definitive answer.
+  - `deny_prefixes` carries only built-ins that fall *inside* this root;
+    usually empty.
+  - Peer roots pass through verbatim (R10 / 010 D-3), so a peer's policy
+    rides along with no gateway work.
 - **`fleet` answers "which hosts should run kaed, and do they"** without
   reading project history. Three states stay distinguishable, because
   collapsing any two is the confusion this was built for:
@@ -385,13 +410,44 @@ What this instance serves, and which hosts are supposed to.
   page past the end: that is already explained by `next_offset`.
 
 #### `read`
-- **In:** `{root, path, range?: {start, end}, window?: {line | anchor,
-  context (default 10)}, numbered? (default false), max_bytes?}`
-- **Out:** `{content, version, range: {start, end}, total_lines,
-  truncated, next_offset?, redacted?, dotenv?, usage_hint?, warnings?}`
+- **In:** `{root, path | paths, range?: {start, end}, window?: {line |
+  anchor, context (default 10), occurrence?}, numbered? (default false),
+  max_bytes?}`
+- **Out (single `path`):** `{content, version, range: {start, end},
+  total_lines, truncated, next_offset?, redacted?, dotenv?, usage_hint?,
+  warnings?}`
+- **Out (`paths`):** `{files: [{path, …the single-path shape…} |
+  {path, error: {code, message, data}}], requested, returned,
+  budget_exhausted?}`
 - Modes: whole file (capped), explicit line `range`, or `window` — N
-  context lines around a line number or around a unique anchor string.
+  context lines around a line number or around an anchor string.
   `window` + anchor is the cheap "show me where I'm about to edit" read.
+- **`window.occurrence` picks among repeats** (022), 1-based, the same name
+  and semantics as `anchor_replace`'s field. Before it, an agent could
+  disambiguate on the *write* path and not on the *read* path, with no
+  stated reason — so a repeated anchor forced a guessed line range, which
+  costs two calls instead of one. `occurrence` with `line` is
+  `invalid_input`: it picks among anchor matches and means nothing
+  otherwise.
+- **`paths` reads several files in one round trip** (022). The survey call:
+  an agent looking at a freshly scaffolded tree wants 3–6 small files
+  *together*, and pricing that at N round trips is what made a shell
+  `cat` loop look cheaper — then cost more, because that route returns no
+  versions and the agent had to come back for them anyway.
+  - **Whole files only.** `range`/`window` address one file by nature;
+    passing either with `paths` is `invalid_input`.
+  - **One shared byte budget, spent in request order** — not a per-file
+    cap, which would make the total unbounded in the number of paths.
+    Exhaustion is stated (`budget_exhausted`) and the paths it stopped at
+    are still listed, each with its own error. Never a silent omission
+    (R3).
+  - **Partial success.** A read has none of the atomicity argument that
+    makes all-or-nothing right for `edit`. A denied, missing or classified
+    path returns its own structured error *in its place in the list* and
+    never sinks the rest.
+  - Every entry carries its own `version` (R1), usable directly as an edit
+    base — the whole reason the shell route lost.
+  - Capped at 32 paths, refused rather than silently trimmed.
 - Whatever the mode, `version` is the whole file's version — immediately
   usable as an edit base.
 - Classified dotenv files (R9): `redacted: true`, `content` is the
@@ -484,6 +540,7 @@ One tool, transactional, all addressing modes.
       {"op": "create", "path": "src/new.rs", "content": "…",
        "executable?": false, "overwrite?": false},
       {"op": "delete", "path": "src/old.rs"},
+      // still planned, not shipped:
       {"op": "rename", "from": "src/a.rs", "to": "src/b.rs"},
       // dotenv ops (R9) — for strict-dotenv files, classified or not:
       {"op": "env_set", "path": ".env", "key": "KLAMS_TOKEN",
@@ -507,11 +564,46 @@ One tool, transactional, all addressing modes.
     "check?": false,          // parse-check touched files post-edit
     "intent?": "extract rollback into its own fn",  // journaled
     "drop_keys?": ["OLD_TOKEN"],  // values this edit may destroy (R9)
-    "allow_secrets?": ["sk-ant-"] // leak matches this edit may write (R12)
+    "allow_secrets?": ["sk-ant-"], // leak matches this edit may write (R12)
+    "drop_paths?": [".env"]       // deletes kaed cannot make recoverable
   }
   ```
-- **Out:** `{txn_id, files: [{path, old_version, new_version}], diff,
-  diagnostics?, applied: true|false /* false = dry run */, warnings?}`
+- **Out:** `{txn_id, files: [{path, old_version, new_version?, deleted?,
+  recoverable?, unrecoverable_because?}], diff, diagnostics?,
+  applied: true|false /* false = dry run */, warnings?}`
+- **`delete` (022)** removes a file, closing the create-then-remove
+  lifecycle that used to split across two tools with kaed journaling only
+  the first half.
+  - Declared in `base` like any other non-`create` op, so deleting a file
+    that moved since you looked is a `version_conflict`, never a silent
+    win. It rides the ordinary transaction: multi-file, atomic,
+    all-or-none with the other ops.
+  - **Recoverable exactly when kaed could have *edited* the file.** The
+    bound is the existing one, not a new number: the pre-image blob is the
+    same blob the edit path already writes, under the same
+    `blob_retention_days` and the same redaction machinery. So binaries
+    and oversized files need no special case (`load_text` already refuses
+    them), and there is no new config knob.
+  - **A classified file keeps no blob — stricter than `edit` on purpose.**
+    `edit` journals a redacted rendering; you cannot restore from one,
+    because it writes `⟨kaed:KEY@digest⟩` back as literal text. That is
+    audit value at the price of *negative* recovery value. 008 D-11 stays
+    intact: still no plaintext shadow.
+  - **`recoverable` is reported per file, at the time of the act** — not
+    discovered on a later revert attempt.
+  - **Unrecoverable deletes must be acknowledged** by naming the path in
+    `drop_paths`, the same shape and the same reason as `drop_keys`.
+    Ordinary deletes need nothing. The refusal
+    (`reason: delete_would_be_unrecoverable`) names the exact paths to
+    pass.
+  - **Directories are refused** (`reason: delete_is_files_only`): name the
+    files. It bounds the blast radius and avoids a journal entry that
+    cannot honestly say what it destroyed.
+  - Ops run in order, so `edit` then `delete` is coherent and the reverse
+    is refused.
+  - It **addresses** a path, so `resolve_creatable` covers it under R7 and
+    no `filter_entry` work is needed — pinned by a test rather than
+    assumed, because a new op is exactly where that invariant gets missed.
 - **Semantics:**
   - Every path referenced by a non-`create` op must appear in `base` with
     its version; mismatch at apply time → `version_conflict`, nothing
@@ -700,13 +792,23 @@ The escape hatch, its own tool so the harness prompts for it separately.
   with `version_conflict` and a delta. Never a force-overwrite — a revert
   that bypassed R2 would be a hole in it. The agent resolves via `diff` +
   a fresh `edit`.
+- **Undoing a `create` is a `delete`, and undoing a `delete` is a
+  `create`** (022). Both work; the old
+  `revert_of_create_needs_delete` refusal is gone, because the op it was
+  waiting for shipped.
 - Refuses, with `data.reason`, where kaed cannot honestly undo:
   `root_no_longer_served` / `unqualified_pre_007` (R8's corollary),
   `no_plaintext_history` (the file is classified, so what the journal
   retains is a *rendering*; restoring it would write placeholders into the
-  file as literals), `revert_of_create_needs_delete` (undoing a create is
-  a delete, and `delete` is not shipped yet), `blob_expired_or_absent`,
-  `wrong_root`.
+  file as literals), `blob_expired_or_absent`, `wrong_root` — and for a
+  deleted file, `never_recoverable`, `path_reoccupied` or
+  `nothing_to_restore`.
+- **The ways a delete cannot be undone are named separately, on purpose.**
+  "This was never recoverable" (`never_recoverable` — classified, so
+  nothing was ever retained and no retention setting would have helped)
+  and "this was recoverable until last Tuesday"
+  (`blob_expired_or_absent`) are different facts an agent acts on
+  differently, so they are never collapsed into one generic failure.
 
 ### Meta
 

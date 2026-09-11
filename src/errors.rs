@@ -185,13 +185,22 @@ impl KaedError {
     }
 
     pub fn ambiguous_anchor(data: AmbiguousAnchorData) -> Self {
+        let lines: Vec<String> = data
+            .occurrences
+            .iter()
+            .map(|o| o.line.to_string())
+            .collect();
+        let where_ = if data.truncated {
+            format!("first {} at lines {}", lines.len(), lines.join(", "))
+        } else {
+            format!("lines {}", lines.join(", "))
+        };
         Self::new(
             ErrorCode::AmbiguousAnchor,
             format!(
-                "anchor matches {} locations in {} (lines {:?}); pass `occurrence` to pick one",
-                data.occurrences.len(),
-                data.path,
-                data.occurrences
+                "anchor matches {} locations in {} ({where_}); each line's content is in \
+                 `data.occurrences` — pass `occurrence` to pick one",
+                data.total, data.path,
             ),
         )
         .with_data(data)
@@ -228,6 +237,13 @@ impl KaedError {
     /// carries the fix. A `version_conflict` qualifies only when kaed had
     /// no delta to give: a conflict *with* one is the contract working,
     /// one without is the retention window failing an agent.
+    ///
+    /// `ambiguous_anchor` earned that exclusion in 022 and did not have it
+    /// before: until then its `data` was a path and bare line numbers, so
+    /// the justification written here was simply false, and the suppression
+    /// hid a real cost (#2373). The rule the episode leaves behind: an
+    /// exclusion justified by "the data carries the fix" is a claim about a
+    /// payload, and it has to be re-checked when that payload changes.
     fn invites_feedback(&self) -> bool {
         match self.code {
             ErrorCode::Denied | ErrorCode::TooLarge | ErrorCode::Internal => true,
@@ -278,11 +294,95 @@ pub struct VersionConflictData {
     pub delta: String,
 }
 
-/// `data` payload for `ambiguous_anchor`: 1-based lines where the anchor matched.
+/// One place an anchor matched: where, and enough of the line to tell it
+/// apart from its siblings. A bare line number was not enough to pick with
+/// — see 022 D-1.
+#[derive(Debug, Serialize)]
+pub struct AnchorOccurrence {
+    /// 1-based line of the match.
+    pub line: usize,
+    /// That line, trimmed, and truncated to [`ANCHOR_LINE_MAX_CHARS`] with a
+    /// trailing `…` when it did not fit.
+    pub text: String,
+}
+
+/// How many occurrences `ambiguous_anchor` will enumerate. A common anchor
+/// can match hundreds of times, and with content attached that payload stops
+/// being a fix and becomes its own problem. Past this the list truncates —
+/// explicitly, never silently — and the `hint` sends the agent to `search`.
+pub const ANCHOR_OCCURRENCE_MAX: usize = 20;
+
+/// Per-occurrence width cap. One line is enough to pick with; a minified
+/// file's single 40KB line is not.
+pub const ANCHOR_LINE_MAX_CHARS: usize = 120;
+
+/// `data` payload for `ambiguous_anchor`: where the anchor matched, with a
+/// line of context each, and how to pick one.
 #[derive(Debug, Serialize)]
 pub struct AmbiguousAnchorData {
     pub path: String,
-    pub occurrences: Vec<usize>,
+    /// At most [`ANCHOR_OCCURRENCE_MAX`] entries, in file order.
+    pub occurrences: Vec<AnchorOccurrence>,
+    /// How many times the anchor actually matched. Equal to
+    /// `occurrences.len()` unless the list truncated.
+    pub total: usize,
+    /// `true` when `occurrences` lists fewer than `total`.
+    pub truncated: bool,
+    /// What to do next, in the agent's own vocabulary — the same role the
+    /// `hint` on `denied` plays.
+    pub hint: String,
+}
+
+impl AmbiguousAnchorData {
+    /// Build the payload from every hit, capping the list and describing
+    /// what to do about what did not fit.
+    pub fn new(path: impl Into<String>, lines: &[String], hit_lines: &[usize]) -> Self {
+        let path = path.into();
+        let total = hit_lines.len();
+        let truncated = total > ANCHOR_OCCURRENCE_MAX;
+        let occurrences: Vec<AnchorOccurrence> = hit_lines
+            .iter()
+            .take(ANCHOR_OCCURRENCE_MAX)
+            .map(|&line| AnchorOccurrence {
+                line,
+                text: lines
+                    .get(line - 1)
+                    .map(|l| clip_line(l.trim()))
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let hint = if truncated {
+            format!(
+                "{total} matches, showing the first {shown}. Pass `occurrence` (1-based) to \
+                 pick one, or narrow with `search` — a more specific pattern answers in one \
+                 call where guessing a line range costs two.",
+                shown = occurrences.len()
+            )
+        } else {
+            "Pass `occurrence` (1-based) to pick one — `read` takes it on `window` and \
+             `edit` takes it on `anchor_replace`. A longer, more distinctive anchor works \
+             too."
+                .to_owned()
+        };
+        Self {
+            path,
+            occurrences,
+            total,
+            truncated,
+            hint,
+        }
+    }
+}
+
+/// Trim a line to [`ANCHOR_LINE_MAX_CHARS`] *characters* (not bytes, so a
+/// multi-byte boundary can never split), marking the cut.
+fn clip_line(line: &str) -> String {
+    if line.chars().count() <= ANCHOR_LINE_MAX_CHARS {
+        return line.to_owned();
+    }
+    let mut s: String = line.chars().take(ANCHOR_LINE_MAX_CHARS).collect();
+    s.push('…');
+    s
 }
 
 impl From<std::io::Error> for KaedError {
@@ -332,14 +432,28 @@ mod tests {
         assert_eq!(v["data"]["delta"], "@@ -38,4 +38,9 @@");
     }
 
+    fn lines_of(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("line {i} body")).collect()
+    }
+
     #[test]
-    fn ambiguous_anchor_lists_candidates() {
-        let err = KaedError::ambiguous_anchor(AmbiguousAnchorData {
-            path: "a.rs".into(),
-            occurrences: vec![3, 41, 97],
-        });
+    fn ambiguous_anchor_lists_candidates_with_their_content() {
+        let err = KaedError::ambiguous_anchor(AmbiguousAnchorData::new(
+            "a.rs",
+            &lines_of(100),
+            &[3, 41, 97],
+        ));
         let v = serde_json::to_value(&err).unwrap();
-        assert_eq!(v["data"]["occurrences"], serde_json::json!([3, 41, 97]));
+        assert_eq!(
+            v["data"]["occurrences"],
+            serde_json::json!([
+                {"line": 3, "text": "line 3 body"},
+                {"line": 41, "text": "line 41 body"},
+                {"line": 97, "text": "line 97 body"},
+            ])
+        );
+        assert_eq!(v["data"]["total"], 3);
+        assert_eq!(v["data"]["truncated"], false);
         assert!(err.message.contains("occurrence"));
     }
 
@@ -385,10 +499,12 @@ mod tests {
             "unknown field `old_string`"
         )));
         assert!(!invited(KaedError::anchor_not_found("src/txn.rs")));
-        assert!(!invited(KaedError::ambiguous_anchor(AmbiguousAnchorData {
-            path: "a.rs".into(),
-            occurrences: vec![3, 41],
-        })));
+        // 022: this exclusion is now true rather than merely asserted —
+        // the payload carries each match's content and a hint naming the
+        // field that resolves it.
+        assert!(!invited(KaedError::ambiguous_anchor(
+            AmbiguousAnchorData::new("a.rs", &lines_of(50), &[3, 41])
+        )));
         assert!(!invited(KaedError::not_found("no such file")));
     }
 

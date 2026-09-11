@@ -53,6 +53,16 @@ async fn start_server_with(
         host: HOST.into(),
         roots: vec![ResolvedRoot {
             description: Some("test root".into()),
+            // A real deny list, as Config::resolve would build it: `roots`
+            // publishes these (022 D-3) and an empty one would assert
+            // nothing. Neither pattern matches anything these tests write.
+            deny: std::sync::Arc::new(
+                kaed::deny::DenyList::new(
+                    vec![(workdir_path.join(".config/kaed"), "kaed's own config")],
+                    &["**/.ssh".to_string(), "**/secrets".to_string()],
+                )
+                .expect("test deny list builds"),
+            ),
             // default classification on, as Config::resolve would build it
             ..ResolvedRoot::with_default_classify(ROOT, workdir_path.clone())
         }],
@@ -1002,6 +1012,281 @@ async fn secret_lifecycle_generate_rotate_handle_and_audit() -> anyhow::Result<(
     Ok(())
 }
 
+/// 022 #2377, end to end: the create-then-remove lifecycle that used to
+/// split across two tools with kaed seeing only the first half. The
+/// reporting instance was a cross-tool repo lock created through kaed and
+/// released with `ssh … rm` — unjournalled.
+#[tokio::test]
+async fn delete_journals_what_it_can_restore_and_says_which() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    // create through kaed, as the lock was
+    let made = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("edit").with_arguments(args(json!({
+                    "root": ROOT, "intent": "take the repo lock",
+                    "ops": [{"op": "create", "path": "karc.lock", "content": "leg = \"x\"\n"}]
+                }))),
+            )
+            .await?,
+    );
+    let v = made["files"][0]["new_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(server.workdir_path.join("karc.lock").exists());
+
+    // and release it through kaed too — the half that used to leave
+    let gone = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("edit").with_arguments(args(json!({
+                    "root": ROOT, "intent": "release the repo lock",
+                    "base": [{"path": "karc.lock", "version": v}],
+                    "ops": [{"op": "delete", "path": "karc.lock"}]
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(gone["applied"], true);
+    assert!(!server.workdir_path.join("karc.lock").exists());
+    assert_eq!(gone["files"][0]["deleted"], true);
+    assert_eq!(gone["files"][0]["recoverable"], true);
+    assert!(
+        gone["files"][0]["new_version"].is_null(),
+        "a deleted path has no content to address"
+    );
+    let txn_id = gone["txn_id"].as_i64().unwrap();
+
+    // the journal saw both halves
+    let h = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("journal")
+                    .with_arguments(args(json!({"root": ROOT, "path": "karc.lock"}))),
+            )
+            .await?,
+    );
+    let intents: Vec<&str> = h["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|e| e["intent"].as_str())
+        .collect();
+    assert!(intents.contains(&"take the repo lock"), "{intents:?}");
+    assert!(intents.contains(&"release the repo lock"), "{intents:?}");
+
+    // and the delete is reversible, which `rm` never was
+    let back = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("revert")
+                    .with_arguments(args(json!({"root": ROOT, "txn_id": txn_id}))),
+            )
+            .await?,
+    );
+    assert_eq!(back["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(server.workdir_path.join("karc.lock"))?,
+        "leg = \"x\"\n"
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// Deleting a classified file is stricter than editing one: no blob, and
+/// the loss has to be acknowledged first.
+#[tokio::test]
+async fn deleting_a_classified_file_needs_drop_paths() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    std::fs::write(
+        server.workdir_path.join(".env"),
+        "TOKEN=sk-live-abcdefghijklmnop\n",
+    )?;
+    let v = fsops::version_of(b"TOKEN=sk-live-abcdefghijklmnop\n");
+
+    let refused = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("edit").with_arguments(args(json!({
+                    "root": ROOT,
+                    "base": [{"path": ".env", "version": v}],
+                    "ops": [{"op": "delete", "path": ".env"}]
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(refused["code"], "invalid_input");
+    assert_eq!(refused["data"]["reason"], "delete_would_be_unrecoverable");
+    assert!(server.workdir_path.join(".env").exists());
+
+    let done = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("edit").with_arguments(args(json!({
+                    "root": ROOT,
+                    "base": [{"path": ".env", "version": v}],
+                    "ops": [{"op": "delete", "path": ".env"}],
+                    "drop_paths": [".env"]
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(done["applied"], true);
+    assert_eq!(done["files"][0]["recoverable"], false);
+    assert!(!server.workdir_path.join(".env").exists());
+    // the proof of what was destroyed never carries the value
+    assert!(
+        !done["diff"]
+            .as_str()
+            .unwrap()
+            .contains("sk-live-abcdefghijklmnop"),
+        "{:?}",
+        done["diff"]
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// 022 #2374: the survey call, end to end. The finding was an agent
+/// pricing four kaed reads against one `ssh … cat && cat && cat`, taking
+/// ssh, and then coming back through kaed anyway for the versions ssh
+/// cannot give. This is the route that wins on both counts.
+#[tokio::test]
+async fn read_takes_several_paths_in_one_call_each_with_its_own_version() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    std::fs::write(
+        server.workdir_path.join("justfile"),
+        "default:\n  @just --list\n",
+    )?;
+    std::fs::write(
+        server.workdir_path.join(".env"),
+        "# app\nTOKEN=sk-live-abcdefghijklmnop\n",
+    )?;
+
+    let r = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("read").with_arguments(args(json!({
+                    "root": ROOT,
+                    "paths": ["hello.txt", "justfile", "nope.txt", ".env"]
+                }))),
+            )
+            .await?,
+    );
+
+    assert_eq!(r["requested"], 4);
+    assert_eq!(r["returned"], 3, "the missing one is reported, not counted");
+    let files = r["files"].as_array().unwrap();
+    assert_eq!(files.len(), 4, "every requested path keeps its place");
+
+    // order is the order asked, and each carries an edit base
+    assert_eq!(files[0]["path"], "hello.txt");
+    assert!(files[0]["content"].as_str().unwrap().contains("old_name"));
+    assert!(files[0]["version"].as_str().is_some());
+    assert_eq!(files[1]["path"], "justfile");
+    assert!(files[1]["version"].as_str().is_some());
+
+    // partial success: the bad path explains itself in place
+    assert_eq!(files[2]["path"], "nope.txt");
+    assert_eq!(files[2]["error"]["code"], "not_found");
+    assert!(files[2]["content"].is_null());
+
+    // R9 holds on this path too — a classified file is served redacted
+    // here exactly as a single read serves it, and the multi-file shape
+    // is not a way around the secrets model.
+    assert_eq!(files[3]["path"], ".env");
+    assert_eq!(files[3]["redacted"], true);
+    let env = files[3]["content"].as_str().unwrap();
+    assert!(!env.contains("sk-live-abcdefghijklmnop"), "got {env}");
+    assert!(env.contains("⟨kaed:TOKEN@"), "got {env}");
+
+    // the version a multi-read hands back really is an edit base
+    let v = files[1]["version"].as_str().unwrap();
+    let edited = client
+        .call_tool(
+            CallToolRequestParams::new("edit").with_arguments(args(json!({
+                "root": ROOT,
+                "base": [{"path": "justfile", "version": v}],
+                "ops": [{"op": "anchor_replace", "path": "justfile",
+                         "old_text": "--list", "new_text": "--list --unsorted"}]
+            }))),
+        )
+        .await?;
+    let e = structured(&edited);
+    assert_eq!(e["applied"], true, "{e:?}");
+    assert!(
+        e["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+  @just --list --unsorted")
+    );
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The two shapes are exclusive, and saying so beats guessing which the
+/// caller meant.
+#[tokio::test]
+async fn read_refuses_a_shaped_multi_path_request() -> anyhow::Result<()> {
+    let server = start_server().await?;
+    let client = connect(&server).await?;
+
+    let both = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("read").with_arguments(args(json!({
+                    "root": ROOT, "path": "hello.txt", "paths": ["hello.txt"]
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(both["code"], "invalid_input");
+
+    let shaped = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("read").with_arguments(args(json!({
+                    "root": ROOT, "paths": ["hello.txt"], "range": {"start": 1, "end": 2}
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(shaped["code"], "invalid_input");
+    assert!(
+        shaped["message"].as_str().unwrap().contains("single file"),
+        "{:?}",
+        shaped["message"]
+    );
+
+    let neither = structured(
+        &client
+            .call_tool(
+                CallToolRequestParams::new("read").with_arguments(args(json!({
+                    "root": ROOT
+                }))),
+            )
+            .await?,
+    );
+    assert_eq!(neither["code"], "invalid_input");
+
+    let _ = client.cancel().await;
+    server.ct.cancel();
+    Ok(())
+}
+
 /// korg #930: "which hosts should run kaed, and do they" must be answerable
 /// from the tool surface, without reading korg history — and a host that is
 /// deliberately without an instance must not look like a failed rollout.
@@ -1027,6 +1312,49 @@ async fn roots_answers_which_hosts_should_run_kaed() -> anyhow::Result<()> {
             .as_array()
             .unwrap()
             .contains(&json!("edit"))
+    );
+
+    // 022 #2376 / D-3: a root says what it refuses, so an agent never has
+    // to guess — the guess that started this item was that `.git` was
+    // denied, and it never was.
+    let policy = &root["policy"];
+    assert_eq!(policy["deny"], json!(["**/.ssh", "**/secrets"]));
+    assert!(
+        !policy["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().unwrap().contains(".git")),
+        "nothing denies .git, and now that is visible rather than guessable"
+    );
+    // built-in prefixes are reported only when they fall inside this root
+    assert_eq!(
+        policy["deny_prefixes"].as_array().unwrap().len(),
+        1,
+        "the config home this test put inside the root"
+    );
+    assert!(
+        policy["deny_prefixes"][0]
+            .as_str()
+            .unwrap()
+            .contains("kaed's own config")
+    );
+    // classify is published too: these do not refuse, they redact
+    assert!(
+        policy["classify"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("**/.env")),
+        "got {:?}",
+        policy["classify"]
+    );
+    // and the published list says honestly what it cannot enumerate
+    assert!(
+        policy["also_enforced"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains(".kaedignore"))
     );
 
     let fleet = &r["fleet"];
@@ -1184,7 +1512,14 @@ async fn structured_errors_reach_the_agent() -> anyhow::Result<()> {
     assert_eq!(ambiguous.is_error, Some(true));
     let a = structured(&ambiguous);
     assert_eq!(a["code"], "ambiguous_anchor");
-    assert_eq!(a["data"]["occurrences"], json!([1, 2]));
+    // 022 #2373: each candidate carries its line's content, so the error
+    // can be acted on without a second read.
+    assert_eq!(
+        a["data"]["occurrences"],
+        json!([{"line": 1, "text": "x"}, {"line": 2, "text": "x"}])
+    );
+    assert_eq!(a["data"]["total"], 2);
+    assert!(a["data"]["hint"].as_str().unwrap().contains("occurrence"));
 
     // 014 / korg #1091: the OS refusing is what an AGENT receives, which is
     // the whole complaint — the journal row was already better than the

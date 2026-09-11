@@ -104,6 +104,29 @@ impl DenyList {
             .chain(self.patterns.iter().cloned())
             .collect()
     }
+
+    /// The configured globs, for publishing on `roots` (022 D-3).
+    ///
+    /// Safe to disclose because matching is lexical and absolute — it never
+    /// touches the filesystem and answers identically for paths that exist
+    /// and paths that do not. Publishing the patterns therefore discloses
+    /// *policy*, not filesystem contents; the property was built deliberately
+    /// in 001 and this is the payoff.
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    /// Built-in absolute prefixes that actually fall inside `root` — the
+    /// only ones worth telling a caller addressing that root about. kaed's
+    /// config and journal homes usually sit outside every root, in which
+    /// case this is empty and the root's policy is its globs alone.
+    pub fn builtin_prefixes_within(&self, root: &Path) -> Vec<String> {
+        self.builtin
+            .iter()
+            .filter(|(dir, _)| dir.starts_with(root))
+            .map(|(dir, label)| format!("{} ({label})", dir.display()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
