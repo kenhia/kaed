@@ -144,6 +144,30 @@ The fourth row is the one that matters: the whole case for narrowing rests on
 012's write-side leak detection being the real fence, and it is now confirmed
 live rather than inferred.
 
+## Caught by the post-deploy smoke test
+
+The `revert` tool's MCP **description** still told agents that undoing a
+create "needs a delete op kaed does not have yet" — written truthfully in 009,
+and shipped unchanged in the very release that added `delete`. The behaviour
+was right and tested; the sentence an agent reads before deciding whether to
+try was wrong.
+
+That is this sprint's own failure class, one layer up: #2376 was a root whose
+policy an agent could not see, and this was a tool whose description said it
+could not do something it now could. An agent reading it would not have
+attempted the call, and nothing would have been recorded — the near-miss
+again.
+
+Fixed on a follow-up branch, with a **gate** so the surface cannot drift
+silently again: `lists_the_tool_surface` now asserts that `edit` advertises
+`delete`, that `revert` claims no missing capability, and that `read` and
+`roots` name the fields 022 gave them. Verified by re-introducing the old
+sentence and watching the test fail, then restoring it.
+
+The general rule, which is why the gate is worth more than the one-line fix:
+**a tool description is part of the contract, and nothing was checking it
+against the behaviour.** Every other contract surface here has a test.
+
 ## Deploy
 
 The fleet still runs `0.1.0 (fdd8647)`, which predates this sprint — confirmed
