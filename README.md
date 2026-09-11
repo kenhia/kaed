@@ -46,17 +46,17 @@ Twelve tools over streamable HTTP with per-agent bearer auth:
 
 | tool | what it does |
 |---|---|
-| `roots` | the workspace roots this fleet serves — peers probed live, an unreachable host reported as data |
+| `roots` | the workspace roots this fleet serves, each with the deny/classify policy in force — peers probed live, an unreachable host reported as data |
 | `stat` | metadata + content version — the cheap staleness probe |
 | `list` | directory entries, gitignore-aware, paginated |
-| `read` | whole file, a line range, or a window around a line or unique anchor |
+| `read` | whole file, a line range, a window around a line or anchor, or several files at once — each with its own version |
 | `search` | ripgrep-grade, every hit carrying its file's version; root patterns (`*:*`) search the whole fleet in one call |
-| `edit` | anchor/range replace + create + typed dotenv ops; multi-file, atomic, `dry_run` |
+| `edit` | anchor/range replace + create + delete + typed dotenv ops; multi-file, atomic, `dry_run` |
 | `secret` | the secret lifecycle without disclosure: describe (a durable handle), generate, rotate, occurrences |
 | `secret_reveal` | the escape hatch — its own tool so it can be permissioned separately; always journaled |
 | `journal` | what happened here: applied writes, failed attempts, friction reports and secret-audit events, merged |
 | `diff` | any two states of a file — a version, a transaction, or the working tree |
-| `revert` | undo a transaction as a new transaction; never history rewriting |
+| `revert` | undo a transaction as a new transaction — including restoring a deleted file; never history rewriting |
 | `feedback` | tell kaed it got in your way; one required field |
 
 The bet underneath them is **verified writes**:
