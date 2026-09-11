@@ -108,8 +108,46 @@ revert again restores it) is pinned by a test.
 `just check` green: `cargo fmt --check`, `cargo clippy --all-targets
 -D warnings`, and 344 tests (290 lib + 54 integration), up from 331.
 
-## Still open: #2375
+### #2375 — the secrets fence, narrowed (landed in k-homelab)
 
-The change lands in **k-homelab's manifests**, not here, and it carries a
-policy call that is Ken's rather than the sprint's. Raised separately with the
-evidence assembled.
+Ken decided it on 2026-09-11: narrow the rule. `**/secrets` →
+`**/secrets/store` + `**/*.age` on kai and kubs0, with kubs0's root
+description and the `kaed-service` recipe README moved in the same commit —
+otherwise the tool surface would keep saying "secrets/ denied" while the deny
+list said otherwise.
+
+**Verified equivalent for the values before changing anything.** All nine
+`.age` files live under `secrets/store`, and it is the only `secrets`
+directory in any root in the fleet. So the narrowing opens exactly three
+plaintext files — `index.yml`, `README.md`, `recipients.txt` — and denies not
+one byte less than before.
+
+`**/*.age` is the glob doing the real work. It denies encrypted values by
+**file shape** wherever they live, rather than trusting a directory name. The
+general form, recorded in the manifests because it outlives this instance: a
+deny rule written against a directory name denies whatever else that directory
+comes to hold, and stops denying what moves out of it.
+
+Applied with `bin/apply` on both hosts — a restart, not a SIGHUP, because deny
+config is startup-only — then verified through the tool surface rather than
+assumed:
+
+| check | result |
+|---|---|
+| `secrets/index.yml` read | serves |
+| `secrets/index.yml` `dry_run` edit | clean diff |
+| `secrets/store/unifi-controller-user.age` | `denied`, rule `**/*.age` |
+| `dry_run` putting a real `sk-ant-` token in the index | `secret_leak`, refused |
+| `roots` description | corrected |
+
+The fourth row is the one that matters: the whole case for narrowing rests on
+012's write-side leak detection being the real fence, and it is now confirmed
+live rather than inferred.
+
+## Deploy
+
+The fleet still runs `0.1.0 (fdd8647)`, which predates this sprint — confirmed
+incidentally when a verification call using the new `window.occurrence` field
+came back `unknown field`. The k-homelab half above is live now because it is
+config; the code half ships at Phase 7, and will carry 021's non-code changes
+along with it as the proposal predicted.
