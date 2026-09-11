@@ -175,3 +175,49 @@ incidentally when a verification call using the new `window.occurrence` field
 came back `unknown field`. The k-homelab half above is live now because it is
 config; the code half ships at Phase 7, and will carry 021's non-code changes
 along with it as the proposal predicted.
+
+## Deployed
+
+**2026-09-11 — `0.1.0-d0c3cd1` on kai, kubs0 and kubsdb.**
+
+Published from merged `main` to the homelab package store; every host
+installed that artifact with `install.sh --from-store`, kai included. The
+fleet had been on `0.1.0 (fdd8647 2026-08-19)` since sprint 020, so this
+deploy carries 021's non-code changes along with it, exactly as the proposal
+predicted — the lag was deliberate, not a missed deploy.
+
+Two publishes: `0.1.0-75525e2` (the sprint merge) went out first, and the
+post-deploy smoke test found the stale `revert` description above. The
+corrected `0.1.0-d0c3cd1` replaced it fleet-wide within the same session.
+
+| host | binary | check-config | unit | MCP `serverInfo` |
+|---|---|---|---|---|
+| kai | match | exit 0 | active | `0.1.0 (d0c3cd1 2026-09-11)` |
+| kubs0 | match | exit 0 | active | `0.1.0 (d0c3cd1 2026-09-11)` |
+| kubsdb | match | exit 0 | active | `0.1.0 (d0c3cd1 2026-09-11)` |
+
+Binary on disk and the server answering the network agree on every host.
+
+### Verified live, not inferred
+
+Each of the sprint's four code changes was exercised against the deployed
+fleet rather than trusted from the test suite:
+
+- **#2373** — an ambiguous anchor on a real file returned
+  `occurrences: [{line, text}]` with `total` and the hint; `occurrence: 3`
+  then returned the third match directly.
+- **#2374** — a three-path `read` returned two files with their own versions
+  and the missing one reporting `not_found` in its place
+  (`requested: 3, returned: 2`). Over raw JSON-RPC, because a client holding
+  the pre-deploy schema stringifies the array.
+- **#2376** — `roots` carries `policy` per root, **and peer roots carry
+  theirs through the gateway verbatim**: kubs0's and kubsdb's deny/classify
+  lists arrived with no gateway work, which is 010 D-3 paying off exactly as
+  predicted. kubsdb's five 014 classify globs are visible too.
+- **#2377** — deleted a file (`recoverable: true`, diff to nothing), then
+  reverted the transaction and got the file back byte-identical.
+- **#2375** (config, applied earlier) — the narrowed fence is live: kai and
+  kubs0 show `**/secrets/store` + `**/*.age`, kubsdb keeps its own
+  `**/secrets` untouched, as the item specified.
+- The corrected `revert` description was confirmed on the live server by
+  `tools/list`, not just in the source.
