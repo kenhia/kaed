@@ -278,6 +278,51 @@ async fn lists_the_tool_surface() -> anyhow::Result<()> {
             "stat"
         ]
     );
+
+    // A tool's description is part of the contract an agent reads, and
+    // nothing was checking it against the behaviour. `revert`'s said
+    // undoing a create "needs a delete op kaed does not have yet" — true
+    // when written, and still shipped in the release that added `delete`.
+    // The whole theme of 022 is that the tool surface must not lie about
+    // what kaed will do, so the surface gets a gate too.
+    let describe = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t.name.as_ref() == name)
+            .unwrap_or_else(|| panic!("{name} is in the surface"))
+            .description
+            .as_ref()
+            .map(|d| d.to_string())
+            .unwrap_or_default()
+    };
+
+    let edit = describe("edit");
+    assert!(
+        edit.contains("delete"),
+        "`edit` advertises every op it takes, `delete` included: {edit}"
+    );
+
+    let revert = describe("revert");
+    for stale in ["does not have yet", "not shipped", "no `delete` op"] {
+        assert!(
+            !revert.contains(stale),
+            "`revert` still claims a capability is missing ({stale:?}): {revert}"
+        );
+    }
+
+    // `read` and `roots` gained fields in 022; an agent that cannot see
+    // them in the description will not go looking for them.
+    let read = describe("read");
+    assert!(read.contains("paths"), "`read` advertises the survey call");
+    assert!(
+        read.contains("occurrence"),
+        "`read` advertises the occurrence picker"
+    );
+    assert!(
+        describe("roots").contains("policy"),
+        "`roots` advertises that it publishes each root's policy"
+    );
+
     let _ = client.cancel().await;
     server.ct.cancel();
     Ok(())

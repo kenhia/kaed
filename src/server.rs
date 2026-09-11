@@ -1293,7 +1293,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Undo a journaled transaction by applying its pre-image as a NEW transaction — history is never rewritten, and the revert is itself journaled and itself revertible. It goes through the same versioning contract as any edit: if a file moved since, you get version_conflict with a delta, not a force-overwrite. Refuses, with a reason, when the transaction ran under a root this host no longer serves, when it created a file (undoing a create needs a delete op kaed does not have yet), or when the file is classified (its journaled pre-image is a redacted rendering, so kaed does not hold the bytes to restore). Supports dry_run."
+        description = "Undo a journaled transaction by applying its pre-image as a NEW transaction — history is never rewritten, and the revert is itself journaled and itself revertible. It goes through the same versioning contract as any edit: if a file moved since, you get version_conflict with a delta, not a force-overwrite. Undoing a create is a delete and undoing a delete is a create — both work. Refuses, with a reason, when the transaction ran under a root this host no longer serves, when the file is classified (its journaled pre-image is a redacted rendering, so kaed does not hold the bytes to restore), or — for a deleted file — when the content was never retained (`never_recoverable`), the retention window has passed (`blob_expired_or_absent`), or something occupies the path again (`path_reoccupied`). Those last two are deliberately distinct: \"never recoverable\" and \"recoverable until last Tuesday\" are different facts. Supports dry_run."
     )]
     async fn revert(
         &self,
