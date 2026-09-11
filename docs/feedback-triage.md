@@ -16,14 +16,16 @@ above these.
 
 | Host | Triaged through | As of |
 |---|---|---|
-| kai | 5 | 2026-08-13 |
-| kubs0 | 0 (no rows) | 2026-08-13 |
-| kubsdb | 0 (no rows) | 2026-08-13 |
+| kai | 15 | 2026-09-11 |
+| kubs0 | 0 (no rows) | 2026-09-11 |
+| kubsdb | 0 (no rows) | 2026-09-11 |
 
 `feedback` carries no `root`, so a report lands on whichever host served
 the connection rather than the host it is about. Every report so far was
-filed from cleo through the kai gateway, which is why kai holds all five —
-including the three about kubsdb.
+filed through the kai gateway, which is why kai holds all fifteen —
+including the ones about kubsdb and kubs0. Two passes in, no report has
+ever landed anywhere else; treat "read kai" as the pass in practice and
+the other two hosts as a check that the assumption still holds.
 
 ## 2026-08-13 — first pass (kai #1–#5)
 
@@ -67,8 +69,68 @@ only on errors**. Friction that costs an agent a detour without ever
 failing — a search re-run three times, a capability routed around via ssh —
 cannot reach this table by the mechanism that fills it.
 
-That is a deliberate 009 D-5 choice, and whether it leaves a real gap is
-being tested: **korg #1233** is an experiment in prompting for the missing
-class at end of session. Until it reports, read the category mix here as a
-fact about the invite's placement, not about how well the contract serves
-its users.
+That is a deliberate 009 D-5 choice, and whether it left a real gap was
+tested by **korg #1233**, an experiment in prompting for the missing class
+at end of session. **It did leave one, and the prompt reaches it** — see
+the second pass below, where the category mix inverts. Read the four-bug
+mix above as a fact about the invite's placement, which is exactly what it
+turned out to be.
+
+## 2026-09-11 — second pass (kai #6–#15)
+
+Ten reports, spanning 2026-08-22 to 2026-09-11. Five work items filed,
+bundled as proposal korg:2378; three needed none; two are praise.
+
+| Row | Cat | Subject | Disposition |
+|---|---|---|---|
+| kai #6 | friction | An ops-shaped session wrote ~12 files across two hosts and never once considered kaed | **Already filed** — korg #1560 (kaed) + #1562 (agent-skills), program 1563; kaed half shipped in sprint 021 |
+| kai #7 | friction | Partial root coverage on a symmetric two-host task selects against kaed harder than no coverage | **Already shipped** — sprint 021, PD-8 (`kubs0:scratch`) and PD-9 (systemd-user, out of scope), korg #1560 |
+| kai #8 | praise | `roots` returning per-root `path` let a session audit its own coverage in one call | **No action** — affordance to protect |
+| kai #9 | friction | `ambiguous_anchor` returns bare line numbers, and `read` has no occurrence picker | **Filed — korg #2373** |
+| kai #10 | friction | No multi-file read, so ssh is cheaper for 3–6 small files — and loses the versions | **Filed — korg #2374** |
+| kai #11 | praise | The `edit` diff plus per-file `new_version` replaced every verification read across seven edits | **No action** — affordance to protect |
+| kai #12 | friction | `**/secrets` denies the store's plaintext metadata file, so bookkeeping edits leave the journal | **Filed — korg #2375** (change lands in k-homelab) |
+| kai #13 | friction | No delete op: every create-then-remove lifecycle splits across two tools | **Filed — korg #2377** |
+| kai #14 | friction | A root's deny policy is invisible, so an agent guessed `.git` was denied and used ssh | **Filed — korg #2376.** Guess was wrong — verified writable by `dry_run` during triage |
+| kai #15 | praise | A `create`'s version stayed a valid edit base across a branch switch, squash merge and pull | **No action** — affordance to protect |
+
+### What the second pass showed
+
+**The category mix inverted, and that answers korg #1233.** Six `friction`
+and three `praise` against a prior corpus of four `bug` and one `wish`.
+Every report here is about a call that **succeeded** or was **never made**
+— which is precisely the class §2 predicted existed and the in-band invite
+could not reach.
+
+**Three of the five filed items are near-misses: reports about calls that
+were never made.** #10 priced kaed against ssh and chose ssh; #14 guessed a
+path was denied and never asked; #13 never had the op to consider. There is
+no error, no refusal and no journal row behind any of them. This is the
+finding that rules *against* #1233 §6's favoured option — widening
+`with_feedback_invite()` cannot reach a call that was never made, because
+there is no response to attach an invite to. The prompt can, and did.
+
+**Verify the guess, not just the complaint.** #14 reported that `.git`
+*seemed* denied. It is not — neither the default deny list nor either
+host's config mentions it, confirmed with a `dry_run` `create` at the exact
+reported path. The report was still correct about the cost: the agent paid
+it on a belief, and the belief was never tested because testing it cost a
+round trip. A triage pass that had only checked "is this a real denial?"
+would have closed it as invalid and missed the actual finding, which is
+that kaed gives an agent no way to know.
+
+**The praise rows earn their place by naming what they replaced.** #11 and
+#15 both name a specific affordance and the call it removed — the `edit`
+diff standing in for a verification read, and `version` being a content
+address rather than a session handle (one survived a branch switch, a
+squash merge and a pull, and still worked as an edit base). That is the
+form §4 asked for, and it is worth protecting deliberately: both are
+properties a future refactor could quietly break with every test still
+green.
+
+**One report was not prompt-driven.** #12 arrived alone, mid-session, at a
+`denied` refusal — the in-band invite working exactly as designed. Rows
+#6–#8 were filed at Ken's explicit request after he noticed the behaviour
+himself, and are **not** a prompt result; the provenance note on korg #1233
+explains why that distinction matters. Rows #9–#11 and #13–#15 arrived as
+end-of-session batches in the prompt's shape.
