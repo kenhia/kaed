@@ -130,6 +130,13 @@ correction makes it work. Enumerations (`list`, `search`) omit denied entries
 rather than failing, but report `denied_hidden: N`, because a silently
 filtered listing reads as a complete one.
 
+`roots` publishes each root's deny and classify patterns, so an agent never
+has to *guess* whether a path is refused — a guess costs nothing it can
+perceive and so is always cheaper than asking, which meant the answer was
+routinely "assume denied, use ssh". Publishing the rules is safe precisely
+because matching is lexical: it never touches the filesystem, so the patterns
+disclose policy and never what exists.
+
 The operating system is a fourth layer, and it does not read kaed's config at
 all: a file the service identity cannot open, or a directory it cannot write,
 refuses too. That also arrives as `denied` — with
@@ -177,8 +184,9 @@ whom, so a human's edits and several agents' edits stay mutually visible.
 
 ## Where it is now
 
-**Early beta.** Ten tools — `roots`, `stat`, `list`, `read`, `search`, `edit`,
-`journal`, `diff`, `revert`, `feedback` — running on a small fleet of hosts,
+**Early beta.** Twelve tools — `roots`, `stat`, `list`, `read`, `search`,
+`edit`, `secret`, `secret_reveal`, `journal`, `diff`, `revert`, `feedback` —
+running on a small fleet of hosts,
 dogfooded daily, with the full verified-write loop working end to end from a
 remote agent. Roots are host-qualified (`kai:src`), and `roots` also reports
 the **declared fleet**: which hosts should run kaed, including the ones
@@ -234,6 +242,21 @@ The sprints so far:
   stream that makes "has any agent ever seen this token?" answerable.
   Revealing plaintext is deliberately a separate, always-journaled tool.
 
+Sprints 012–022 are not summarised here yet — write-side leak detection, a
+third host, legible OS permissions, the MCP protocol revision, per-host client
+identities, rotation grace windows, and two passes of feedback triage. Each
+has its own record under
+[`sprints/`](../sprints/), which is the authority; this list is a narrative
+and it lags.
+
+One of them is worth naming here, because this section used to hold it as an
+ambition: **the feedback loop closed.** Sprint 017 built a reader for the
+friction reports agents file, and sprint 022 was the first contract revision
+driven by what those reports said — including three findings of a kind kaed
+structurally cannot see, because they were calls an agent decided *not* to
+make. Nothing in a journal records a road not taken, which is why the channel
+had to be asked rather than mined.
+
 ## Where it is going
 
 Roughly in order, with the reasoning in
@@ -242,9 +265,6 @@ Roughly in order, with the reasoning in
 - **Structure** — tree-sitter `outline`, node-targeted edits, and parse
   diagnostics returned in the edit response (so "did I break the syntax?" is
   answered by the write, like everything else).
-- **Acting on the feedback.** The channel exists now; the real test is the
-  first contract revision driven by a friction report an agent filed itself.
-  An unread channel is worse than none, because it looks like a channel.
 - **A read log.** Only writes are journaled today, so the question this whole
   design most wants answered — does a refusal push an agent to reach for ssh
   instead? — is one the journal structurally cannot answer. Every `journal`
@@ -254,12 +274,10 @@ Roughly in order, with the reasoning in
   cost. The evidence for whether the bet paid off. Until that exists, "kaed is
   better" is a hypothesis.
 
-Further out, and genuinely uncertain: write-side leak detection (kaed sees
-every write, so a known secret heading into a README can be caught at the
-moment it happens), per-region versioning so two agents can edit disjoint
-parts of one file, and kaed as a *local* tool alongside an agent's built-in
-editing — the "if we got this right" bet, which needs the dogfood report
-first.
+Further out, and genuinely uncertain: per-region versioning so two agents can
+edit disjoint parts of one file, and kaed as a *local* tool alongside an
+agent's built-in editing — the "if we got this right" bet, which needs the
+dogfood report first.
 
 ## Reading further
 

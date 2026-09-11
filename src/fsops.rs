@@ -580,9 +580,23 @@ pub struct ReadResult {
 
 pub enum ReadMode<'a> {
     Whole,
-    Range { start: usize, end: usize },
-    WindowLine { line: usize, context: usize },
-    WindowAnchor { anchor: &'a str, context: usize },
+    Range {
+        start: usize,
+        end: usize,
+    },
+    WindowLine {
+        line: usize,
+        context: usize,
+    },
+    WindowAnchor {
+        anchor: &'a str,
+        context: usize,
+        /// 1-based pick when the anchor matches more than once, mirroring
+        /// `anchor_replace`'s field of the same name (022 D-2). Without it,
+        /// an ambiguous anchor is an error the agent cannot answer on the
+        /// read path at all.
+        occurrence: Option<usize>,
+    },
 }
 
 /// What the policy layers decided about a loaded file's content.
@@ -692,6 +706,139 @@ const USAGE_HINT: &str = "values are sealed placeholders; you rarely need plaint
      (env_set / env_rename / env_delete / env_reorder) — a placeholder passed as a value \
      is substituted with the real value on write.";
 
+/// How many paths one `read` may name. The use case is surveying a handful
+/// of small files in one round trip (022 #2374), not bulk export — `list`
+/// and `search` are the tools for "what is here". A request past this is
+/// `invalid_input` rather than a silent trim.
+pub const MAX_READ_PATHS: usize = 32;
+
+/// One file's outcome in a multi-path read. Exactly one of the flattened
+/// read or `error` is present — partial success is the contract (022 D-4),
+/// so a denied or missing path never sinks the whole call, and never
+/// disappears from the answer either.
+#[derive(Debug, Serialize)]
+pub struct FileRead {
+    pub path: String,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadResult>,
+    /// The structured failure for this path, verbatim — same `{code,
+    /// message, data}` shape a single-path `read` would have returned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<serde_json::Value>,
+}
+
+/// The answer to a multi-path read.
+#[derive(Debug, Serialize)]
+pub struct MultiReadResult {
+    /// One entry per requested path, in the order asked. Never shorter than
+    /// the request: a path that could not be read says why.
+    pub files: Vec<FileRead>,
+    pub requested: usize,
+    /// How many entries carry content.
+    pub returned: usize,
+    /// `true` when the shared byte budget ran out before every path was
+    /// read. The paths it stopped at are still listed, each with an
+    /// explicit error — truncation is never silent (R1).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub budget_exhausted: bool,
+}
+
+/// Read several files in one call, whole, under **one shared byte budget**
+/// consumed in request order (022 D-4).
+///
+/// The budget is shared rather than per-file on purpose: the point of this
+/// call is one bounded round trip, and a per-file cap makes the total
+/// unbounded in the number of paths. When it runs out the remaining paths
+/// are reported as errors naming the budget, so the caller can ask again
+/// for what it still wants.
+///
+/// Whole-file only. `range` and `window` address one file by nature, and a
+/// window that meant something different in each of six files would be a
+/// worse tool than six calls.
+pub fn read_many(
+    root: &ResolvedRoot,
+    rels: &[String],
+    numbered: bool,
+    max_bytes: Option<usize>,
+    limits: &Limits,
+) -> Result<MultiReadResult> {
+    if rels.is_empty() {
+        return Err(KaedError::invalid_input(
+            "`paths` must name at least one file",
+        ));
+    }
+    if rels.len() > MAX_READ_PATHS {
+        return Err(KaedError::invalid_input(format!(
+            "`paths` names {} files; the cap is {MAX_READ_PATHS}. Use `list` or `search` \
+             to survey more than that.",
+            rels.len()
+        )));
+    }
+
+    let total_budget = max_bytes
+        .unwrap_or(limits.max_read_bytes)
+        .min(limits.max_read_bytes);
+    let mut spent = 0usize;
+    let mut budget_exhausted = false;
+    let mut files = Vec::with_capacity(rels.len());
+
+    for rel in rels {
+        let remaining = total_budget.saturating_sub(spent);
+        if remaining == 0 {
+            budget_exhausted = true;
+            files.push(FileRead {
+                path: rel.clone(),
+                read: None,
+                error: Some(budget_error(total_budget)),
+            });
+            continue;
+        }
+        match read(
+            root,
+            rel,
+            &ReadMode::Whole,
+            numbered,
+            Some(remaining),
+            limits,
+        ) {
+            Ok(r) => {
+                spent += r.content.len();
+                if r.truncated {
+                    budget_exhausted = true;
+                }
+                files.push(FileRead {
+                    path: rel.clone(),
+                    read: Some(r),
+                    error: None,
+                });
+            }
+            Err(e) => files.push(FileRead {
+                path: rel.clone(),
+                read: None,
+                error: Some(serde_json::to_value(&e).unwrap_or_else(
+                    |_| serde_json::json!({"code": "internal", "message": e.message}),
+                )),
+            }),
+        }
+    }
+
+    let returned = files.iter().filter(|f| f.read.is_some()).count();
+    Ok(MultiReadResult {
+        requested: rels.len(),
+        returned,
+        budget_exhausted,
+        files,
+    })
+}
+
+fn budget_error(total: usize) -> serde_json::Value {
+    serde_json::to_value(KaedError::too_large(format!(
+        "the shared read budget ({total} bytes) was spent on earlier paths; ask for this \
+         one in another call, or raise `max_bytes`"
+    )))
+    .expect("error serializes")
+}
+
 pub fn read(
     root: &ResolvedRoot,
     rel: &str,
@@ -789,8 +936,12 @@ fn slice_lines(
             }
             window(line, context, total_lines)
         }
-        ReadMode::WindowAnchor { anchor, context } => {
-            let hit = addr::resolve_anchor(content, anchor, None, rel)?;
+        ReadMode::WindowAnchor {
+            anchor,
+            context,
+            occurrence,
+        } => {
+            let hit = addr::resolve_anchor(content, anchor, occurrence, rel)?;
             window(hit.line, context, total_lines)
         }
     };
@@ -1363,6 +1514,213 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
+    /// 022 #2374: the report was an agent pricing four kaed reads against
+    /// one ssh, taking ssh, and coming back for versions it then had to
+    /// re-read for. One call, whole files, every entry carrying its own
+    /// version is what makes the cheaper route also the right one.
+    #[test]
+    fn read_many_returns_every_file_with_its_own_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "justfile", "default:\n  @just --list\n");
+        write(dir.path(), "CLAUDE.md", "# conventions\n");
+        write(dir.path(), ".gitignore", "target/\n");
+        let root = test_root(dir.path());
+
+        let r = read_many(
+            &root,
+            &[
+                "justfile".to_string(),
+                "CLAUDE.md".to_string(),
+                ".gitignore".to_string(),
+            ],
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(r.requested, 3);
+        assert_eq!(r.returned, 3);
+        assert!(!r.budget_exhausted);
+        for f in &r.files {
+            let read = f.read.as_ref().expect("content");
+            assert!(!read.version.is_empty(), "{} has no version", f.path);
+            assert!(f.error.is_none());
+        }
+        assert_eq!(r.files[0].path, "justfile");
+        assert!(
+            r.files[1]
+                .read
+                .as_ref()
+                .unwrap()
+                .content
+                .contains("conventions")
+        );
+
+        // the versions are the same content addresses a single read gives,
+        // so they are usable as edit bases without a second call
+        let single = read(
+            &root,
+            "justfile",
+            &ReadMode::Whole,
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(r.files[0].read.as_ref().unwrap().version, single.version);
+    }
+
+    /// D-4: a read has no atomicity argument, so one bad path reports in
+    /// place instead of sinking the call — and it is never silently
+    /// dropped from the answer either.
+    #[test]
+    fn read_many_is_partial_success_and_names_what_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.txt", "alpha\n");
+        write(dir.path(), "c.txt", "gamma\n");
+        let root = test_root(dir.path());
+
+        let r = read_many(
+            &root,
+            &[
+                "a.txt".to_string(),
+                "nope.txt".to_string(),
+                "c.txt".to_string(),
+            ],
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(r.requested, 3);
+        assert_eq!(r.returned, 2);
+        assert_eq!(r.files.len(), 3, "the failure keeps its place in the list");
+        assert_eq!(r.files[1].path, "nope.txt");
+        assert!(r.files[1].read.is_none());
+        assert_eq!(r.files[1].error.as_ref().unwrap()["code"], "not_found");
+        // the ones that worked still worked
+        assert!(r.files[0].read.is_some());
+        assert!(r.files[2].read.is_some());
+    }
+
+    /// The budget is shared and spent in order — a per-file cap would make
+    /// the total unbounded in the number of paths. Running out is stated,
+    /// never silent.
+    #[test]
+    fn read_many_shares_one_budget_and_says_when_it_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "big.txt", &"x".repeat(500));
+        write(dir.path(), "later.txt", "short\n");
+        let root = test_root(dir.path());
+
+        let r = read_many(
+            &root,
+            &["big.txt".to_string(), "later.txt".to_string()],
+            false,
+            Some(200),
+            &Limits::default(),
+        )
+        .unwrap();
+
+        assert!(r.budget_exhausted);
+        assert_eq!(r.files.len(), 2);
+        // the second path is present and explains itself rather than
+        // vanishing from the response
+        let second = &r.files[1];
+        assert_eq!(second.path, "later.txt");
+        assert!(
+            second.read.is_none() || second.read.as_ref().unwrap().truncated,
+            "either it did not fit, or it says it was cut"
+        );
+    }
+
+    #[test]
+    fn read_many_rejects_an_empty_or_oversized_path_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_root(dir.path());
+        assert_eq!(
+            read_many(&root, &[], false, None, &Limits::default())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidInput
+        );
+        let many: Vec<String> = (0..MAX_READ_PATHS + 1)
+            .map(|i| format!("f{i}.txt"))
+            .collect();
+        let err = read_many(&root, &many, false, None, &Limits::default()).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("search"), "it names the right tool");
+    }
+
+    /// 022 D-2: `read` can answer an ambiguous anchor, the way `edit`
+    /// always could. Before this the two paths were asymmetric with no
+    /// stated reason, and the read path's only recourse was to guess a
+    /// line range — two calls where one would do.
+    #[test]
+    fn read_window_anchor_takes_an_occurrence_like_anchor_replace_does() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", "dup\na\ndup\nb\ndup\n");
+        let root = test_root(dir.path());
+
+        // without it: ambiguous, and the error now carries what to pick with
+        let err = read(
+            &root,
+            "f.txt",
+            &ReadMode::WindowAnchor {
+                anchor: "dup",
+                context: 0,
+                occurrence: None,
+            },
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::AmbiguousAnchor);
+        assert_eq!(err.data.unwrap()["total"], 3);
+
+        // with it: the third match, no second read needed
+        let picked = read(
+            &root,
+            "f.txt",
+            &ReadMode::WindowAnchor {
+                anchor: "dup",
+                context: 0,
+                occurrence: Some(3),
+            },
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap();
+        assert_eq!((picked.range.start, picked.range.end), (5, 5));
+    }
+
+    /// Out-of-range is `invalid_input`, shared with the edit path so the
+    /// two read alike.
+    #[test]
+    fn read_window_anchor_occurrence_out_of_range_is_invalid_input() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "f.txt", "dup\na\ndup\n");
+        let root = test_root(dir.path());
+        let err = read(
+            &root,
+            "f.txt",
+            &ReadMode::WindowAnchor {
+                anchor: "dup",
+                context: 0,
+                occurrence: Some(9),
+            },
+            false,
+            None,
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
     #[test]
     fn read_window_around_line_and_anchor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1387,6 +1745,7 @@ mod tests {
             &ReadMode::WindowAnchor {
                 anchor: "needle",
                 context: 2,
+                occurrence: None,
             },
             true,
             None,
@@ -1683,6 +2042,7 @@ mod tests {
             &ReadMode::WindowAnchor {
                 anchor: "DEBUG=",
                 context: 0,
+                occurrence: None,
             },
             false,
             None,

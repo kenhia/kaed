@@ -379,11 +379,18 @@ pub struct RangeParam {
 pub struct WindowParam {
     /// Center the window on this 1-based line…
     pub line: Option<usize>,
-    /// …or on the unique occurrence of this text.
+    /// …or on an occurrence of this text.
     pub anchor: Option<String>,
     /// Context lines on each side (default 10).
     #[serde(default = "default_context")]
     pub context: usize,
+    /// 1-based pick when `anchor` matches more than once — the same name
+    /// and semantics `edit`'s `anchor_replace` uses (022 D-2). Without it,
+    /// a repeated anchor is `ambiguous_anchor`, whose `data` lists every
+    /// match with its line content so this field can be filled in without
+    /// a second read.
+    #[serde(default)]
+    pub occurrence: Option<usize>,
 }
 
 fn default_context() -> usize {
@@ -394,7 +401,16 @@ fn default_context() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct ReadParams {
     pub root: String,
-    pub path: String,
+    /// The file to read. Exactly one of `path` or `paths`.
+    pub path: Option<String>,
+    /// Several files in one round trip, whole, under one shared byte
+    /// budget consumed in order (022 D-4). The survey call: an agent
+    /// looking at a freshly scaffolded tree wants 3-6 small files
+    /// *together*, and pricing that at N round trips is what made `ssh`
+    /// look cheaper — then cost more, because ssh returns no versions.
+    /// Every entry carries its own `version`, usable as an edit base.
+    /// `range` and `window` are single-path only.
+    pub paths: Option<Vec<String>>,
     /// Explicit line range; mutually exclusive with `window`.
     pub range: Option<RangeParam>,
     /// N context lines around a line or unique anchor — the cheap
@@ -465,6 +481,12 @@ pub struct EditParams {
     /// match is named here.
     #[serde(default)]
     pub allow_secrets: Vec<String>,
+    /// Paths this edit may `delete` even though kaed will retain no content
+    /// for them — a classified file, or one it could not load as text. The
+    /// refusal names the exact paths to pass. Ordinary deletes keep their
+    /// pre-image blob and need nothing here.
+    #[serde(default)]
+    pub drop_paths: Vec<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -615,7 +637,53 @@ struct RootInfo {
     /// a fleet rather than the intersection, so a mid-upgrade fleet never
     /// hides a working feature on its most-updated host.
     capabilities: &'static [&'static str],
+    /// What this root refuses and what it redacts (022 D-3). Published so
+    /// an agent never has to *guess* whether a policy-adjacent path is
+    /// reachable — the guess is free, wrong in the direction of not
+    /// calling, and produces no error anyone can see.
+    policy: RootPolicy,
 }
+
+/// A root's policy, in the call every client already makes at session start.
+///
+/// Disclosing it is safe by construction: deny and classify matching are
+/// lexical and absolute, never touching the filesystem, so these patterns
+/// say what the *rules* are and nothing about what exists. The counter —
+/// that publishing tells a client exactly what is being kept from it — is
+/// answered by kaed's actual threat model: authenticated agents, per-author
+/// tokens, and a journal naming every edit. See 022 D-3.
+#[derive(Serialize, Clone)]
+struct RootPolicy {
+    /// Glob patterns that refuse a path outright (`denied`,
+    /// `reason: server_denylist`). A path matching none of these is not
+    /// necessarily writable — the OS still has a say, and `dry_run` is the
+    /// way to find out for certain.
+    deny: Vec<String>,
+    /// Absolute prefixes refused unconditionally that fall *inside* this
+    /// root. Usually empty: kaed's own config and journal homes normally
+    /// sit outside every root.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deny_prefixes: Vec<String>,
+    /// Glob patterns that mark a file secret-bearing. These do not refuse:
+    /// a classified file reads redacted and is edited through typed env
+    /// ops (R9). Published for the same reason as `deny` — an agent that
+    /// knows a path will come back redacted does not route around kaed to
+    /// avoid a refusal that was never going to happen.
+    classify: Vec<String>,
+    /// Policy layers this list does NOT include, named so the absence is a
+    /// disclosure rather than a gap: per-directory `.kaedignore` files and
+    /// the in-file `kaedignore` marker are discovered at access time, and
+    /// unix ownership is the OS's answer, not kaed's.
+    also_enforced: &'static [&'static str],
+}
+
+/// The layers `roots` cannot enumerate up front, named on every root so the
+/// published policy is honest about being partial (022 D-3).
+const POLICY_ALSO_ENFORCED: &[&str] = &[
+    ".kaedignore files (per-directory, read at access time)",
+    "in-file `kaedignore` marker (checked where content is opened)",
+    "unix ownership (reported as not_readable_by_service_identity / not_writable_by_service_identity)",
+];
 
 /// Which hosts should run kaed, and what is known about them — korg #930,
 /// answered in the response every MCP client already fetches.
@@ -673,7 +741,7 @@ struct FleetHostInfo {
 #[tool_router]
 impl KaedServer {
     #[tool(
-        description = "List the workspace roots this fleet serves, and what is known about each host. Root names are host-qualified (`kai:src`) — pass one verbatim as `root`, with a root-relative `path`. Peers with configured routing are probed live under YOUR identity: their roots appear here and are directly addressable (calls are proxied, journaled on the target under your name), and a declared host that is not answering appears as status `unreachable` with `since` — a fact to reason about, not a wiring failure. A host declared `deferred` is deliberately not running kaed (`ref` says why) and must not be \"fixed\"; `fleet.declared: false` means this host declares no fleet at all, so absence from the list means nothing."
+        description = "List the workspace roots this fleet serves, and what is known about each host. Root names are host-qualified (`kai:src`) — pass one verbatim as `root`, with a root-relative `path`. Peers with configured routing are probed live under YOUR identity: their roots appear here and are directly addressable (calls are proxied, journaled on the target under your name), and a declared host that is not answering appears as status `unreachable` with `since` — a fact to reason about, not a wiring failure. A host declared `deferred` is deliberately not running kaed (`ref` says why) and must not be \"fixed\"; `fleet.declared: false` means this host declares no fleet at all, so absence from the list means nothing. Each root carries its `policy` — the deny globs that refuse a path outright and the classify globs that serve it redacted — so you never have to GUESS whether a policy-adjacent path is reachable and route around kaed on that guess. It is the rules, not the filesystem: deny matching is lexical, so a pattern list discloses policy and never what exists. `policy.also_enforced` names the layers this cannot list up front (.kaedignore, the in-file marker, unix ownership); for those, and for writability, `edit` with `dry_run` is the definitive answer."
     )]
     async fn roots(
         &self,
@@ -691,6 +759,12 @@ impl KaedServer {
                 description: r.description.clone(),
                 status: "active",
                 capabilities: ROOT_CAPABILITIES,
+                policy: RootPolicy {
+                    deny: r.deny.patterns().to_vec(),
+                    deny_prefixes: r.deny.builtin_prefixes_within(&r.path),
+                    classify: r.classify.describe(),
+                    also_enforced: POLICY_ALSO_ENFORCED,
+                },
             };
             root_entries.push(
                 serde_json::to_value(info).map_err(|e| {
@@ -882,7 +956,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Read a file: whole (capped), a line `range`, or a `window` of context around a line or unique anchor string. Always returns the whole file's `version` — usable directly as an edit base. Truncation is explicit (`truncated`, `next_offset`)."
+        description = "Read a file: whole (capped), a line `range`, or a `window` of context around a line or an anchor string (`window.occurrence` picks among repeats, exactly as `anchor_replace` does). Always returns the whole file's `version` — usable directly as an edit base. Truncation is explicit (`truncated`, `next_offset`). To survey several small files, pass `paths` instead of `path`: one round trip, whole files, one shared byte budget spent in request order, and **every entry carries its own version** — which a shell `cat` loop does not, so this is the cheaper route as well as the journalled one. Partial success is the contract there: a denied or missing path returns its own error in place and never sinks the rest."
     )]
     async fn read(
         &self,
@@ -891,6 +965,44 @@ impl KaedServer {
         let state = self.state.clone();
         run(move || {
             let root = state.root(&p.root)?;
+
+            // The survey call (022 #2374). Whole-file only: `range` and
+            // `window` address one file by nature.
+            if let Some(paths) = &p.paths {
+                if p.path.is_some() {
+                    return Err(KaedError::invalid_input("pass `path` or `paths`, not both"));
+                }
+                if p.range.is_some() || p.window.is_some() {
+                    return Err(KaedError::invalid_input(
+                        "`range` and `window` address a single file; use `path` for a \
+                         shaped read, or `paths` for whole files",
+                    ));
+                }
+                let result =
+                    fsops::read_many(&root, paths, p.numbered, p.max_bytes, &state.limits)?;
+                // Same digest-index feed as the single read below, per file
+                // that actually came back redacted (012 D-4).
+                for f in &result.files {
+                    if let Some(r) = &f.read
+                        && r.redacted
+                    {
+                        state.journal.record_digests(
+                            &root.name,
+                            &f.path,
+                            &crate::secrets::extract_placeholder_digests(&r.content),
+                        );
+                    }
+                }
+                return serde_json::to_value(result)
+                    .map_err(|e| KaedError::internal(format!("serializing multi-read: {e}")));
+            }
+
+            let Some(path) = p.path.as_deref() else {
+                return Err(KaedError::invalid_input(
+                    "`read` needs `path` (one file) or `paths` (several)",
+                ));
+            };
+
             let mode = match (&p.range, &p.window) {
                 (Some(_), Some(_)) => {
                     return Err(KaedError::invalid_input(
@@ -902,13 +1014,22 @@ impl KaedServer {
                     end: r.end,
                 },
                 (None, Some(w)) => match (&w.line, &w.anchor) {
-                    (Some(line), None) => ReadMode::WindowLine {
-                        line: *line,
-                        context: w.context,
-                    },
+                    (Some(line), None) => {
+                        if w.occurrence.is_some() {
+                            return Err(KaedError::invalid_input(
+                                "`occurrence` picks among anchor matches; it means nothing \
+                                 with `line`",
+                            ));
+                        }
+                        ReadMode::WindowLine {
+                            line: *line,
+                            context: w.context,
+                        }
+                    }
                     (None, Some(anchor)) => ReadMode::WindowAnchor {
                         anchor,
                         context: w.context,
+                        occurrence: w.occurrence,
                     },
                     _ => {
                         return Err(KaedError::invalid_input(
@@ -918,14 +1039,7 @@ impl KaedServer {
                 },
                 (None, None) => ReadMode::Whole,
             };
-            let result = fsops::read(
-                &root,
-                &p.path,
-                &mode,
-                p.numbered,
-                p.max_bytes,
-                &state.limits,
-            )?;
+            let result = fsops::read(&root, path, &mode, p.numbered, p.max_bytes, &state.limits)?;
             // A redacted read feeds the known-digest index (012 D-4): the
             // rendering already disclosed these digests, so indexing them
             // discloses nothing further — it is what lets the write path
@@ -935,11 +1049,12 @@ impl KaedServer {
             if result.redacted {
                 state.journal.record_digests(
                     &root.name,
-                    &p.path,
+                    path,
                     &crate::secrets::extract_placeholder_digests(&result.content),
                 );
             }
-            Ok(result)
+            serde_json::to_value(result)
+                .map_err(|e| KaedError::internal(format!("serializing read: {e}")))
         })
         .await
     }
@@ -980,7 +1095,7 @@ impl KaedServer {
     }
 
     #[tool(
-        description = "Transactional edit: anchor_replace / range_replace / create ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Writes into UNclassified files are scanned for leaking secrets: content matching a known secret's digest, a provider token prefix, or a private-key block refuses with `reason: secret_leak` naming the exact `allow_secrets` override to pass if the write is deliberate (reference the variable instead of the value where you can); merely secret-shaped content applies with a warning. Supports dry_run — and dry_run models WRITABILITY, so a path the service identity cannot write refuses on the dry run too rather than returning a diff for a write that cannot land."
+        description = "Transactional edit: anchor_replace / range_replace / create / delete ops, plus env_set / env_rename / env_delete / env_reorder for dotenv-shaped files — multi-file, atomic, all land or none do. Every non-create path must appear in `base` with its version; a mismatch fails with version_conflict carrying a delta of what changed. The returned diff is proof of what was applied: no verification read needed. Classified (secret-bearing) files take only env ops; placeholders from a redacted read pass through as values verbatim and kaed substitutes the real value on write. A write that would destroy a value requires naming its key in `drop_keys`. Writes into UNclassified files are scanned for leaking secrets: content matching a known secret's digest, a provider token prefix, or a private-key block refuses with `reason: secret_leak` naming the exact `allow_secrets` override to pass if the write is deliberate (reference the variable instead of the value where you can); merely secret-shaped content applies with a warning. Supports dry_run — and dry_run models WRITABILITY, so a path the service identity cannot write refuses on the dry run too rather than returning a diff for a write that cannot land. `delete` removes a file (declare it in `base` like any other non-create op, so deleting one that moved since you looked is a version_conflict): it journals the pre-image when kaed could have edited the file, so `revert` puts it back, and the response says `recoverable` per file at the time of the act. When it could NOT retain the content — a classified file, whose redacted blob would restore placeholders as literal text — it refuses until you name that path in `drop_paths`, then hard-deletes. Directories are refused: name the files."
     )]
     async fn edit(
         &self,
@@ -1027,6 +1142,7 @@ impl KaedServer {
                 intent: p.intent,
                 drop_keys: p.drop_keys,
                 allow_secrets: p.allow_secrets,
+                drop_paths: p.drop_paths,
             };
             txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
         })

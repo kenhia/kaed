@@ -56,6 +56,18 @@ pub enum EditOp {
         end: usize,
         new_text: String,
     },
+    /// Remove a file. The path must be declared in `base` like any other
+    /// non-create op, so deleting a file someone changed since you looked
+    /// is a `version_conflict` rather than a silent win.
+    ///
+    /// What the journal keeps is decided by whether it *could* restore the
+    /// file (022 D-5): an unclassified file that loads as text keeps its
+    /// pre-image blob under the ordinary retention, and the response says
+    /// `recoverable: true`. A classified file keeps none — a redacted blob
+    /// restores placeholders as literal text, which is negative recovery
+    /// value, and 008 D-11 keeps no plaintext shadow. Directories are
+    /// refused outright (022 D-7): name the files.
+    Delete { path: String },
     /// Create a file (parent directories are created as needed).
     Create {
         path: String,
@@ -129,6 +141,7 @@ impl EditOp {
             EditOp::AnchorReplace { path, .. }
             | EditOp::RangeReplace { path, .. }
             | EditOp::Create { path, .. }
+            | EditOp::Delete { path }
             | EditOp::EnvSet { path, .. }
             | EditOp::EnvRename { path, .. }
             | EditOp::EnvDelete { path, .. }
@@ -156,6 +169,12 @@ pub struct EditRequest {
     /// provider prefix, an armor label. Naming the specific match keeps
     /// each secret's disclosure a per-decision act, like `drop_keys`.
     pub allow_secrets: Vec<String>,
+    /// Paths this transaction may delete **unrecoverably** (022 D-8). A
+    /// `delete` whose content kaed cannot retain — classified, binary, or
+    /// past `max_file_bytes` — refuses unless its path is named here. Same
+    /// shape and same reason as `drop_keys`: destroying something kaed
+    /// cannot give back is a per-decision act, not a default.
+    pub drop_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -164,7 +183,38 @@ pub struct FileChange {
     /// Absent for created files.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub old_version: Option<String>,
-    pub new_version: String,
+    /// Absent for deleted files — there is no content to address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_version: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+    /// On a delete only (022 D-6): whether kaed retained the content, and
+    /// so whether `revert` could put the file back. Answered here, at the
+    /// time of the act, rather than discovered on a later revert attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recoverable: Option<bool>,
+    /// Why not, when `recoverable` is `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unrecoverable_because: Option<&'static str>,
+}
+
+/// Why a delete could not retain the file's content, or `None` when it can.
+///
+/// `load_text` has already refused binaries and anything past
+/// `max_file_bytes`, so a buffer that got this far with content is exactly
+/// the set kaed could have edited — which is the bound (022 D-5).
+fn delete_unrecoverable_reason(buf: &FileBuf) -> Option<&'static str> {
+    if buf.classified.is_some() {
+        // A redacted blob restores placeholders as literal text: negative
+        // recovery value, and 008 D-11 keeps no plaintext shadow.
+        return Some(
+            "classified: the journal would hold a redacted rendering, which cannot restore the file",
+        );
+    }
+    if buf.old_content.is_none() {
+        return Some("no pre-image was loaded for this path");
+    }
+    None
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -305,6 +355,10 @@ struct FileBuf {
     /// drives the vanish guard, the redacted diff, and what the journal
     /// retains.
     classified: Option<String>,
+    /// This file is being removed (022). `content` is then meaningless and
+    /// every stage that writes bytes skips it; `old_content` is what the
+    /// journal may or may not retain.
+    deleted: bool,
 }
 
 /// Apply a transaction, recording the attempt either way.
@@ -379,7 +433,7 @@ fn apply_inner(
                 KaedError::version_conflict(VersionConflictData {
                     path: b.path.clone(),
                     expected_version: b.version.clone(),
-                    actual_version: "absent".into(),
+                    actual_version: VERSION_ABSENT.into(),
                     delta: "(file no longer exists)".into(),
                 })
             } else {
@@ -428,6 +482,7 @@ fn apply_inner(
                 mode: loaded.mode,
                 touched: false,
                 classified,
+                deleted: false,
             },
         );
     }
@@ -436,6 +491,34 @@ fn apply_inner(
     for op in &req.ops {
         let path = op.path();
         match op {
+            EditOp::Delete { path } => {
+                // Directories are refused outright (022 D-7): an agent that
+                // wants a tree gone names the files. It bounds the blast
+                // radius, keeps the atomicity story unchanged, and avoids a
+                // journal entry that cannot honestly say what it destroyed.
+                let abs = fsops::resolve_creatable(root, path)?;
+                if abs.is_dir() {
+                    return Err(KaedError::invalid_input(format!(
+                        "{path} is a directory; `delete` removes files. Name the files, or \
+                         use `list` to enumerate them first."
+                    ))
+                    .with_data(serde_json::json!({
+                        "reason": "delete_is_files_only",
+                        "path": path,
+                    })));
+                }
+                // Declared in `base` like any other non-create op, so the
+                // stale-world case is a conflict and not a silent win.
+                let buf = declared_any(&mut bufs, path)?;
+                if buf.old_version.is_none() {
+                    return Err(KaedError::invalid_input(format!(
+                        "{path}: this transaction created it — creating and deleting the \
+                         same path in one transaction is a no-op written two ways"
+                    )));
+                }
+                buf.deleted = true;
+                buf.touched = true;
+            }
             EditOp::Create {
                 path,
                 content,
@@ -483,6 +566,7 @@ fn apply_inner(
                                 mode,
                                 touched: true,
                                 classified,
+                                deleted: false,
                             },
                         );
                     } else {
@@ -496,6 +580,7 @@ fn apply_inner(
                                 mode,
                                 touched: true,
                                 classified,
+                                deleted: false,
                             },
                         );
                     }
@@ -622,6 +707,7 @@ fn apply_inner(
                             mode: CREATE_MODE,
                             touched: true,
                             classified,
+                            deleted: false,
                         },
                     );
                 }
@@ -630,7 +716,7 @@ fn apply_inner(
             }
         }
         let buf = &bufs[path];
-        if buf.content.len() as u64 > limits.max_file_bytes {
+        if !buf.deleted && buf.content.len() as u64 > limits.max_file_bytes {
             return Err(KaedError::too_large(format!(
                 "{path}: edit result ({} bytes) exceeds max_file_bytes {}",
                 buf.content.len(),
@@ -648,7 +734,10 @@ fn apply_inner(
     // create/overwrite. Renames and placeholder passthrough preserve the
     // value and trip nothing.
     for (path, buf) in &touched {
-        if buf.classified.is_none() {
+        if buf.classified.is_none() || buf.deleted {
+            // A delete destroys every value at once, which is what
+            // `drop_paths` acknowledges — enumerating the keys would be a
+            // second, weaker gate on the same act (022 D-8).
             continue;
         }
         let before = buf.old_content.as_deref().and_then(dotenv::parse);
@@ -680,7 +769,10 @@ fn apply_inner(
     let mut leak_warnings: Vec<String> = Vec::new();
     if root.leak_checks != leak::LeakChecks::Off {
         for (path, buf) in &touched {
-            if buf.classified.is_some() {
+            // Nothing is being written, so nothing can leak *in*. The edit
+            // removing a token was always allowed (012 D-1); removing the
+            // whole file is the same direction.
+            if buf.classified.is_some() || buf.deleted {
                 continue;
             }
             let matches = leak::scan(buf.old_content.as_deref(), &buf.content, |ds| {
@@ -713,12 +805,74 @@ fn apply_inner(
         return Err(leak_refusal(&leak_refused));
     }
 
+    // Deletes: what can be given back, and the acknowledgement for what
+    // cannot (022 D-5, D-8).
+    //
+    // The bound is the one that already exists rather than a new number: a
+    // delete is recoverable exactly when kaed could have *edited* the file,
+    // because the blob it retains is the same blob the edit path already
+    // writes, under the same `blob_retention_days` and the same redaction
+    // machinery. Binaries and oversized files need no special case —
+    // `load_text` refuses them, so they never reach here with content.
+    //
+    // Classified files get no blob and that is stricter than `edit` on
+    // purpose: `edit` journals a *redacted* rendering, and restoring one
+    // writes `⟨kaed:KEY@digest⟩` as literal text — a file that looks real
+    // and is corrupt, with the values gone either way. A redacted
+    // delete-blob buys audit value at the price of negative recovery
+    // value. 008 D-11 stays intact: still no plaintext shadow.
+    let mut unacknowledged: Vec<(String, &'static str)> = Vec::new();
+    for (path, buf) in &touched {
+        if !buf.deleted {
+            continue;
+        }
+        if let Some(reason) = delete_unrecoverable_reason(buf)
+            && !req.drop_paths.contains(*path)
+        {
+            unacknowledged.push(((*path).clone(), reason));
+        }
+    }
+    if !unacknowledged.is_empty() {
+        let paths: Vec<&str> = unacknowledged.iter().map(|(p, _)| p.as_str()).collect();
+        return Err(KaedError::invalid_input(format!(
+            "this transaction deletes {paths:?} unrecoverably — kaed will retain no content \
+             for {}, so `revert` can never restore {}. Pass drop_paths: {paths:?} to \
+             confirm.",
+            if paths.len() == 1 { "it" } else { "them" },
+            if paths.len() == 1 { "it" } else { "them" },
+        ))
+        .with_data(serde_json::json!({
+            "reason": "delete_would_be_unrecoverable",
+            "paths": unacknowledged
+                .iter()
+                .map(|(p, why)| serde_json::json!({"path": p, "why": why}))
+                .collect::<Vec<_>>(),
+        })));
+    }
+
     let files: Vec<FileChange> = touched
         .iter()
-        .map(|(path, buf)| FileChange {
-            path: (*path).clone(),
-            old_version: buf.old_version.clone(),
-            new_version: fsops::version_of(buf.content.as_bytes()),
+        .map(|(path, buf)| {
+            if buf.deleted {
+                return FileChange {
+                    path: (*path).clone(),
+                    old_version: buf.old_version.clone(),
+                    new_version: None,
+                    deleted: true,
+                    // D-6: say at the time whether this was reversible, not
+                    // on some later attempt to revert it.
+                    recoverable: Some(delete_unrecoverable_reason(buf).is_none()),
+                    unrecoverable_because: delete_unrecoverable_reason(buf),
+                };
+            }
+            FileChange {
+                path: (*path).clone(),
+                old_version: buf.old_version.clone(),
+                new_version: Some(fsops::version_of(buf.content.as_bytes())),
+                deleted: false,
+                recoverable: None,
+                unrecoverable_because: None,
+            }
         })
         .collect();
     // For classified files the diff is over redacted renderings — the
@@ -727,15 +881,24 @@ fn apply_inner(
         touched
             .iter()
             .map(|(path, buf)| {
+                // A delete is a diff to nothing. For a classified file
+                // that is a diff of the redacted rendering to nothing, so
+                // the proof still shows placeholders and never values.
+                let after = if buf.deleted { "" } else { &buf.content };
                 if buf.classified.is_some() {
                     let old_view = buf
                         .old_content
                         .as_deref()
                         .map(redact_view)
                         .unwrap_or_default();
-                    unified_diff(&old_view, &redact_view(&buf.content), path)
+                    let new_view = if buf.deleted {
+                        String::new()
+                    } else {
+                        redact_view(after)
+                    };
+                    unified_diff(&old_view, &new_view, path)
                 } else {
-                    unified_diff(buf.old_content.as_deref().unwrap_or(""), &buf.content, path)
+                    unified_diff(buf.old_content.as_deref().unwrap_or(""), after, path)
                 }
             })
             .collect::<Vec<_>>()
@@ -791,8 +954,14 @@ fn apply_inner(
     }
 
     // Stage everything before any rename; abort cleanly on any failure.
+    // Deletes stage nothing — there are no bytes — but they still take
+    // effect only in the promote phase below, so the transaction is as
+    // atomic as it was.
     let mut staged = Vec::new();
     for (path, buf) in &touched {
+        if buf.deleted {
+            continue;
+        }
         match fsops::stage(&buf.abs, buf.content.as_bytes(), buf.mode & 0o7777) {
             Ok(s) => staged.push(s),
             Err(e) => {
@@ -817,11 +986,18 @@ fn apply_inner(
         .iter()
         .zip(&files)
         .map(|((path, buf), change)| {
-            let (added, removed) = diffstat(buf.old_content.as_deref().unwrap_or(""), &buf.content);
+            let after = if buf.deleted { "" } else { &buf.content };
+            let (added, removed) = diffstat(buf.old_content.as_deref().unwrap_or(""), after);
             let redacted = buf.classified.is_some();
             // classified content is journaled as its redacted rendering;
             // content kaed cannot redact is withheld outright (D-11)
-            let (blob_old, blob_new) = if redacted {
+            let (blob_old, blob_new) = if buf.deleted {
+                // The pre-image only, and only when it can actually
+                // restore the file (022 D-5). There is no post-image: the
+                // path is gone.
+                let keep = delete_unrecoverable_reason(buf).is_none();
+                (keep.then(|| buf.old_content.clone()).flatten(), None)
+            } else if redacted {
                 (
                     buf.old_content.as_deref().and_then(try_redact),
                     try_redact(&buf.content),
@@ -832,7 +1008,14 @@ fn apply_inner(
             FileTxnRecord {
                 path: (*path).clone(),
                 old_version: buf.old_version.clone(),
-                new_version: change.new_version.clone(),
+                // A deleted path has no content to address. `absent` is the
+                // vocabulary a `version_conflict` already uses for a file
+                // that is no longer there, so a reader meets one word, not
+                // two — and the row stays NOT NULL without a migration.
+                new_version: change
+                    .new_version
+                    .clone()
+                    .unwrap_or_else(|| VERSION_ABSENT.to_owned()),
                 lines_added: added,
                 lines_removed: removed,
                 blob_old,
@@ -857,6 +1040,22 @@ fn apply_inner(
     for s in &staged {
         fsops::promote(s)?;
     }
+    // Unlinks ride the same phase as the renames: past the first promote
+    // there is no rollback either way, and the journal entry is already
+    // written, so a failure here leaves the same torn-txn signal startup
+    // detection looks for.
+    for (path, buf) in &touched {
+        if !buf.deleted {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(&buf.abs) {
+            // ENOENT means it went while we held the lock — the intended
+            // end state, reached by someone else. Anything else is real.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(KaedError::internal(format!("removing {path}: {e}")));
+            }
+        }
+    }
     recorder.complete(txn_id)?;
 
     // Flagged and override-allowed leaks are journaled with the
@@ -880,7 +1079,37 @@ fn apply_inner(
     })
 }
 
+/// A buffer this transaction already deleted, for an op that needs content.
+/// Ops run in order, so `edit` then `delete` is coherent and the reverse is
+/// not — saying so beats writing bytes to a path about to be unlinked.
+fn refuse_if_deleted(buf: &FileBuf, path: &str) -> Result<()> {
+    if buf.deleted {
+        return Err(KaedError::invalid_input(format!(
+            "{path}: an earlier op in this transaction deleted it; ops run in order, so \
+             edit before deleting, not after"
+        )));
+    }
+    Ok(())
+}
+
+/// The version string standing for "this path holds no content". Used by a
+/// `version_conflict` on a file that vanished, and by a delete's journal row
+/// — one word for one fact, and never a valid content address (those are
+/// hex digests).
+pub const VERSION_ABSENT: &str = "absent";
+
 fn declared<'a>(bufs: &'a mut BTreeMap<String, FileBuf>, path: &str) -> Result<&'a mut FileBuf> {
+    let buf = declared_any(bufs, path)?;
+    refuse_if_deleted(buf, path)?;
+    Ok(buf)
+}
+
+/// `declared`, without the deleted check — for `delete` itself, which is
+/// the one op whose subject may legitimately be on its way out.
+fn declared_any<'a>(
+    bufs: &'a mut BTreeMap<String, FileBuf>,
+    path: &str,
+) -> Result<&'a mut FileBuf> {
     bufs.get_mut(path).ok_or_else(|| {
         KaedError::invalid_input(format!(
             "{path}: not declared in base (every edited file needs its version there)"
@@ -1140,6 +1369,7 @@ mod tests {
             intent: None,
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         }
     }
 
@@ -1152,6 +1382,351 @@ mod tests {
 
     fn apply_noop(root: &ResolvedRoot, r: &EditRequest) -> Result<EditOutcome> {
         apply(root, r, &Limits::default(), "test", &NoopRecorder)
+    }
+
+    // ------------------------------------------------- delete (022 #2377)
+
+    /// The reporting instance: a lock file created through kaed and
+    /// released with `ssh … rm`, so half the lifecycle left the journal by
+    /// construction. Both halves are kaed's now.
+    #[test]
+    fn delete_removes_the_file_and_reports_it_recoverable() {
+        let (dir, root) = setup();
+        let v = write(dir.path(), "lock", "held\n");
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("lock", &v)],
+                vec![EditOp::Delete {
+                    path: "lock".into(),
+                }],
+            ),
+        )
+        .unwrap();
+
+        assert!(out.applied);
+        assert!(!dir.path().join("lock").exists());
+        assert_eq!(out.files.len(), 1);
+        assert!(out.files[0].deleted);
+        assert_eq!(out.files[0].new_version, None);
+        assert_eq!(out.files[0].old_version.as_deref(), Some(v.as_str()));
+        // D-6: said at the time of the act, not on a later revert attempt
+        assert_eq!(out.files[0].recoverable, Some(true));
+        assert_eq!(out.files[0].unrecoverable_because, None);
+        // the diff is the proof, and for a delete it is content -> nothing
+        assert!(out.diff.unwrap().contains("-held"));
+    }
+
+    /// It rides the existing transaction: multi-file, atomic, all-or-none
+    /// with the other ops.
+    #[test]
+    fn delete_is_atomic_with_the_other_ops() {
+        let (dir, root) = setup();
+        let a = write(dir.path(), "a.txt", "alpha\n");
+        let b = write(dir.path(), "b.txt", "beta\n");
+
+        // the failing op is last, and the delete must not have happened
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base("a.txt", &a), base("b.txt", &b)],
+                vec![
+                    EditOp::Delete {
+                        path: "a.txt".into(),
+                    },
+                    EditOp::AnchorReplace {
+                        path: "b.txt".into(),
+                        old_text: "nowhere".into(),
+                        new_text: "x".into(),
+                        occurrence: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::AnchorNotFound);
+        assert!(
+            dir.path().join("a.txt").exists(),
+            "the delete rolled back with the rest of the transaction"
+        );
+
+        // and the happy path does both
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("a.txt", &a), base("b.txt", &b)],
+                vec![
+                    EditOp::Delete {
+                        path: "a.txt".into(),
+                    },
+                    EditOp::AnchorReplace {
+                        path: "b.txt".into(),
+                        old_text: "beta".into(),
+                        new_text: "gamma".into(),
+                        occurrence: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(!dir.path().join("a.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "gamma\n"
+        );
+    }
+
+    /// Deleting a file someone else moved since you looked is a conflict,
+    /// not a silent win.
+    #[test]
+    fn delete_of_a_changed_file_is_a_version_conflict() {
+        let (dir, root) = setup();
+        let stale = write(dir.path(), "f.txt", "first\n");
+        write(dir.path(), "f.txt", "someone else got here\n");
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base("f.txt", &stale)],
+                vec![EditOp::Delete {
+                    path: "f.txt".into(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::VersionConflict);
+        assert!(dir.path().join("f.txt").exists());
+    }
+
+    #[test]
+    fn delete_needs_the_path_declared_in_base() {
+        let (dir, root) = setup();
+        write(dir.path(), "f.txt", "x\n");
+        let err = apply_noop(
+            &root,
+            &req(
+                Vec::new(),
+                vec![EditOp::Delete {
+                    path: "f.txt".into(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("not declared in base"));
+        assert!(dir.path().join("f.txt").exists());
+    }
+
+    /// D-7: directories are refused outright. An agent that wants a tree
+    /// gone names the files — it bounds the blast radius and avoids a
+    /// journal entry that cannot honestly say what it destroyed.
+    #[test]
+    fn delete_refuses_a_directory_and_says_to_name_the_files() {
+        let (dir, root) = setup();
+        write(dir.path(), "sub/f.txt", "x\n");
+        let err = apply_noop(
+            &root,
+            &req(Vec::new(), vec![EditOp::Delete { path: "sub".into() }]),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert_eq!(
+            err.data.unwrap()["reason"],
+            serde_json::json!("delete_is_files_only")
+        );
+        assert!(dir.path().join("sub/f.txt").exists());
+    }
+
+    /// Ops run in order, so edit-then-delete is coherent and the reverse
+    /// is not. Saying so beats writing bytes to a path about to be gone.
+    #[test]
+    fn an_op_after_a_delete_in_the_same_transaction_is_refused() {
+        let (dir, root) = setup();
+        let v = write(dir.path(), "f.txt", "alpha\n");
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base("f.txt", &v)],
+                vec![
+                    EditOp::Delete {
+                        path: "f.txt".into(),
+                    },
+                    EditOp::AnchorReplace {
+                        path: "f.txt".into(),
+                        old_text: "alpha".into(),
+                        new_text: "beta".into(),
+                        occurrence: None,
+                    },
+                ],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("edit before deleting"));
+        assert!(dir.path().join("f.txt").exists());
+
+        // the other order is fine
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("f.txt", &v)],
+                vec![
+                    EditOp::AnchorReplace {
+                        path: "f.txt".into(),
+                        old_text: "alpha".into(),
+                        new_text: "beta".into(),
+                        occurrence: None,
+                    },
+                    EditOp::Delete {
+                        path: "f.txt".into(),
+                    },
+                ],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(!dir.path().join("f.txt").exists());
+    }
+
+    /// D-8: destroying something kaed cannot give back is a per-decision
+    /// act, the same shape and the same reason as `drop_keys`.
+    ///
+    /// D-5 is why a classified file is in that set at all, and it makes
+    /// `delete` deliberately STRICTER than `edit`: `edit` journals a
+    /// redacted blob, but you cannot restore from one — it would write
+    /// `⟨kaed:KEY@digest⟩` back as literal text, a file that looks real and
+    /// is corrupt. Audit value at the price of negative recovery value. So
+    /// the honest answer is to keep nothing and say so.
+    #[test]
+    fn deleting_a_classified_file_refuses_until_the_loss_is_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ResolvedRoot::with_default_classify("t", dir.path().canonicalize().unwrap());
+        let v = write(dir.path(), ".env", "TOKEN=sk-live-abcdefghijklmnop\n");
+
+        let err = apply_noop(
+            &root,
+            &req(
+                vec![base(".env", &v)],
+                vec![EditOp::Delete {
+                    path: ".env".into(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let data = err.data.unwrap();
+        assert_eq!(
+            data["reason"],
+            serde_json::json!("delete_would_be_unrecoverable")
+        );
+        assert_eq!(data["paths"][0]["path"], ".env");
+        assert!(
+            data["paths"][0]["why"]
+                .as_str()
+                .unwrap()
+                .contains("classified")
+        );
+        assert!(dir.path().join(".env").exists(), "nothing was destroyed");
+
+        // named: it goes, and the response says it was not recoverable
+        let out = apply_noop(
+            &root,
+            &EditRequest {
+                drop_paths: vec![".env".into()],
+                ..req(
+                    vec![base(".env", &v)],
+                    vec![EditOp::Delete {
+                        path: ".env".into(),
+                    }],
+                )
+            },
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert!(!dir.path().join(".env").exists());
+        assert_eq!(out.files[0].recoverable, Some(false));
+        assert!(out.files[0].unrecoverable_because.is_some());
+        // the diff is over the redacted rendering, so the proof of what
+        // was destroyed never contains the value
+        let diff = out.diff.unwrap();
+        assert!(!diff.contains("sk-live-abcdefghijklmnop"), "{diff}");
+        assert!(diff.contains("⟨kaed:TOKEN@"), "{diff}");
+    }
+
+    /// An ordinary delete needs no acknowledgement — the blob makes it
+    /// reversible, and Ken's framing is the one that settles it: the route
+    /// an agent reaches for otherwise is `rm`, unrecoverable 100% of the
+    /// time. Partial recoverability strictly dominates.
+    #[test]
+    fn an_ordinary_delete_needs_no_acknowledgement() {
+        let (dir, root) = setup();
+        let v = write(dir.path(), "notes.md", "x\n");
+        let out = apply_noop(
+            &root,
+            &req(
+                vec![base("notes.md", &v)],
+                vec![EditOp::Delete {
+                    path: "notes.md".into(),
+                }],
+            ),
+        )
+        .unwrap();
+        assert!(out.applied);
+        assert_eq!(out.files[0].recoverable, Some(true));
+    }
+
+    /// A dry run probes for real and destroys nothing (014 D-4).
+    #[test]
+    fn delete_dry_run_reports_without_removing() {
+        let (dir, root) = setup();
+        let v = write(dir.path(), "f.txt", "x\n");
+        let out = apply_noop(
+            &root,
+            &EditRequest {
+                dry_run: true,
+                ..req(
+                    vec![base("f.txt", &v)],
+                    vec![EditOp::Delete {
+                        path: "f.txt".into(),
+                    }],
+                )
+            },
+        )
+        .unwrap();
+        assert!(!out.applied);
+        assert!(out.files[0].deleted);
+        assert_eq!(out.files[0].recoverable, Some(true));
+        assert!(dir.path().join("f.txt").exists());
+    }
+
+    /// R7's three-places rule: `delete` ADDRESSES a path, so
+    /// `resolve_creatable` covers it and no `filter_entry` work is needed
+    /// — but a new op is exactly where that invariant gets missed, so it
+    /// is pinned rather than assumed.
+    #[test]
+    fn delete_is_refused_by_the_deny_list_like_every_other_addressed_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(path.join("secrets")).unwrap();
+        std::fs::write(path.join("secrets/index.md"), "x\n").unwrap();
+        let root = ResolvedRoot {
+            deny: std::sync::Arc::new(
+                crate::deny::DenyList::new(Vec::new(), &["**/secrets".to_string()]).unwrap(),
+            ),
+            ..ResolvedRoot::unrestricted("t", path.clone())
+        };
+        let err = apply_noop(
+            &root,
+            &req(
+                Vec::new(),
+                vec![EditOp::Delete {
+                    path: "secrets/index.md".into(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Denied);
+        assert!(path.join("secrets/index.md").exists());
     }
 
     #[test]
@@ -1179,8 +1754,8 @@ mod tests {
         assert_eq!(out.files.len(), 1);
         assert_eq!(out.files[0].old_version.as_deref(), Some(v.as_str()));
         assert_eq!(
-            out.files[0].new_version,
-            fsops::version_of(b"fn new() {}\nrest\n")
+            out.files[0].new_version.as_deref(),
+            Some(fsops::version_of(b"fn new() {}\nrest\n").as_str())
         );
         let diff = out.diff.unwrap();
         assert!(diff.contains("-fn old() {}"));
@@ -1571,6 +2146,7 @@ mod tests {
             intent: None,
             drop_keys: Vec::new(),
             allow_secrets: Vec::new(),
+            drop_paths: Vec::new(),
         };
         let dry = apply(&root, &req(true), &Limits::default(), "test", &NoopRecorder).unwrap_err();
         let wet = apply(
@@ -1628,6 +2204,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "test",
@@ -1690,6 +2267,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "test",
@@ -1878,6 +2456,7 @@ mod tests {
                 intent: Some("test intent".into()),
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -2034,6 +2613,7 @@ mod tests {
             &EditRequest {
                 drop_keys: vec!["KLAMS_TOKEN".into()],
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
                 ..req(
                     vec![base(".env", &v)],
                     vec![EditOp::EnvDelete {
@@ -2462,7 +3042,10 @@ mod tests {
         assert!(ok.applied);
         assert_eq!(err.code, ErrorCode::VersionConflict);
         // the loser is told what the file became
-        assert_eq!(err.data.unwrap()["actual_version"], ok.files[0].new_version);
+        assert_eq!(
+            err.data.unwrap()["actual_version"],
+            serde_json::json!(ok.files[0].new_version)
+        );
     }
 
     // ------------------------------------- write-side leak detection (012)

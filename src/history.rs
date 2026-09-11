@@ -754,23 +754,105 @@ pub fn revert(
 
     let mut base = Vec::new();
     let mut ops = Vec::new();
+    let mut drop_paths = Vec::new();
     for f in &row.files {
-        // Undoing a create is a delete, and the `delete` op is a later
-        // slice. Refuse with the reason named rather than skip the file
-        // and report a partial revert as a whole one.
-        let Some(old_version) = &f.old_version else {
-            return Err(refuse(
-                "revert_of_create_needs_delete",
-                format!(
-                    "transaction {txn_id} created {:?}; undoing a create means deleting the \
-                     file, and kaed has no `delete` op yet. Delete it outside kaed, or leave \
-                     it — `journal` records that the create happened either way.",
-                    f.path
-                ),
-                serde_json::json!({ "path": f.path }),
-            ));
-        };
         let abs = fsops::resolve_creatable(root, &f.path)?;
+
+        // Undoing a DELETE is a create: put the pre-image back. The blob
+        // is there exactly when the delete reported `recoverable: true`
+        // (022 D-5), and the ways it can be missing are different facts an
+        // agent should act on differently — "this was never recoverable"
+        // and "this was recoverable until last Tuesday" each get their own
+        // named reason rather than one generic failure (022 D-9).
+        if f.new_version == crate::txn::VERSION_ABSENT {
+            let old_version = f.old_version.as_ref().ok_or_else(|| {
+                refuse(
+                    "nothing_to_restore",
+                    format!(
+                        "transaction {txn_id} recorded {:?} with no pre-image",
+                        f.path
+                    ),
+                    serde_json::json!({ "path": f.path }),
+                )
+            })?;
+            if root.classify.classified_by(&abs).is_some() {
+                return Err(refuse(
+                    "never_recoverable",
+                    format!(
+                        "{:?} is classified, so its delete deliberately retained no content \
+                         (022 D-5: a redacted blob restores placeholders as literal text, \
+                         which is worse than nothing). This was never recoverable — not \
+                         recoverable-until-recently. Re-create the file and set its keys \
+                         with env ops.",
+                        f.path
+                    ),
+                    serde_json::json!({ "path": f.path }),
+                ));
+            }
+            let Some((content, was_redacted)) = crate::txn::TxnRecorder::blob(j, old_version)
+            else {
+                return Err(refuse(
+                    "blob_expired_or_absent",
+                    format!(
+                        "the content of {:?} (version {old_version}) is no longer retained — \
+                         blob content expires after {} days (korg #909) while the metadata \
+                         above is kept forever. It WAS restorable; the window has passed.",
+                        f.path,
+                        j.blob_retention_days()
+                    ),
+                    serde_json::json!({ "path": f.path, "version": old_version }),
+                ));
+            };
+            if was_redacted {
+                return Err(refuse(
+                    "never_recoverable",
+                    format!(
+                        "what the journal holds for {:?} is a redacted rendering, not its \
+                         bytes — restoring it would write placeholders as literals",
+                        f.path
+                    ),
+                    serde_json::json!({ "path": f.path }),
+                ));
+            }
+            if abs.exists() {
+                return Err(refuse(
+                    "path_reoccupied",
+                    format!(
+                        "{:?} exists again since transaction {txn_id} deleted it — restoring \
+                         the pre-image would clobber whatever is there now. Read it, and \
+                         `create` with `overwrite` if that is what you mean.",
+                        f.path
+                    ),
+                    serde_json::json!({ "path": f.path }),
+                ));
+            }
+            ops.push(EditOp::Create {
+                path: f.path.clone(),
+                content,
+                executable: false,
+                overwrite: false,
+            });
+            continue;
+        }
+
+        // Undoing a CREATE is a delete, which kaed has had since 022. The
+        // refusal this replaced said the op was "a later slice"; this is
+        // that slice.
+        let Some(old_version) = &f.old_version else {
+            base.push(BaseVersion {
+                path: f.path.clone(),
+                version: f.new_version.clone(),
+            });
+            ops.push(EditOp::Delete {
+                path: f.path.clone(),
+            });
+            // The content being removed is this transaction's own
+            // post-image, still in the journal, and the caller asked for
+            // exactly this — so the unrecoverable gate has nothing to tell
+            // them they do not already know. Acknowledge on their behalf.
+            drop_paths.push(f.path.clone());
+            continue;
+        };
         // D-4: for a classified file the retained blob is a *rendering*.
         // Restoring it would write `⟨kaed:KEY@digest⟩` into the file as a
         // literal — destroying the value while reporting success, which is
@@ -839,6 +921,7 @@ pub fn revert(
             intent: Some(intent),
             drop_keys: Vec::new(),
             allow_secrets: allow_secrets.to_vec(),
+            drop_paths,
         },
         limits,
         author,
@@ -952,6 +1035,7 @@ mod tests {
                 intent: intent.map(str::to_owned),
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1001,6 +1085,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1203,6 +1288,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1276,7 +1362,7 @@ mod tests {
             &Limits::default(),
         )
         .unwrap();
-        assert_eq!(d.from_version, out.files[0].new_version);
+        assert_eq!(Some(d.from_version), out.files[0].new_version);
         assert_eq!(d.diff, "", "the txn's output is the current content");
     }
 
@@ -1374,6 +1460,7 @@ mod tests {
                 intent: Some(format!("rotating to {VALUE}")),
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1389,7 +1476,7 @@ mod tests {
             (Side::Version(v1.clone()), Side::Current),
             (
                 Side::Version(v1.clone()),
-                Side::Version(out.files[0].new_version.clone()),
+                Side::Version(out.files[0].new_version.clone().unwrap()),
             ),
             (Side::Txn(out.txn_id.unwrap()), Side::Current),
         ] {
@@ -1711,6 +1798,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1745,8 +1833,141 @@ mod tests {
         );
     }
 
+    fn delete_file(root: &ResolvedRoot, j: &Journal, rel: &str, drop: &[&str]) -> EditOutcome {
+        let version = fsops::version_of(std::fs::read(root.path.join(rel)).unwrap().as_slice());
+        txn::apply(
+            root,
+            &EditRequest {
+                base: vec![BaseVersion {
+                    path: rel.into(),
+                    version,
+                }],
+                ops: vec![EditOp::Delete { path: rel.into() }],
+                dry_run: false,
+                return_diff: false,
+                intent: None,
+                drop_keys: Vec::new(),
+                allow_secrets: Vec::new(),
+                drop_paths: drop.iter().map(|s| (*s).to_string()).collect(),
+            },
+            &Limits::default(),
+            "claude",
+            j,
+        )
+        .unwrap()
+    }
+
+    /// 022 D-9: restoring a deleted file is the natural inverse, and the
+    /// most valuable revert kaed could have. The reporting instance was a
+    /// lock file created through kaed and `rm`-ed over ssh; now both ends
+    /// of that lifecycle are journalled and the middle is reversible.
     #[test]
-    fn revert_of_a_create_refuses_and_names_the_missing_op() {
+    fn revert_of_a_delete_puts_the_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_at("kai:t", dir.path());
+        let j = Journal::open_in_memory().unwrap();
+        std::fs::write(dir.path().join("lock"), "held\n").unwrap();
+
+        let gone = delete_file(&root, &j, "lock", &[]);
+        assert_eq!(gone.files[0].recoverable, Some(true));
+        assert!(!dir.path().join("lock").exists());
+
+        let back = revert(
+            &root,
+            &RevertRequest {
+                txn_id: gone.txn_id.unwrap(),
+                dry_run: false,
+                intent: Some("the leg finished"),
+                author: "claude",
+                allow_secrets: &[],
+            },
+            &j,
+            &Limits::default(),
+            "kai",
+            &live(&root),
+        )
+        .unwrap();
+
+        assert!(back.applied);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lock")).unwrap(),
+            "held\n"
+        );
+    }
+
+    /// The three ways a delete cannot be undone are different facts, and
+    /// an agent acts on them differently — "this was never recoverable"
+    /// versus "this was recoverable until the retention window passed".
+    /// Each gets its own named reason rather than one generic failure.
+    #[test]
+    fn revert_of_an_unrecoverable_delete_says_which_kind_of_gone_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = ResolvedRoot::with_default_classify("kai:t", dir.path().canonicalize().unwrap());
+        let j = Journal::open_in_memory().unwrap();
+        std::fs::write(dir.path().join(".env"), "TOKEN=sk-live-abcdefghij\n").unwrap();
+
+        let gone = delete_file(&root, &j, ".env", &[".env"]);
+        assert_eq!(gone.files[0].recoverable, Some(false));
+
+        let err = revert(
+            &root,
+            &RevertRequest {
+                txn_id: gone.txn_id.unwrap(),
+                dry_run: false,
+                intent: None,
+                author: "claude",
+                allow_secrets: &[],
+            },
+            &j,
+            &Limits::default(),
+            "kai",
+            &live(&root),
+        )
+        .unwrap_err();
+        // never_recoverable, NOT blob_expired_or_absent — the distinction
+        // is the point: nothing was ever retained for this one, so no
+        // retention setting would have helped.
+        assert_eq!(err.data.unwrap()["reason"], "never_recoverable");
+        assert!(!dir.path().join(".env").exists());
+    }
+
+    /// Restoring over something that came back on its own would clobber
+    /// it. Say so instead.
+    #[test]
+    fn revert_of_a_delete_refuses_when_the_path_is_occupied_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_at("kai:t", dir.path());
+        let j = Journal::open_in_memory().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "original\n").unwrap();
+
+        let gone = delete_file(&root, &j, "f.txt", &[]);
+        std::fs::write(dir.path().join("f.txt"), "something else entirely\n").unwrap();
+
+        let err = revert(
+            &root,
+            &RevertRequest {
+                txn_id: gone.txn_id.unwrap(),
+                dry_run: false,
+                intent: None,
+                author: "claude",
+                allow_secrets: &[],
+            },
+            &j,
+            &Limits::default(),
+            "kai",
+            &live(&root),
+        )
+        .unwrap_err();
+        assert_eq!(err.data.unwrap()["reason"], "path_reoccupied");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "something else entirely\n",
+            "the file that was there is untouched"
+        );
+    }
+
+    #[test]
+    fn revert_of_a_create_now_deletes_the_file_it_made() {
         let dir = tempfile::tempdir().unwrap();
         let root = root_at("kai:t", dir.path());
         let j = Journal::open_in_memory().unwrap();
@@ -1765,6 +1986,7 @@ mod tests {
                 intent: None,
                 drop_keys: Vec::new(),
                 allow_secrets: Vec::new(),
+                drop_paths: Vec::new(),
             },
             &Limits::default(),
             "claude",
@@ -1772,7 +1994,10 @@ mod tests {
         )
         .unwrap();
 
-        let err = revert(
+        // Before 022 this refused with `revert_of_create_needs_delete`,
+        // whose message said the op was "a later slice". This is that
+        // slice: undoing a create is a delete, and it now works.
+        let undone = revert(
             &root,
             &RevertRequest {
                 txn_id: out.txn_id.unwrap(),
@@ -1786,12 +2011,38 @@ mod tests {
             "kai",
             &live(&root),
         )
-        .unwrap_err();
+        .unwrap();
+
+        assert!(undone.applied);
+        assert!(!dir.path().join("new.txt").exists());
+        assert_eq!(undone.files.len(), 1);
+        assert!(undone.files[0].deleted);
+        assert_eq!(undone.files[0].new_version, None);
+        // the caller asked for exactly this, so the unrecoverable gate is
+        // acknowledged on their behalf rather than refusing the revert
+        assert_eq!(undone.files[0].recoverable, Some(true));
+
+        // and it is itself a journalled transaction, reversible in turn
+        let back = revert(
+            &root,
+            &RevertRequest {
+                txn_id: undone.txn_id.unwrap(),
+                dry_run: false,
+                intent: None,
+                author: "claude",
+                allow_secrets: &[],
+            },
+            &j,
+            &Limits::default(),
+            "kai",
+            &live(&root),
+        )
+        .unwrap();
+        assert!(back.applied);
         assert_eq!(
-            err.data.as_ref().unwrap()["reason"],
-            "revert_of_create_needs_delete"
+            std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
+            "x\n"
         );
-        assert!(dir.path().join("new.txt").exists());
     }
 
     #[test]
