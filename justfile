@@ -46,5 +46,5 @@ publish:
     d=$(ssh -n kubsdb mktemp -d)
     scp target/release/kaed kubsdb:"$d/kaed-$arch"
     scp deploy/install.sh deploy/kaed.service deploy/config.example.toml \
-        deploy/new-token.sh kubsdb:"$d"/
+        kubsdb:"$d"/
     ssh -n kubsdb "kpkg artifact $latest_arg kaed $v $d/* && rm -rf $d"

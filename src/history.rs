@@ -108,6 +108,9 @@ pub enum Entry {
     Txn {
         txn_id: i64,
         author: String,
+        /// The tailnet node the author declared itself from (023), or
+        /// `unknown`. Record only — never a reason a call was refused.
+        node: String,
         /// RFC 3339, the time the transaction began.
         time: String,
         /// `applied` — every rename landed. `torn` — begun and never
@@ -129,6 +132,9 @@ pub enum Entry {
     Failure {
         failure_id: i64,
         author: String,
+        /// The tailnet node the author declared itself from (023), or
+        /// `unknown`. Record only — never a reason a call was refused.
+        node: String,
         time: String,
         root: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -162,6 +168,9 @@ pub enum Entry {
     Secret {
         event_id: i64,
         author: String,
+        /// The tailnet node the author declared itself from (023), or
+        /// `unknown`. Record only — never a reason a call was refused.
+        node: String,
         time: String,
         /// `generate` | `rotate` | `reveal` | `transport`
         action: String,
@@ -301,6 +310,7 @@ pub fn journal(
         let rows = j.failures(&filter)?;
         scanned += rows.len();
         entries.extend(rows.into_iter().map(|f| Entry::Failure {
+            node: f.node.clone(),
             failure_id: f.id,
             author: f.author,
             time: f.failed_at,
@@ -333,6 +343,7 @@ pub fn journal(
         let rows = j.secret_events(&filter)?;
         scanned += rows.len();
         entries.extend(rows.into_iter().map(|e| Entry::Secret {
+            node: e.node.clone(),
             event_id: e.id,
             author: e.author,
             time: e.created_at,
@@ -385,6 +396,7 @@ fn txn_entry(t: TxnRow, roots: &[ResolvedRoot], host: &str) -> Entry {
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.lines_added, r + f.lines_removed));
     Entry::Txn {
+        node: t.node.clone(),
         txn_id: t.id,
         author: t.author,
         time: t.started_at,
@@ -679,6 +691,10 @@ pub struct RevertRequest<'a> {
     /// The identity the revert is journalled under — its own, not that of
     /// the transaction being undone.
     pub author: &'a str,
+    /// The tailnet node that identity arrived from (023), recorded the
+    /// same way and for the same reason: a revert is a new act by a new
+    /// caller, so it carries its own node, not the original's.
+    pub node: &'a str,
     /// Leak-match overrides (012 D-2), passed through to the engine: a
     /// revert that re-introduces a secret the current content lacks is a
     /// re-leak, and refuses like any other write until named here.
@@ -703,6 +719,7 @@ pub fn revert(
         dry_run,
         intent,
         author,
+        node,
         allow_secrets,
     } = *req;
     let Some(row) = j.txn(txn_id)? else {
@@ -925,7 +942,7 @@ pub fn revert(
         },
         limits,
         author,
-        j,
+        &j.as_node(node),
     )
 }
 
@@ -1667,6 +1684,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1689,6 +1707,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1722,6 +1741,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1756,6 +1776,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1813,6 +1834,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1879,6 +1901,7 @@ mod tests {
                 dry_run: false,
                 intent: Some("the leg finished"),
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1916,6 +1939,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -1950,6 +1974,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -2004,6 +2029,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -2030,6 +2056,7 @@ mod tests {
                 dry_run: false,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -2060,6 +2087,7 @@ mod tests {
                 dry_run: true,
                 intent: None,
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,
@@ -2091,6 +2119,7 @@ mod tests {
                 dry_run: false,
                 intent: Some("the change broke the build"),
                 author: "claude",
+                node: "kai",
                 allow_secrets: &[],
             },
             &j,

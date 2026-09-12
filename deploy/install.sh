@@ -14,10 +14,10 @@
 #                  how the fleet deploys (korg #1015).
 #   (default)      build from this checkout with cargo.
 #
-# What this owns:      the binary, `kaed-new-token`, the unit file, and
-#                      (only if absent) a starter config.
+# What this owns:      the binary, the unit file, and (only if absent) a
+#                      starter config.
 # What it never
-# touches:             the token, and any config that already exists.
+# touches:             any config that already exists.
 # What it deliberately
 # leaves alone:        `tailscale serve` and per-host config content —
 #                      those belong to k-homelab's recipes and to you.
@@ -32,9 +32,8 @@
 #                 and does it still match its checksum".
 #   --no-build    do not run cargo; use an existing release binary
 #   --bin PATH    install this prebuilt binary (implies --no-build)
-#   --from-store  fetch the binary, unit file, config template and
-#                 new-token.sh from the package store instead of this
-#                 checkout
+#   --from-store  fetch the binary, unit file and config template from the
+#                 package store instead of this checkout
 #   --store URL   store base URL, e.g. https://host:4880. Also read from
 #                 $KAED_STORE_URL. There is no default, on purpose: a
 #                 guessed hostname fails later as a confusing curl error
@@ -126,7 +125,11 @@ REPO_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 BIN_DST_DIR="$HOME/.local/bin"
 BIN_DST="$BIN_DST_DIR/kaed"
-TOKEN_TOOL_DST="$BIN_DST_DIR/kaed-new-token"
+# Sprint 023 retired token minting and rotation: an identity is a declared
+# name, so there is nothing to mint and nothing to rotate. The path is kept
+# only so a stale copy can be REMOVED — a retired tool left on PATH looks
+# like live rotation machinery for a credential that no longer exists.
+RETIRED_TOKEN_TOOL="$BIN_DST_DIR/kaed-new-token"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT_DST="$UNIT_DIR/kaed.service"
 CONFIG_DIR="$HOME/.config/kaed"
@@ -185,7 +188,7 @@ if [ "$FROM_STORE" -eq 1 ]; then
     # answer: mixing a new unit file with an old binary would be worse, and a
     # clone-less host has nothing to fall back to. Roll back with `.prev` or
     # `--bin` instead.
-    for f in "kaed-$SUFFIX" kaed.service config.example.toml new-token.sh; do
+    for f in "kaed-$SUFFIX" kaed.service config.example.toml; do
         curl -fsS -o "$WORK/$f" "$VERSION_URL/$f" \
             || fail "fetch failed: $VERSION_URL/$f — is $STORE_VERSION published, for $SUFFIX, with a full deploy bundle?"
         line=$(printf '%s\n' "$SUMS" | grep -E "[[:space:]][*]?$f\$" | head -1)
@@ -213,7 +216,7 @@ if [ "$FROM_STORE" -eq 1 ]; then
     ASSET_DIR="$WORK"
 fi
 
-for f in kaed.service config.example.toml new-token.sh; do
+for f in kaed.service config.example.toml; do
     [ -f "$ASSET_DIR/$f" ] || fail "missing $ASSET_DIR/$f"
 done
 
@@ -247,10 +250,10 @@ if [ -f "$BIN_DST" ]; then
 fi
 run "mv -f '$BIN_DST.new' '$BIN_DST'"
 
-# Token minting and rotation are operator work that outlives the install, and
-# a store-installed host has no checkout to run them from. Ships as a command
-# rather than a file you have to go and find.
-run "install -m 0755 '$ASSET_DIR/new-token.sh' '$TOKEN_TOOL_DST'"
+if [ -f "$RETIRED_TOKEN_TOOL" ]; then
+    note "removing kaed-new-token: rotation is retired (sprint 023)"
+    run "rm -f '$RETIRED_TOKEN_TOOL'"
+fi
 
 case ":$PATH:" in
     *":$BIN_DST_DIR:"*) ;;
@@ -313,9 +316,12 @@ Next, in order:
      — roots: name the directories an agent should reach. NOT \$HOME.
      — allowed_hosts: if a proxy fronts kaed, its hostname in BOTH the
        bare and :4870 forms, or requests die before auth runs.
-  2. $TOKEN_TOOL_DST
-  3. kaed check-config          # read the roots and deny rules it prints
-  4. systemctl --user start kaed
+     — [auth]: allow-list the identities that may connect, one name per
+       line (\`claude-<host> = {}\`). There is no token to mint: a caller
+       declares its name in X-Homelab-Agent and an unknown name is
+       refused. Adding a name is a RESTART, not a reload.
+  2. kaed check-config          # read the roots and deny rules it prints
+  3. systemctl --user start kaed
 EOF
 else
     printf '\n  kaed check-config     # confirm what this host can reach\n'

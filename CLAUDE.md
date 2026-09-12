@@ -54,7 +54,7 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–016, 2026-08-12):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–022):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
 auth, serving **MCP `2026-07-28`** fleet-wide since 016 (`0.1.0-af51376`) —
@@ -65,16 +65,18 @@ checkout**, so any instruction to `git pull` on a host is wrong.
 
 **kai is the fleet's gateway since 010** (R10 in the contract;
 `sprints/010-gateway-peer-mode/decisions.md`): calls to kai addressing
-peer roots (`kubs0:*`, `kubsdb:*`) are proxied *as the caller* —
-per-author peer tokens in
-`[peers.<host>.tokens]` on kai (an author without one is refused with
-`no_peer_credential`, never impersonated; PD-4), results and errors pass
+peer roots (`kubs0:*`, `kubsdb:*`) are proxied *as the caller* — since 023
+by **forwarding the caller's declared name**, with no credential held on
+the gateway at all (PD-10; the `[peers.<host>.tokens]` table and
+`no_peer_credential` are retired, and the only config a gateway adds is
+that each backend's `[auth]` must list the identities arriving proxied).
+Results and errors pass
 through verbatim plus a `root` tag on errors, `roots` probes peers live
-(an outage is `status: "unreachable"` + `since`, data not failure), and
+(an outage is `status: "unreachable"` + `since`, data not failure; a
+backend that *answered* and declined the forwarded name is
+`identity_refused`, not unreachable), and
 `search` takes root patterns (`*:*`) for fleet-wide search with per-root
-`fanout` reporting. The tokens table is host-local: k-homelab's
-kaed-service recipe *preserves* it but never writes it (its sprint 023),
-so it is configured by hand per gateway host. Direct per-host URLs remain
+`fanout` reporting. Direct per-host URLs remain
 the documented fallback — the gateway journals no proxied calls (D-7), so
 each host's journal is still the only record of its own edits.
 
@@ -318,32 +320,54 @@ fails, and what the journal structurally cannot tell you — see
   nothing and went beyond its gate: `bin/apply kai kaed-service` was run
   for real, leaving the config byte-identical, so korg #1072's preservation
   fix is now observed rather than inferred.
-- **Every identity has a rotation grace window since 019** (`sprints/
-  019-rotation-grace-windows/decisions.md`; korg #1375, krot program 1374
-  slice 9). krot's audit found `prev_token_file` on **one of nine**
-  (backend × author) credentials, so rotating the other eight was a hard
-  cut. All nine are configured now, and three things stop the tenth being
-  added bare: `kaed-new-token --rotate` **refuses** without a window
-  (`--force` overrides, and deliberately writes no `.prev` — one nothing
-  honours is a live-looking credential on disk), `config.example.toml`
-  ships the window on, and `Config::resolve` warns at startup naming the
-  uncovered identities. Four things not to re-derive: **`prev_token_file`
-  is NOT defaulted to `<token_file>.prev`** (D-2 — the file's existence is
-  what makes a token valid, so a default would silently re-arm a
-  half-abandoned rotation's leftovers as a live credential nobody
-  declared); the warning is in `resolve()`, **not** `resolve_identities()`
-  (D-3 — grace windows are config *shape*, which SIGHUP cannot change, so
-  per-reload warnings would report something no reload could have altered);
-  **`--identity` reads paths out of `config.toml` and never derives them**
-  (D-6 — the original `claude` sits at plain `token` on all three hosts, so
-  any convention needs a special case, and a wrong guess mints a
-  real-looking credential at a path nothing references; an entry the
-  literal one-line-inline-table parser cannot read is a *refusal*, never a
-  fallback); and **peer tokens still get no grace slot** (D-7 — a window is
-  a server-side affordance and `[peers.*.tokens]` is the client half; what
-  the gateway needs is the *ordering* the backend's window supplies, which
-  `docs/setup.md` now spells out). Adding `prev_token_file` is a config-shape
-  change, so it is a **restart**, not a SIGHUP — same trap as 018 D-3.
+- **019's rotation machinery is GONE, retired by 023** — don't go looking for
+  `kaed-new-token`, `prev_token_file`'s grace window, or
+  `identities_without_grace_window`. 019 is history, and it was not wasted:
+  making nine credentials legible enough to count is what fired PD-4's own
+  escape clause.
+- **Identity is a declared name since 023** (PD-10 + R13 in the contract;
+  `sprints/023-forwarded-identity/decisions.md`; korg #2392, #2393, slice 5
+  of program 2440). `[auth]` is an **allow-list**, not a token table: a
+  caller sends `X-Homelab-Agent: <name>` and an unknown name is a 401. The
+  gateway **forwards the caller's own name** to peers and holds no
+  credential, so `[peers.<host>.tokens]` and `no_peer_credential` are gone —
+  PD-4's identity fidelity survives, only the proof changed, and the fleet's
+  nine (backend × author) credentials became zero. The caller's tailnet node
+  is recorded beside the identity on every journaled mutation and secrets
+  audit row (`src/whois.rs`, same measured shape as klams sprint 049 —
+  `X-Forwarded-For` first, socket peer as fallback, `unknown` for every
+  failure mode). Six things not to re-derive:
+  **a declared name never falls through to the bearer** (D-1 — an unknown
+  name is refused, because authenticating a caller as something it did not
+  claim to be is worse than refusing it; whitespace is not a declaration and
+  does fall through);
+  **the transition window IS the token rows** (D-2 — no flag; deleting an
+  identity's `token_file` closes it, and startup warns naming every identity
+  still holding one);
+  **`prev_token_file` and `[peers.*.tokens]` are still PARSED** (D-2 —
+  `deny_unknown_fields` plus `install.sh` never rewriting a config means
+  deleting a field from the struct would be a fleet-wide failure to start;
+  the cutover removes them from the files, the binary never does);
+  **an identity outlives its token** (D-6 — `resolve_identities` used to drop
+  an identity whose token would not resolve, which under declared identity
+  would have deleted every agent at the moment the cutover removed the files);
+  **`[whois]` is top-level, not `[auth.whois]`** (D-7 — kaed's `[auth]` is a
+  map of identity *names*, so klams's placement would collide with an
+  identity called `whois`); and **node enforcement is opt-in and off** (D-5 —
+  there is no proof of origin under declared identity, so a "gateway
+  allow-list" not backed by an origin check is decoration; `nodes` +
+  `[whois] enforce` is the only real mechanism, and a *proxied* call resolves
+  to the **gateway's** node, not the client's).
+  The node reaches the journal via `Journal::as_node()`, a per-request
+  recorder view — the bare `impl TxnRecorder for Journal` records `unknown`,
+  so a call site that forgets to wrap fails **silently**; that is what the
+  `the_node_scoped_recorder_stamps_and_the_bare_one_does_not` gate test is
+  for. Also here: **KP-5 is settled and superseded by KP-6** in the
+  cross-project `karc+` plan (the grain stays the machine; the leg-toolbox
+  credential question dissolved rather than being answered), and **PD-11**
+  says `/etc/klams` does **not** become a kaed root — measured, kaed runs as
+  `ken` and cannot read it at all, so the root would promise a redaction the
+  OS refuses first.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

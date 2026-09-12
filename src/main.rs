@@ -63,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
                 Some(peers) => {
                     println!("fleet:");
                     println!("  {:<20} {:<12} (this host)", resolved.host, "active");
-                    let peer_tokens = config::resolve_peer_tokens(peers);
                     for p in peers {
                         let why = p
                             .reference
@@ -71,21 +70,24 @@ async fn main() -> anyhow::Result<()> {
                             .or(p.since.as_deref())
                             .map(|s| format!("({s}) "))
                             .unwrap_or_default();
-                        // Routable = proxyable from here; which authors can
-                        // be proxied is per-credential (PD-4).
-                        let routing = match (&p.url, p.tokens.is_empty()) {
-                            (None, _) => "no url — declaration only".to_string(),
-                            (Some(url), true) => format!("url {url}, no peer tokens"),
-                            (Some(url), false) => {
-                                let authors: Vec<&str> = p
-                                    .tokens
-                                    .keys()
-                                    .filter(|a| {
-                                        peer_tokens.contains_key(&(p.host.clone(), (*a).clone()))
-                                    })
-                                    .map(String::as_str)
-                                    .collect();
-                                format!("url {url}, proxies for {authors:?}")
+                        // Routable = proxyable from here. Since 023 that is
+                        // all there is to say: the gateway forwards the
+                        // caller's own name and holds no credential, so
+                        // EVERY identity is proxyable and which ones are
+                        // *accepted* is the backend's `[auth]`, not ours to
+                        // report (PD-10, D-3).
+                        let routing = match &p.url {
+                            None => "no url — declaration only".to_string(),
+                            Some(url) => {
+                                let legacy = if p.tokens.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        " (plus retired peer tokens for {:?} — delete them)",
+                                        p.tokens.keys().collect::<Vec<_>>()
+                                    )
+                                };
+                                format!("url {url}, proxies as the caller{legacy}")
                             }
                         };
                         println!(
@@ -97,10 +99,28 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            println!("identities:");
+            println!("identities (allow-listed names, X-Homelab-Agent):");
             for id in &resolved.identities {
-                println!("  {} (token resolved)", id.author);
+                // The legacy bearer is the only thing worth annotating: it
+                // is what the 023 cutover is removing, and "which of these
+                // is still off the header" is the question this command
+                // gets asked during it.
+                let window = if id.token.is_some() {
+                    "  [transition window OPEN: also accepts a bearer]"
+                } else {
+                    ""
+                };
+                let pinned = if id.nodes.is_empty() {
+                    String::new()
+                } else {
+                    format!("  nodes={:?}", id.nodes)
+                };
+                println!("  {}{pinned}{window}", id.author);
             }
+            println!(
+                "whois: enabled={} enforce={} (node recorded beside every identity)",
+                resolved.whois.enabled, resolved.whois.enforce
+            );
             println!(
                 "limits: max_read_bytes={} max_file_bytes={} search_max_results={}",
                 resolved.limits.max_read_bytes,

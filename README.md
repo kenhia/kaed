@@ -20,7 +20,7 @@ on it without a verification round-trip.
 > ## ⚠️ Use at your own risk — early beta
 >
 > kaed is a **network service that writes to your filesystem**, gated by a
-> bearer token. It is at an **early beta** level of maturity:
+> declared identity. It is at an **early beta** level of maturity:
 >
 > - It is dogfooded daily by its author, on a handful of machines on a
 >   private network. It has been run by essentially nobody else, and it has
@@ -42,7 +42,10 @@ on it without a verification round-trip.
 
 ## What works today
 
-Twelve tools over streamable HTTP with per-agent bearer auth:
+Twelve tools over streamable HTTP. Callers **declare an identity** — a name
+on an allow-list, sent as `X-Homelab-Agent` — which is recorded on every
+journal entry. That is attribution; the access-control boundary is the
+network in front of it. See [SECURITY.md](SECURITY.md).
 
 | tool | what it does |
 |---|---|
@@ -118,10 +121,11 @@ makes "has any agent ever seen this token?" an answerable question.
 Revealing plaintext exists but is deliberately its own tool, one key at a
 time, with a required `intent` and a host-wide off switch.
 
-Any instance can also be its fleet's **gateway**: declare peers with URLs
-and per-identity tokens, and calls addressing another host's roots are
-proxied there — as the caller, never as a shared "gateway" identity, so
-journal attribution on the target is identical to a direct call. Errors pass
+Any instance can also be its fleet's **gateway**: declare peers with URLs and
+calls addressing another host's roots are proxied there. The gateway forwards
+the caller's own declared identity and holds no credential of its own, so
+journal attribution on the target is identical to a direct call and is never
+a shared "gateway" identity. Errors pass
 through verbatim (a `version_conflict` delta survives the hop), a peer that
 stops answering becomes `status: "unreachable", since: …` — data, not a
 connection failure — and each host's own URL keeps working as the fallback.
@@ -137,13 +141,12 @@ is what lets the security story be stated in one paragraph. See
 - **[docs/overview.md](docs/overview.md)** — why kaed exists, how it works,
   what is deliberately excluded, where it's going.
 - **[docs/setup.md](docs/setup.md)** — deploying it yourself: build, config,
-  token, systemd unit, remote access, client wiring, rotation. Includes a
-  section you can hand to your own agent to do the install.
+  identities, systemd unit, remote access, client wiring. Includes a section
+  you can hand to your own agent to do the install.
 - **[deploy/](deploy/)** — the install itself: an idempotent `install.sh`
   (re-running it is the upgrade path — building from the checkout, or
   fetching a published, checksum-verified build with `--from-store`), the
-  systemd unit, a config template, and token mint/rotate. It never overwrites
-  a config and never touches a token.
+  systemd unit and a config template. It never overwrites a config.
 - **[docs/kaed-explained.html](docs/kaed-explained.html)** — a single-page
   visual explainer
   ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).
@@ -193,7 +196,7 @@ cargo run -- serve            # run the daemon
 
 kaed lives alongside the other homelab MCP services it was built next to
 (klams for memory, korg for work items): same transport conventions, same
-per-agent bearer-token auth.
+declared-identity auth.
 
 ## License
 

@@ -38,6 +38,9 @@ pub struct Ctx<'a> {
     pub roots: &'a [ResolvedRoot],
     pub limits: &'a Limits,
     pub author: &'a str,
+    /// The caller's tailnet node (023), or `unknown`. Recorded on every
+    /// secrets audit row beside the author, never consulted.
+    pub node: &'a str,
     pub journal: &'a Journal,
     pub secrets: &'a ResolvedSecrets,
 }
@@ -195,6 +198,7 @@ pub fn generate(ctx: &Ctx<'_>, p: &GenerateParams<'_>) -> Result<GenerateResult>
     let digest = secrets::clears_floor(&value).then(|| secrets::digest_of(&value));
     ctx.journal.add_secret_event(&SecretEvent {
         author: ctx.author,
+        node: ctx.node,
         action: "generate",
         root: &ctx.root.name,
         path: p.path,
@@ -437,6 +441,7 @@ pub fn rotate_local(
     for t in &targets {
         ctx.journal.add_secret_event(&SecretEvent {
             author: ctx.author,
+            node: ctx.node,
             action: "rotate",
             root: &t.root,
             path: &t.path,
@@ -713,6 +718,7 @@ pub fn reveal(ctx: &Ctx<'_>, p: &RevealParams<'_>) -> Result<RevealResult> {
     };
     ctx.journal.add_secret_event(&SecretEvent {
         author: ctx.author,
+        node: ctx.node,
         action,
         root: &ctx.root.name,
         path: p.path,
@@ -829,6 +835,7 @@ mod tests {
 
         fn ctx(&self) -> Ctx<'_> {
             Ctx {
+                node: "kai",
                 root: &self.roots[0],
                 roots: &self.roots,
                 limits: &self.limits,
