@@ -777,13 +777,13 @@ impl KaedServer {
         let declared = state.fleet.declared().map(<[Peer]>::to_vec);
         if let Some(peers) = &declared {
             // Probe every routable peer in parallel, under the caller's own
-            // credential — the gateway never holds a shared identity (PD-4).
+            // identity — the gateway forwards the caller's declared name and
+            // never substitutes one (023 D-3, PD-4's guarantee in its
+            // stronger form). Since there is no per-author credential left to
+            // be missing, the only reasons not to probe are structural.
             let mut probes = tokio::task::JoinSet::new();
             for peer in peers {
-                if peer.status == PeerStatus::Deferred
-                    || peer.url.is_none()
-                    || state.fleet.token_for(&peer.host, &author.0).is_none()
-                {
+                if peer.status == PeerStatus::Deferred || peer.url.is_none() {
                     continue;
                 }
                 let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
@@ -813,10 +813,7 @@ impl KaedServer {
                     ),
                     None => AppState::declared_fleet_entry(
                         peer,
-                        Some(json!({
-                            "status": "skipped",
-                            "detail": format!("no credential for author {:?}", author.0),
-                        })),
+                        Some(json!({"status": "skipped", "detail": "not probed"})),
                     ),
                     Some(Ok(payload)) => {
                         if peer.status == PeerStatus::Unreachable {
@@ -1103,6 +1100,7 @@ impl KaedServer {
         Parameters(p): Parameters<EditParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let author = author_of(&parts)?;
+        let node = node_of(&parts);
         let state = self.state.clone();
         // Cross-root `value_from` resolves before the engine (011 D-5):
         // another local root by direct read, another host via that host's
@@ -1124,7 +1122,7 @@ impl KaedServer {
                 let vf = value_from.take().expect("checked above");
                 let destination = format!("{}/{path}", p.root);
                 match self
-                    .fetch_secret_value(&author, &vf, &destination, false)
+                    .fetch_secret_value(&author, &node_of(&parts), &vf, &destination, false)
                     .await
                 {
                     Ok(fetched) => *value = Some(fetched.to_string()),
@@ -1144,7 +1142,17 @@ impl KaedServer {
                 allow_secrets: p.allow_secrets,
                 drop_paths: p.drop_paths,
             };
-            txn::apply(&root, &req, &state.limits, &author.0, &state.journal)
+            // `as_node`, not the bare journal: the node is a property of
+            // this connection, and the unscoped path records `unknown`
+            // (023 D-4). A gate test pins this, because the failure mode is
+            // a column that fills with a plausible default forever.
+            txn::apply(
+                &root,
+                &req,
+                &state.limits,
+                &author.0,
+                &state.journal.as_node(&node),
+            )
         })
         .await
     }
@@ -1160,8 +1168,9 @@ impl KaedServer {
         Parameters(p): Parameters<SecretParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let author = author_of(&parts)?;
+        let node = node_of(&parts);
         if matches!(p.action, SecretAction::Rotate) {
-            return self.secret_rotate(author, p).await;
+            return self.secret_rotate(author, node, p).await;
         }
         let state = self.state.clone();
         run(move || {
@@ -1171,6 +1180,7 @@ impl KaedServer {
                 roots: &state.roots,
                 limits: &state.limits,
                 author: &author.0,
+                node: &node,
                 journal: &state.journal,
                 secrets: &state.secrets,
             };
@@ -1222,6 +1232,7 @@ impl KaedServer {
         Parameters(p): Parameters<SecretRevealParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let author = author_of(&parts)?;
+        let node = node_of(&parts);
         let state = self.state.clone();
         run(move || {
             let root = state.root(&p.root)?;
@@ -1230,6 +1241,7 @@ impl KaedServer {
                 roots: &state.roots,
                 limits: &state.limits,
                 author: &author.0,
+                node: &node,
                 journal: &state.journal,
                 secrets: &state.secrets,
             };
@@ -1301,6 +1313,7 @@ impl KaedServer {
         Parameters(p): Parameters<RevertParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let author = author_of(&parts)?;
+        let node = node_of(&parts);
         let state = self.state.clone();
         run(move || {
             let root = state.root(&p.root)?;
@@ -1311,6 +1324,7 @@ impl KaedServer {
                     dry_run: p.dry_run,
                     intent: p.intent.as_deref(),
                     author: &author.0,
+                    node: &node,
                     allow_secrets: &p.allow_secrets,
                 },
                 &state.journal,
@@ -1444,6 +1458,7 @@ impl KaedServer {
     async fn secret_rotate(
         &self,
         author: Author,
+        node: String,
         p: SecretParams,
     ) -> Result<CallToolResult, ErrorData> {
         let state = self.state.clone();
@@ -1475,6 +1490,7 @@ impl KaedServer {
         let (mut result, value) = {
             let state = state.clone();
             let author = author.0.clone();
+            let node = node.clone();
             let (root_name, path, key) = (p.root.clone(), p.path.clone(), p.key.clone());
             let (shape, intent) = (p.shape.clone(), p.intent.clone());
             let joined = tokio::task::spawn_blocking(move || {
@@ -1484,6 +1500,7 @@ impl KaedServer {
                     roots: &state.roots,
                     limits: &state.limits,
                     author: &author,
+                    node: &node,
                     journal: &state.journal,
                     secrets: &state.secrets,
                 };
@@ -1513,6 +1530,7 @@ impl KaedServer {
             let joined = {
                 let state = state.clone();
                 let author = author.0.clone();
+                let node = node.clone();
                 let (root_name, path, key) = (target_root.clone(), t.path.clone(), key.clone());
                 let (version, intent) = (t.version.clone(), p.intent.clone());
                 let value = value.clone();
@@ -1523,6 +1541,7 @@ impl KaedServer {
                         roots: &state.roots,
                         limits: &state.limits,
                         author: &author,
+                        node: &node,
                         journal: &state.journal,
                         secrets: &state.secrets,
                     };
@@ -1544,6 +1563,7 @@ impl KaedServer {
                     // the value never left it (020 D-2).
                     let _ = state.journal.add_secret_event(&SecretEvent {
                         author: &author.0,
+                        node: &node,
                         action: "rotate",
                         root: &target_root,
                         path: &t.path,
@@ -1598,6 +1618,7 @@ impl KaedServer {
                     // journaled on the target (D-5, D-6).
                     let _ = state.journal.add_secret_event(&SecretEvent {
                         author: &author.0,
+                        node: &node,
                         action: "transport",
                         root: &result.handle.root,
                         path: &p.path,
@@ -1687,6 +1708,7 @@ impl KaedServer {
     async fn fetch_secret_value(
         &self,
         author: &Author,
+        node: &str,
         vf: &ValueFrom,
         destination: &str,
         leaves_host: bool,
@@ -1738,6 +1760,7 @@ impl KaedServer {
             if leaves_host {
                 let _ = self.state.journal.add_secret_event(&SecretEvent {
                     author: &author.0,
+                    node,
                     action: "transport",
                     root: &src_root,
                     path: &vf.path,
@@ -1811,6 +1834,7 @@ impl KaedServer {
     async fn resolve_proxied_value_froms(
         &self,
         author: &Author,
+        node: &str,
         target_host: &str,
         target_root: &str,
         args: &mut rmcp::model::JsonObject,
@@ -1842,7 +1866,7 @@ impl KaedServer {
                 .to_owned();
             let destination = format!("{target_root}/{op_path}");
             let fetched = self
-                .fetch_secret_value(author, &vf, &destination, true)
+                .fetch_secret_value(author, node, &vf, &destination, true)
                 .await?;
             obj.insert("value".into(), json!(*fetched));
             obj.remove("value_from");
@@ -1909,14 +1933,6 @@ impl KaedServer {
                     unavailable.push(json!({"host": peer.host, "status": "no_url"}));
                     continue;
                 }
-                if state.fleet.token_for(&peer.host, &author.0).is_none() {
-                    unavailable.push(json!({
-                        "host": peer.host,
-                        "status": "no_credential",
-                        "author": author.0,
-                    }));
-                    continue;
-                }
                 let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
                 probes.spawn(async move {
                     let outcome = fleet.probe_roots(&peer, &author).await;
@@ -1943,17 +1959,41 @@ impl KaedServer {
                         }
                     }
                     Err(e) => {
-                        let since = state
-                            .fleet
-                            .sight_of(&peer.host)
-                            .down_since
-                            .map(fleet::rfc3339);
-                        unavailable.push(json!({
-                            "host": peer.host,
-                            "status": "unreachable",
-                            "since": since,
-                            "detail": e.message,
-                        }));
+                        // A host that answered and declined the forwarded
+                        // name is NOT unreachable, and saying so would be a
+                        // false claim about the world in the one field whose
+                        // job is stopping an agent forming a wrong picture
+                        // (the same failure #1089 filed). Before 023 this
+                        // case was gated earlier as `no_credential`; with
+                        // that gate gone it reaches here, so it needs its
+                        // own status — and no `since`, because nothing went
+                        // down.
+                        let refused = e
+                            .data
+                            .as_ref()
+                            .and_then(|d| d.get("reason"))
+                            .and_then(Value::as_str)
+                            == Some("peer_credential_rejected");
+                        if refused {
+                            unavailable.push(json!({
+                                "host": peer.host,
+                                "status": "identity_refused",
+                                "author": author.0,
+                                "detail": e.message,
+                            }));
+                        } else {
+                            let since = state
+                                .fleet
+                                .sight_of(&peer.host)
+                                .down_since
+                                .map(fleet::rfc3339);
+                            unavailable.push(json!({
+                                "host": peer.host,
+                                "status": "unreachable",
+                                "since": since,
+                                "detail": e.message,
+                            }));
+                        }
                     }
                 }
             }
@@ -2082,6 +2122,19 @@ fn kaed_error_result(e: KaedError) -> Result<CallToolResult, ErrorData> {
 
 /// The identity the auth middleware bound to this request. Every write —
 /// and every friction report — is attributed (R6); no anonymous mutation.
+/// The caller's tailnet node, as the auth middleware resolved it.
+///
+/// Infallible by design: unlike the author, a missing node is never a
+/// reason to refuse a call. `unknown` is a real answer here (D-4) and the
+/// only one available when whois is off, so the absent-extension case and
+/// the unresolved case collapse to the same string on purpose.
+fn node_of(parts: &http::request::Parts) -> String {
+    parts
+        .extensions
+        .get::<Node>()
+        .map_or_else(|| crate::whois::UNKNOWN_NODE.to_string(), |n| n.0.clone())
+}
+
 fn author_of(parts: &http::request::Parts) -> Result<Author, ErrorData> {
     parts
         .extensions
@@ -2115,9 +2168,10 @@ impl ServerHandler for KaedServer {
                     return Err(ErrorData::internal_error("no http parts on request", None));
                 };
                 let author = author_of(parts)?;
+                let node = node_of(parts);
                 if let Some(args) = request.arguments.as_mut()
                     && let Err(e) = self
-                        .resolve_proxied_value_froms(&author, &peer.host, &root, args)
+                        .resolve_proxied_value_froms(&author, &node, &peer.host, &root, args)
                         .await
                 {
                     return Ok(kaed_error_result(e)?.into());
@@ -2322,14 +2376,27 @@ pub struct AuthState {
     spec: BTreeMap<String, AuthEntry>,
     /// The outbound half: this instance's credentials *for its peers*,
     /// shared with `fleet::Peers` so proxy sessions see rotations.
+    /// Retired in 023 and empty after the cutover — kept while the
+    /// transition window holds.
     peer_tokens: Arc<fleet::PeerTokens>,
     peers_spec: Vec<Peer>,
+    /// `None` = whois disabled; every request records `unknown` (023).
+    whois: Option<Arc<dyn crate::whois::NodeResolver>>,
+    /// `[whois] enforce`. Off by default (D-5).
+    enforce_nodes: bool,
 }
 
 impl AuthState {
-    /// Re-read every token — inbound and peer — from its file. Env-var
-    /// tokens come back unchanged — a process cannot re-read its own
-    /// `EnvironmentFile`, so those still need a restart.
+    /// Re-read the identity allow-list, and any legacy tokens still beside
+    /// it, from the config spec. Env-var tokens come back unchanged — a
+    /// process cannot re-read its own `EnvironmentFile`, so those still
+    /// need a restart.
+    ///
+    /// Since 023 a reload cannot *remove* an identity or add one: the spec
+    /// is captured at startup (018 D-3) and the allow-list is config
+    /// shape, not file contents. Changing who may connect is still a
+    /// restart, and the symptom of forgetting remains a 401 that reads
+    /// like a wrong credential.
     pub fn reload(&self) {
         self.peer_tokens.reload(&self.peers_spec);
         let fresh = config::resolve_identities(&self.spec);
@@ -2344,7 +2411,7 @@ impl AuthState {
 }
 
 /// Constant-time token comparison; length is the only thing an attacker
-/// can learn.
+/// can learn. Legacy: only the transition window still reaches it.
 fn token_eq(a: &str, b: &str) -> bool {
     a.len() == b.len()
         && a.bytes()
@@ -2353,48 +2420,116 @@ fn token_eq(a: &str, b: &str) -> bool {
             == 0
 }
 
+/// How a caller declares who it is (023). The fleet-wide spelling, shared
+/// with klams and karc — one header name for every homelab service, so a
+/// client config is one line whatever it is talking to.
+pub const AGENT_HEADER: &str = "x-homelab-agent";
+
+/// The tailnet node the request came from, resolved by whois and stamped
+/// beside [`Author`]. Always present; [`crate::whois::UNKNOWN_NODE`] when
+/// it could not be determined (D-4).
+#[derive(Clone, Debug)]
+pub struct Node(pub String);
+
 async fn auth_middleware(
     State(auth): State<Arc<AuthState>>,
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    // Order is the contract (D-1). A *declared* name is checked first and,
+    // if it is not on the allow-list, the request dies there — it does not
+    // fall through to the bearer path. The caller said who it was and was
+    // wrong; silently authenticating it as something else would be the
+    // least honest outcome available.
+    let declared = req
+        .headers()
+        .get(AGENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned);
+
     let bearer = req
         .headers()
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let author = bearer.and_then(|token| {
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+
+    let resolved = {
         let identities = auth.identities.read().expect("auth lock never poisoned");
-        for id in identities.iter() {
-            if token_eq(&id.token, token) {
-                return Some(id.author.clone());
-            }
-            if id.prev_token.as_deref().is_some_and(|p| token_eq(p, token)) {
-                // The one signal that answers "is this rotation finished?" —
-                // 401s never reach the journal, so this is where it lives.
-                tracing::warn!(
-                    author = id.author,
-                    "authenticated with the PREVIOUS token; this client has not \
-                     picked up the new one yet"
-                );
-                return Some(id.author.clone());
-            }
+        match &declared {
+            Some(name) => identities
+                .iter()
+                .find(|i| &i.author == name)
+                .map(|i| (i.author.clone(), i.nodes.clone())),
+            None => bearer.as_deref().and_then(|token| {
+                identities
+                    .iter()
+                    .find(|i| i.token.as_deref().is_some_and(|t| token_eq(t, token)))
+                    .map(|i| (i.author.clone(), i.nodes.clone()))
+            }),
         }
-        None
-    });
-    match author {
-        Some(author) => {
-            req.extensions_mut().insert(Author(author));
-            next.run(req).await
-        }
-        None => {
+    };
+
+    let Some((author, pinned_nodes)) = resolved else {
+        tracing::warn!(
+            declared = ?declared,
+            presented_bearer = bearer.is_some(),
+            "401: no identity for the presented credential"
+        );
+        return unauthorized(declared.is_some(), bearer.is_some());
+    };
+
+    if declared.is_some() && bearer.is_some() {
+        // Not an error — a client mid-cutover legitimately sends both, and
+        // refusing would break the window this release exists to hold open.
+        // Worth one line, because "is this client off the token yet?" is
+        // the question the cutover is answering.
+        tracing::info!(
+            author,
+            "client sent both an identity and a bearer; the identity won"
+        );
+    }
+
+    // Record-only unless pinning is on and this identity declares nodes.
+    let peer_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let addr = crate::whois::caller_addr(req.headers(), peer_ip);
+    let node = match (&auth.whois, addr) {
+        (Some(w), Some(ip)) => w.resolve(ip).await,
+        _ => None,
+    };
+
+    if auth.enforce_nodes && !pinned_nodes.is_empty() {
+        let arrived = node.as_deref().unwrap_or(crate::whois::UNKNOWN_NODE);
+        if !pinned_nodes.iter().any(|n| n == arrived) {
+            // Names both sides. A 403 saying only "denied" makes the
+            // operator guess which half is wrong.
             tracing::warn!(
-                presented = bearer.is_some(),
-                "401: no identity for the presented credential"
+                author,
+                node = arrived,
+                allowed = ?pinned_nodes,
+                "403: identity is pinned to other tailnet nodes"
             );
-            unauthorized(bearer.is_some())
+            return (
+                http::StatusCode::FORBIDDEN,
+                format!(
+                    "forbidden: identity {author:?} is not permitted from node \
+                     {arrived:?} (allowed: {pinned_nodes:?})\n"
+                ),
+            )
+                .into_response();
         }
     }
+
+    req.extensions_mut().insert(Author(author));
+    req.extensions_mut().insert(Node(
+        node.unwrap_or_else(|| crate::whois::UNKNOWN_NODE.to_string()),
+    ));
+    next.run(req).await
 }
 
 /// A 401 that says what is actually wrong (RFC 6750 §3). A bare 401 gets
@@ -2403,12 +2538,23 @@ async fn auth_middleware(
 /// had. The description goes in the header *and* the body, so a client
 /// that surfaces either one stops guessing.
 ///
-/// Per §3.1 a request carrying no credential at all gets the challenge
-/// without an error code: there is no invalid token to describe, and the
-/// client may simply not have known auth was needed.
-fn unauthorized(had_token: bool) -> Response {
+/// Three cases since 023, because they need three different fixes: a name
+/// that is not on the allow-list, a token that matches nothing, and no
+/// credential at all. Per §3.1 the last gets the challenge without an
+/// error code — there is nothing invalid to describe, and the client may
+/// simply not have known auth was needed.
+fn unauthorized(declared_name: bool, had_token: bool) -> Response {
+    const UNKNOWN_NAME: &str = "X-Homelab-Agent names no configured identity on this host; \
+         a declared name is never silently downgraded to the bearer";
     const NO_EXPIRY: &str = "token matches no configured identity; kaed tokens do not expire";
-    let (challenge, body) = if had_token {
+    let (challenge, body) = if declared_name {
+        (
+            format!(
+                "Bearer realm=\"kaed\", error=\"invalid_token\", error_description=\"{UNKNOWN_NAME}\""
+            ),
+            format!("unauthorized: {UNKNOWN_NAME}\n"),
+        )
+    } else if had_token {
         (
             format!(
                 "Bearer realm=\"kaed\", error=\"invalid_token\", error_description=\"{NO_EXPIRY}\""
@@ -2418,7 +2564,8 @@ fn unauthorized(had_token: bool) -> Response {
     } else {
         (
             "Bearer realm=\"kaed\"".to_string(),
-            "unauthorized: no bearer token presented\n".to_string(),
+            "unauthorized: no credential presented — send X-Homelab-Agent: <your identity>\n"
+                .to_string(),
         )
     };
     (
@@ -2441,7 +2588,7 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
     );
     anyhow::ensure!(
         !resolved.identities.is_empty(),
-        "no auth identities resolved; set the token env vars from [auth]"
+        "no auth identities resolved; [auth] must allow-list at least one identity"
     );
 
     let journal = Journal::open(&resolved.journal_path, resolved.journal_retention_days)?;
@@ -2474,11 +2621,31 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
         journal,
         secrets: resolved.secrets,
     });
+    // A resolver is installed only when whois is on: a host without the
+    // `tailscale` binary should pay nothing at all, not one failed process
+    // spawn per address.
+    let whois: Option<Arc<dyn crate::whois::NodeResolver>> = if resolved.whois.enabled {
+        Some(Arc::new(crate::whois::TailscaleWhois::with_binary(
+            resolved.whois.binary.clone(),
+            std::time::Duration::from_secs(resolved.whois.ttl_secs),
+        )))
+    } else {
+        tracing::info!("[whois] disabled: every request will record node = unknown");
+        None
+    };
+    if resolved.whois.enforce {
+        tracing::warn!(
+            "[whois] enforce is ON: identities declaring `nodes` are refused from \
+             anywhere else, and an unresolvable caller counts as elsewhere"
+        );
+    }
     let auth = Arc::new(AuthState {
         identities: RwLock::new(resolved.identities),
         spec: resolved.auth,
         peer_tokens,
         peers_spec,
+        whois,
+        enforce_nodes: resolved.whois.enforce,
     });
 
     let mut allowed_hosts: Vec<String> = vec!["localhost".into(), "127.0.0.1".into(), "::1".into()];
@@ -2518,6 +2685,14 @@ pub async fn serve(resolved: Resolved) -> anyhow::Result<()> {
     });
 
     tracing::info!(%bind, "kaed serving MCP at /mcp");
-    axum::serve(listener, app).await?;
+    // ConnectInfo so `whois::caller_addr` has its fallback. Behind
+    // `tailscale serve` — how kaed actually runs — this is always loopback
+    // and `X-Forwarded-For` is the informative one; the fallback is for a
+    // direct deployment, where there is no forwarding header at all.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

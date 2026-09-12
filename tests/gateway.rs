@@ -20,7 +20,6 @@ struct Instance {
     _workdir: tempfile::TempDir,
     workdir_path: std::path::PathBuf,
     ct: tokio_util::sync::CancellationToken,
-    auth: std::sync::Arc<kaed::server::AuthState>,
 }
 
 async fn start_instance(
@@ -73,9 +72,10 @@ async fn start_instance_with_roots(
         deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
         classify: std::sync::Arc::new(kaed::policy::Classifier::empty()),
         auth: auth_spec,
+        whois: kaed::config::WhoisConfig::default(),
         secrets: Default::default(),
     };
-    let (app, auth) = kaed::server::build_app(resolved)?;
+    let (app, _auth) = kaed::server::build_app(resolved)?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let ct = tokio_util::sync::CancellationToken::new();
@@ -92,15 +92,25 @@ async fn start_instance_with_roots(
         _workdir: workdir,
         workdir_path,
         ct,
-        auth,
     })
 }
 
 fn identity(author: &str, token: &str) -> Identity {
     Identity {
         author: author.into(),
-        token: token.into(),
-        prev_token: None,
+        token: Some(token.into()),
+        nodes: std::sync::Arc::new(Vec::new()),
+    }
+}
+
+/// An identity with no bearer at all — the ordinary shape after the 023
+/// cutover, and the one the fixtures above still do not use because they
+/// also exercise the transition window.
+fn identity_only(author: &str) -> Identity {
+    Identity {
+        author: author.into(),
+        token: None,
+        nodes: std::sync::Arc::new(Vec::new()),
     }
 }
 
@@ -161,6 +171,24 @@ async fn connect(
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
             .auth_header(token),
+    );
+    Ok(ClientInfo::default().serve(transport).await?)
+}
+
+/// Connect by DECLARED IDENTITY (023) rather than by bearer: the header a
+/// real client sends after the cutover.
+async fn connect_as(
+    addr: std::net::SocketAddr,
+    author: &str,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        http::HeaderName::from_static("x-homelab-agent"),
+        http::HeaderValue::from_str(author)?,
+    );
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .custom_headers(headers),
     );
     Ok(ClientInfo::default().serve(transport).await?)
 }
@@ -477,10 +505,17 @@ async fn an_unreachable_peer_is_data_not_a_connection_failure() -> anyhow::Resul
     Ok(())
 }
 
-/// D-2: no credential for the caller means REFUSE, never impersonate — the
-/// misattributed journal row would be worse than the refused call.
+/// 023 D-3, and PD-4's guarantee in the form that survives the token
+/// matrix: the gateway forwards the caller's OWN declared name and never
+/// substitutes one. A peer that does not allow-list that name refuses the
+/// call — which is the right outcome, because a misattributed journal row
+/// on the peer would be worse than a refused call.
+///
+/// `ghcp` is an identity on alpha and not on beta, so this is the whole
+/// proof in one hop: alpha could trivially have reached beta as `claude`
+/// (it holds that identity too), and does not.
 #[tokio::test]
-async fn an_author_with_no_peer_credential_is_refused_not_impersonated() -> anyhow::Result<()> {
+async fn a_forwarded_identity_the_peer_rejects_is_refused_not_substituted() -> anyhow::Result<()> {
     let (alpha, beta, _secrets) = start_pair().await?;
     let gw = connect(alpha.addr, "tok-alpha-ghcp").await?;
 
@@ -488,23 +523,74 @@ async fn an_author_with_no_peer_credential_is_refused_not_impersonated() -> anyh
     assert_eq!(stat.is_error, Some(true));
     let e = structured(&stat);
     assert_eq!(e["code"], "denied");
-    assert_eq!(e["data"]["reason"], "no_peer_credential");
-    assert_eq!(e["data"]["author"], "ghcp");
+    assert_eq!(e["data"]["reason"], "peer_credential_rejected");
+    assert_eq!(
+        e["data"]["author"], "ghcp",
+        "the caller's own name, not alpha's"
+    );
     assert_eq!(e["data"]["target_host"], "beta");
-    assert!(e["data"]["hint"].as_str().unwrap().contains("tokens"));
+    // The remedy is the allow-list and a restart, not a credential.
+    let hint = e["data"]["hint"].as_str().unwrap();
+    assert!(hint.contains("[auth]"), "{hint}");
+    assert!(hint.contains("RESTART"), "{hint}");
 
-    // roots for ghcp: the peer is declared, unprobeable, and says why
-    let roots = structured(&call(&gw, "roots", json!({})).await);
-    let host = roots["fleet"]["hosts"]
+    let _ = gw.cancel().await;
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// The point of the whole sprint, as one assertion: alpha declares beta
+/// with **no `[peers.beta.tokens]` table at all** and the proxied call
+/// still lands, journaled on beta under the caller's name. Nine
+/// credentials became zero, and identity fidelity did not move.
+#[tokio::test]
+async fn a_gateway_with_no_peer_credentials_still_proxies_as_the_caller() -> anyhow::Result<()> {
+    let beta = start_instance("beta", vec![identity_only("claude")], BTreeMap::new(), None).await?;
+    let alpha = start_instance(
+        "alpha",
+        vec![identity_only("claude")],
+        BTreeMap::new(),
+        Some(vec![Peer {
+            url: Some(format!("http://{}/mcp", beta.addr)),
+            tokens: BTreeMap::new(),
+            ..Peer::declared("beta", PeerStatus::Active)
+        }]),
+    )
+    .await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
+
+    let edit = call(
+        &gw,
+        "edit",
+        json!({
+            "root": "beta:scratch",
+            "ops": [{"op": "create", "path": "forwarded.txt", "content": "landed\n"}],
+            "intent": "023 forwarded identity",
+        }),
+    )
+    .await;
+    assert_ne!(
+        edit.is_error,
+        Some(true),
+        "proxied edit with no peer credential: {:?}",
+        edit.structured_content
+    );
+    assert_eq!(
+        std::fs::read_to_string(beta.workdir_path.join("forwarded.txt"))?,
+        "landed\n"
+    );
+
+    // Beta's own journal is the record, and it says `claude` — not
+    // `alpha`, and not a shared gateway identity.
+    let rows = structured(&call(&gw, "journal", json!({"root": "beta:scratch"})).await);
+    let txn = rows["entries"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|h| h["host"] == "beta")
-        .unwrap()
-        .clone();
-    assert_eq!(host["verified"], false);
-    assert_eq!(host["probe"]["status"], "skipped");
-    assert!(host["probe"]["detail"].as_str().unwrap().contains("ghcp"));
+        .find(|e| e["kind"] == "txn")
+        .expect("the proxied edit is journaled on beta");
+    assert_eq!(txn["author"], "claude");
 
     let _ = gw.cancel().await;
     alpha.ct.cancel();
@@ -741,84 +827,16 @@ async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyho
         .await,
     );
     assert_eq!(fleetwide["hosts_unavailable"][0]["host"], "beta");
-    assert_eq!(fleetwide["hosts_unavailable"][0]["status"], "no_credential");
+    // Refused, not unreachable: beta answered and declined the forwarded
+    // name. Reporting an outage here would be a false claim about the
+    // world in the one field whose job is preventing exactly that.
+    assert_eq!(
+        fleetwide["hosts_unavailable"][0]["status"],
+        "identity_refused"
+    );
+    assert_eq!(fleetwide["hosts_unavailable"][0]["author"], "ghcp");
 
     let _ = stranger.cancel().await;
-    let _ = gw.cancel().await;
-    alpha.ct.cancel();
-    beta.ct.cancel();
-    Ok(())
-}
-
-/// D-2's rotation story: a backend rotates, the gateway's stale credential
-/// fails loudly with the remedy named, and a SIGHUP-equivalent reload picks
-/// up the new token with no restart — the #914 promise, extended to the
-/// outbound direction.
-#[tokio::test]
-async fn peer_token_rotation_reloads_without_restart() -> anyhow::Result<()> {
-    // beta reads its accepted token from a file, so it can rotate live
-    let beta_secrets = tempfile::tempdir()?;
-    let accepted = beta_secrets.path().join("claude.token");
-    std::fs::write(&accepted, "tok-v1\n")?;
-    let mut beta_auth = BTreeMap::new();
-    beta_auth.insert(
-        "claude".to_string(),
-        AuthEntry {
-            token_env: None,
-            token_file: Some(accepted.display().to_string()),
-            prev_token_file: None,
-        },
-    );
-    let beta = start_instance("beta", vec![identity("claude", "tok-v1")], beta_auth, None).await?;
-
-    let gw_secrets = tempfile::tempdir()?;
-    let held = gw_secrets.path().join("beta-claude.token");
-    std::fs::write(&held, "tok-v1\n")?;
-    let mut tokens = BTreeMap::new();
-    tokens.insert(
-        "claude".to_string(),
-        PeerTokenEntry {
-            token_env: None,
-            token_file: Some(held.display().to_string()),
-        },
-    );
-    let alpha = start_instance(
-        "alpha",
-        vec![identity("claude", "tok-alpha-claude")],
-        BTreeMap::new(),
-        Some(vec![Peer {
-            url: Some(format!("http://{}/mcp", beta.addr)),
-            tokens,
-            ..Peer::declared("beta", PeerStatus::Active)
-        }]),
-    )
-    .await?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
-
-    let ok = call(&gw, "stat", json!({"root": "beta:scratch", "path": ""})).await;
-    assert_ne!(ok.is_error, Some(true), "v1 works before the rotation");
-
-    // beta rotates, hard cut — the gateway now holds a dead credential
-    std::fs::write(&accepted, "tok-v2\n")?;
-    beta.auth.reload();
-    let rejected = call(&gw, "stat", json!({"root": "beta:scratch", "path": ""})).await;
-    assert_eq!(rejected.is_error, Some(true));
-    let e = structured(&rejected);
-    assert_eq!(e["code"], "denied", "{e}");
-    assert_eq!(e["data"]["reason"], "peer_credential_rejected");
-    assert!(e["data"]["hint"].as_str().unwrap().contains("SIGHUP"));
-
-    // the gateway's token file catches up; reload — no restart anywhere
-    std::fs::write(&held, "tok-v2\n")?;
-    alpha.auth.reload();
-    let again = call(&gw, "stat", json!({"root": "beta:scratch", "path": ""})).await;
-    assert_ne!(
-        again.is_error,
-        Some(true),
-        "rotated peer credential works after reload: {:?}",
-        again.structured_content
-    );
-
     let _ = gw.cancel().await;
     alpha.ct.cancel();
     beta.ct.cancel();

@@ -89,7 +89,8 @@ and checked to canonicalize inside its root — symlink escapes rejected
 **Journal.** SQLite, one DB per host (`~/.local/share/kaed/journal.db`),
 tables: `txns`, `txn_files` (path, old/new version), `blobs`
 (content-addressed, for `diff`/`revert` reconstruction; retention window
-configurable, default ~30 days), `feedback`. Author from bearer token;
+configurable, default ~30 days), `feedback`. Author from the caller's
+declared identity, with its tailnet `node` recorded beside it (023);
 `git_head` captured via `git -C` at txn time when inside a repo.
 
 **Node IDs.** `outline` returns selector-style ids (`fn:apply/body`,
@@ -142,9 +143,9 @@ retention_days = 30
 - Mutation surface is file edits only — no exec, by contract (see
   overview non-goals). Blast radius = writable files under configured
   roots.
-- Bearer tokens per agent identity; no anonymous writes; author on every
-  journal row. Tokens live in env/systemd credentials, never in config or
-  repo.
+- Declared identities (`X-Homelab-Agent` against an `[auth]` allow-list,
+  023/PD-10); no anonymous writes; author on every journal row. There is no
+  credential — the name is attribution and the tailnet is the perimeter.
 - Tailnet-only exposure; loopback bind means no LAN listener at all.
 - Root allowlist + canonicalization jail (above).
 

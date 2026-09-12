@@ -70,12 +70,7 @@ async fn store_with(version: &str, stamp: &str) -> Store {
     let bin = vdir.join(format!("kaed-{}", target_suffix()));
     std::fs::write(&bin, format!("#!/bin/sh\nprintf '%s\\n' '{stamp}'\n")).unwrap();
 
-    for f in [
-        "kaed.service",
-        "config.example.toml",
-        "new-token.sh",
-        "install.sh",
-    ] {
+    for f in ["kaed.service", "config.example.toml", "install.sh"] {
         std::fs::copy(Path::new(DEPLOY_DIR).join(f), vdir.join(f)).unwrap();
     }
     write_sums(&vdir);

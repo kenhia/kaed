@@ -30,6 +30,10 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS txns (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   author        TEXT NOT NULL,
+  -- The tailnet node the caller declared its identity from (023). Record
+  -- only: 'unknown' whenever whois could not answer, which is a fact about
+  -- this row and never a reason to refuse one.
+  node          TEXT NOT NULL DEFAULT 'unknown',
   intent        TEXT,
   root          TEXT NOT NULL,
   git_head      TEXT,
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 CREATE TABLE IF NOT EXISTS txn_failures (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   author           TEXT NOT NULL,
+  node             TEXT NOT NULL DEFAULT 'unknown',
   intent           TEXT,
   root             TEXT NOT NULL,
   paths            TEXT NOT NULL,
@@ -89,6 +94,7 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE TABLE IF NOT EXISTS secret_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   author      TEXT NOT NULL,
+  node        TEXT NOT NULL DEFAULT 'unknown',
   action      TEXT NOT NULL,
   root        TEXT NOT NULL,
   path        TEXT NOT NULL,
@@ -312,6 +318,10 @@ pub struct TxnFileRow {
 pub struct TxnRow {
     pub id: i64,
     pub author: String,
+    /// The tailnet node the author declared itself from (023), or
+    /// `unknown` — including on every row written before the column
+    /// existed, because nothing was recorded and nothing is known.
+    pub node: String,
     pub intent: Option<String>,
     pub root: String,
     pub git_head: Option<String>,
@@ -326,6 +336,10 @@ pub struct TxnRow {
 pub struct FailureRow {
     pub id: i64,
     pub author: String,
+    /// The tailnet node the author declared itself from (023), or
+    /// `unknown` — including on every row written before the column
+    /// existed, because nothing was recorded and nothing is known.
+    pub node: String,
     pub intent: Option<String>,
     pub root: String,
     pub paths: Vec<String>,
@@ -354,6 +368,10 @@ pub struct FeedbackRow {
 pub struct SecretEventRow {
     pub id: i64,
     pub author: String,
+    /// The tailnet node the author declared itself from (023), or
+    /// `unknown` — including on every row written before the column
+    /// existed, because nothing was recorded and nothing is known.
+    pub node: String,
     /// `generate` | `rotate` | `reveal` | `transport`
     pub action: String,
     pub root: String,
@@ -374,6 +392,8 @@ pub struct SecretEventRow {
 #[derive(Debug, Default)]
 pub struct SecretEvent<'a> {
     pub author: &'a str,
+    /// The caller's tailnet node (023), or `unknown`.
+    pub node: &'a str,
     pub action: &'a str,
     pub root: &'a str,
     pub path: &'a str,
@@ -435,7 +455,7 @@ impl Journal {
         // still comes back with *all* its files: "which txn touched this
         // path" must not silently hide that the txn touched three others.
         let mut sql = String::from(
-            "SELECT id, author, intent, root, git_head, started_at, completed_at
+            "SELECT id, author, intent, root, git_head, started_at, completed_at, node
                FROM txns WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -477,6 +497,7 @@ impl Journal {
                     git_head: r.get(4)?,
                     started_at: r.get(5)?,
                     completed_at: r.get(6)?,
+                    node: r.get(7)?,
                     files: Vec::new(),
                 })
             })
@@ -513,7 +534,7 @@ impl Journal {
         let conn = self.lock();
         let row = conn
             .query_row(
-                "SELECT id, author, intent, root, git_head, started_at, completed_at
+                "SELECT id, author, intent, root, git_head, started_at, completed_at, node
                    FROM txns WHERE id = ?1",
                 [id],
                 |r| {
@@ -525,6 +546,7 @@ impl Journal {
                         git_head: r.get(4)?,
                         started_at: r.get(5)?,
                         completed_at: r.get(6)?,
+                        node: r.get(7)?,
                         files: Vec::new(),
                     })
                 },
@@ -562,7 +584,7 @@ impl Journal {
         let conn = self.lock();
         let mut sql = String::from(
             "SELECT id, author, intent, root, paths, code, message,
-                    expected_version, actual_version, failed_at
+                    expected_version, actual_version, failed_at, node
                FROM txn_failures WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -610,6 +632,7 @@ impl Journal {
                     expected_version: r.get(7)?,
                     actual_version: r.get(8)?,
                     failed_at: r.get(9)?,
+                    node: r.get(10)?,
                 })
             })
             .map_err(db_err)?
@@ -670,7 +693,7 @@ impl Journal {
         let conn = self.lock();
         let mut sql = String::from(
             "SELECT id, author, action, root, path, key, old_digest, new_digest,
-                    disclosed, destination, txn_id, intent, created_at
+                    disclosed, destination, txn_id, intent, created_at, node
                FROM secret_events WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -717,6 +740,7 @@ impl Journal {
                     txn_id: r.get(10)?,
                     intent: r.get(11)?,
                     created_at: r.get(12)?,
+                    node: r.get(13)?,
                 })
             })
             .map_err(db_err)?
@@ -731,11 +755,12 @@ impl Journal {
         let conn = self.lock();
         conn.execute(
             "INSERT INTO secret_events
-               (author, action, root, path, key, old_digest, new_digest,
+               (author, node, action, root, path, key, old_digest, new_digest,
                 disclosed, destination, txn_id, intent, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 e.author,
+                e.node,
                 e.action,
                 e.root,
                 e.path,
@@ -915,13 +940,80 @@ fn migrate(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch("ALTER TABLE blobs ADD COLUMN redacted INTEGER NOT NULL DEFAULT 0")?;
         tracing::info!("journal migrated: blobs.redacted added (sprint 008)");
     }
+    // 023: the caller's tailnet node, beside the identity it declared.
+    // Rows written before this existed default to 'unknown', which is the
+    // honest answer — nothing was recorded, so nothing is known.
+    for table in ["txns", "txn_failures", "secret_events"] {
+        let has_node = conn
+            .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = 'node'")?
+            .exists([table])?;
+        if !has_node {
+            conn.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN node TEXT NOT NULL DEFAULT 'unknown'"
+            ))?;
+            tracing::info!(table, "journal migrated: node added (sprint 023)");
+        }
+    }
     Ok(())
 }
 
-impl TxnRecorder for Journal {
+/// A [`Journal`] bound to one caller's tailnet node (023).
+///
+/// The node is a property of the *connection*, not of a transaction, so it
+/// is attached here rather than threaded through `txn::apply` and every
+/// call site that already carries an author. `server` wraps the shared
+/// journal in one of these per request; everything else delegates.
+pub struct NodeScoped<'a> {
+    journal: &'a Journal,
+    node: &'a str,
+}
+
+impl TxnRecorder for NodeScoped<'_> {
     fn begin(
         &self,
         author: &str,
+        intent: Option<&str>,
+        root: &ResolvedRoot,
+        files: &[FileTxnRecord],
+    ) -> Result<i64> {
+        self.journal
+            .begin_as(author, self.node, intent, root, files)
+    }
+    fn complete(&self, txn_id: i64) -> Result<()> {
+        self.journal.complete(txn_id)
+    }
+    fn blob(&self, version: &str) -> Option<(String, bool)> {
+        self.journal.blob(version)
+    }
+    fn fail(&self, record: &FailedTxnRecord<'_>) {
+        self.journal.fail_as(record, self.node);
+    }
+    fn known_digests(&self, digests: &[String]) -> Vec<Option<crate::leak::DigestLocation>> {
+        Journal::known_digests(self.journal, digests)
+    }
+    fn leak_events(&self, author: &str, root: &ResolvedRoot, events: &[crate::txn::LeakEvent<'_>]) {
+        self.journal.leak_events_as(author, self.node, root, events);
+    }
+}
+
+impl Journal {
+    /// A view of this journal that stamps `node` on everything it records.
+    #[must_use]
+    pub fn as_node<'a>(&'a self, node: &'a str) -> NodeScoped<'a> {
+        NodeScoped {
+            journal: self,
+            node,
+        }
+    }
+}
+
+impl Journal {
+    /// The real insert: one transaction row stamped with the author it was
+    /// made by and the node that author declared itself from.
+    pub fn begin_as(
+        &self,
+        author: &str,
+        node: &str,
         intent: Option<&str>,
         root: &ResolvedRoot,
         files: &[FileTxnRecord],
@@ -935,9 +1027,9 @@ impl TxnRecorder for Journal {
         let mut conn = self.lock();
         let tx = conn.transaction().map_err(db_err)?;
         tx.execute(
-            "INSERT INTO txns (author, intent, root, git_head, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![author, intent, root.name, git_head, now()],
+            "INSERT INTO txns (author, node, intent, root, git_head, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![author, node, intent, root.name, git_head, now()],
         )
         .map_err(db_err)?;
         let txn_id = tx.last_insert_rowid();
@@ -994,6 +1086,21 @@ impl TxnRecorder for Journal {
         tx.commit().map_err(db_err)?;
         Ok(txn_id)
     }
+}
+
+impl TxnRecorder for Journal {
+    /// Unscoped: records `unknown`. `server` always goes through
+    /// [`Journal::as_node`]; this path is for tests and for callers with no
+    /// connection behind them.
+    fn begin(
+        &self,
+        author: &str,
+        intent: Option<&str>,
+        root: &ResolvedRoot,
+        files: &[FileTxnRecord],
+    ) -> Result<i64> {
+        self.begin_as(author, crate::whois::UNKNOWN_NODE, intent, root, files)
+    }
 
     fn complete(&self, txn_id: i64) -> Result<()> {
         self.lock()
@@ -1022,6 +1129,22 @@ impl TxnRecorder for Journal {
     }
 
     fn leak_events(&self, author: &str, root: &ResolvedRoot, events: &[crate::txn::LeakEvent<'_>]) {
+        self.leak_events_as(author, crate::whois::UNKNOWN_NODE, root, events);
+    }
+
+    fn fail(&self, r: &FailedTxnRecord<'_>) {
+        self.fail_as(r, crate::whois::UNKNOWN_NODE);
+    }
+}
+
+impl Journal {
+    fn leak_events_as(
+        &self,
+        author: &str,
+        node: &str,
+        root: &ResolvedRoot,
+        events: &[crate::txn::LeakEvent<'_>],
+    ) {
         for e in events {
             // `key` names the value when it is known (the digest tier);
             // otherwise it carries the detector's disclosable detail
@@ -1030,6 +1153,7 @@ impl TxnRecorder for Journal {
             let intent = e.intent.map(redact_note);
             let write = self.add_secret_event(&SecretEvent {
                 author,
+                node,
                 action: e.action,
                 root: &root.name,
                 path: e.path,
@@ -1047,7 +1171,7 @@ impl TxnRecorder for Journal {
         }
     }
 
-    fn fail(&self, r: &FailedTxnRecord<'_>) {
+    fn fail_as(&self, r: &FailedTxnRecord<'_>, node: &str) {
         // version_conflict is the reason this table exists, so lift its
         // versions into columns — "which base was stale, and what was it
         // actually?" should be a query, not a JSON dig.
@@ -1061,11 +1185,12 @@ impl TxnRecorder for Journal {
         };
         let write = self.lock().execute(
             "INSERT INTO txn_failures
-               (author, intent, root, paths, code, message,
+               (author, node, intent, root, paths, code, message,
                 expected_version, actual_version, failed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 r.author,
+                node,
                 r.intent.map(redact_note),
                 r.root.name,
                 r.paths.join(", "),
@@ -1547,6 +1672,52 @@ mod tests {
             .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(blobs, 0);
+    }
+
+    /// 023's gate test. The node is the one column whose failure mode is
+    /// silent: a wrong wiring does not error, it fills the column with a
+    /// plausible default forever, and nobody notices until the day the
+    /// journal is asked where an edit came from.
+    #[test]
+    fn the_node_scoped_recorder_stamps_and_the_bare_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(&dir.path().join("j.db"), 30).unwrap();
+        let root = ResolvedRoot::unrestricted("t", dir.path().canonicalize().unwrap());
+        let rec = |v: &str| FileTxnRecord {
+            path: "a.txt".into(),
+            old_version: None,
+            new_version: v.into(),
+            lines_added: 1,
+            lines_removed: 0,
+            blob_old: None,
+            blob_new: None,
+            redacted: false,
+        };
+
+        let scoped = j
+            .as_node("kai")
+            .begin("claude", None, &root, &[rec("v1")])
+            .unwrap();
+        let bare = j.begin("claude", None, &root, &[rec("v2")]).unwrap();
+
+        let rows = j
+            .txns(&HistoryFilter {
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let node_of = |id: i64| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .map(|r| r.node.clone())
+                .unwrap()
+        };
+        assert_eq!(node_of(scoped), "kai");
+        assert_eq!(
+            node_of(bare),
+            "unknown",
+            "the unscoped path must say `unknown`, not invent a node"
+        );
     }
 
     #[test]

@@ -111,9 +111,12 @@ impl PeerTokens {
 
 struct CachedSession {
     svc: Arc<Session>,
-    /// The token this session was built with. A SIGHUP that rotates the
-    /// configured token makes this stale, and checkout rebuilds (D-2).
-    token: String,
+    /// The legacy token this session was built with, if any. A SIGHUP that
+    /// changes it makes the session stale and checkout rebuilds (010 D-2).
+    /// `None` once the transition window is closed — the forwarded
+    /// identity is part of the session's key, not its credential, so there
+    /// is nothing left here to go stale.
+    token: Option<String>,
 }
 
 /// What this process has *observed* about one peer — never persisted, and
@@ -222,14 +225,15 @@ impl Peers {
         arguments: Option<JsonObject>,
         root: Option<&str>,
     ) -> Result<CallToolResult, KaedError> {
-        let Some(token) = self.token_for(&peer.host, author) else {
-            return Err(self.no_credential(peer, author));
-        };
+        // No credential to look up since 023: the caller's declared name
+        // IS what goes to the peer. A legacy peer token, while one
+        // survives the transition window, rides along beside the header.
+        let token = self.token_for(&peer.host, author);
         // One retry, and only for failures provably before the peer
         // processed anything: session establishment, or the transport
         // closing on send. An in-flight failure is never replayed (D-8).
         for attempt in 0..2 {
-            let svc = self.checkout(peer, author, &token).await?;
+            let svc = self.checkout(peer, author, token.as_deref()).await?;
             let params = CallToolRequestParams::new(tool.to_string())
                 .with_arguments(arguments.clone().unwrap_or_default());
             match tokio::time::timeout(CALL_TIMEOUT, svc.call_tool(params)).await {
@@ -285,21 +289,43 @@ impl Peers {
         &self,
         peer: &Peer,
         author: &str,
-        token: &str,
+        token: Option<&str>,
     ) -> Result<Arc<Session>, KaedError> {
         let key = (peer.host.clone(), author.to_string());
         {
             let sessions = self.sessions.lock().await;
             if let Some(cached) = sessions.get(&key)
-                && cached.token == token
+                && cached.token.as_deref() == token
             {
                 return Ok(cached.svc.clone());
             }
         }
         let url = peer.url.as_deref().expect("routable peers carry a url");
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(url.to_string()).auth_header(token),
-        );
+        // The forwarded identity (023 D-3). This is the whole of what the
+        // gateway presents to a peer: the caller's own declared name, sent
+        // verbatim, so the peer journals the edit under the agent that
+        // asked for it and never under kai. An `author` that is not a valid
+        // header value cannot reach here — it came off this host's own
+        // allow-list — but the map is built fallibly rather than with an
+        // unwrap, because a panic in the proxy path would take out calls
+        // that have nothing to do with the bad name.
+        let mut custom_headers = std::collections::HashMap::new();
+        match http::HeaderValue::from_str(author) {
+            Ok(v) => {
+                custom_headers.insert(
+                    http::HeaderName::from_static(crate::server::AGENT_HEADER),
+                    v,
+                );
+            }
+            Err(_) => return Err(self.unforwardable_identity(peer, author)),
+        }
+        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
+            .custom_headers(custom_headers);
+        // Legacy, and only while a peer token row survives (D-2).
+        if let Some(token) = token {
+            config = config.auth_header(token);
+        }
+        let transport = StreamableHttpClientTransport::from_config(config);
         let mut info = ClientInfo::default();
         info.protocol_version = PEER_PROTOCOL_VERSION;
         info.client_info = Implementation::new("kaed", crate::version::FULL);
@@ -329,7 +355,7 @@ impl Peers {
             key,
             CachedSession {
                 svc: svc.clone(),
-                token: token.to_string(),
+                token: token.map(str::to_owned),
             },
         );
         Ok(svc)
@@ -389,26 +415,25 @@ impl Peers {
         }
     }
 
-    fn no_credential(&self, peer: &Peer, author: &str) -> KaedError {
+    /// An author whose name cannot be expressed as an HTTP header value.
+    /// Unreachable through the allow-list, and refused rather than
+    /// silently dropped: a proxied call with no identity header would
+    /// arrive at the peer as an anonymous request, which is exactly the
+    /// impersonation PD-4 exists to prevent.
+    fn unforwardable_identity(&self, peer: &Peer, author: &str) -> KaedError {
         KaedError::new(
             crate::errors::ErrorCode::Denied,
             format!(
-                "no {author:?} credential for host {:?}: kaed on {:?} proxies with \
-                 the caller's own identity (never a shared one), and it holds no \
-                 token for you there",
-                peer.host, self.this_host
+                "identity {author:?} cannot be sent as an HTTP header value, so it \
+                 cannot be forwarded to {:?}",
+                peer.host
             ),
         )
         .with_data(json!({
-            "reason": "no_peer_credential",
+            "reason": "unforwardable_identity",
             "this_host": self.this_host,
             "target_host": peer.host,
             "author": author,
-            "hint": format!(
-                "add [peers.{}.tokens] {author} = {{ token_file = \"…\" }} to kaed's \
-                 config on {}, or connect to {}'s own kaed directly",
-                peer.host, self.this_host, peer.host
-            ),
         }))
     }
 
@@ -416,8 +441,8 @@ impl Peers {
         KaedError::new(
             crate::errors::ErrorCode::Denied,
             format!(
-                "host {:?} rejected the {author:?} credential this gateway holds \
-                 for it — likely rotated on the backend but not here",
+                "host {:?} refused identity {author:?} as forwarded by this gateway \
+                 — that host's [auth] allow-list does not carry the name",
                 peer.host
             ),
         )
@@ -428,9 +453,10 @@ impl Peers {
             "author": author,
             "detail": detail,
             "hint": format!(
-                "rotate the token in [peers.{}.tokens] on {} (SIGHUP reloads it), \
+                "add {author} to [auth] in kaed's config on {} and RESTART it \
+                 (the allow-list is config shape; SIGHUP will not pick it up), \
                  or connect to {}'s own kaed directly",
-                peer.host, self.this_host, peer.host
+                peer.host, peer.host
             ),
         }))
     }

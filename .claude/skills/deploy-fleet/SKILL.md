@@ -101,8 +101,10 @@ to it explicitly rather than letting each resolve `latest` independently:
 V=$(curl -fsS "$STORE/artifacts/kaed/latest")       # or the printed version
 ```
 
-The bundle is the binary plus `install.sh`, `kaed.service`,
-`config.example.toml` and `new-token.sh`, under one `SHA256SUMS`.
+The bundle is the binary plus `install.sh`, `kaed.service` and
+`config.example.toml`, under one `SHA256SUMS`. (`new-token.sh` was in it
+until sprint 023; installing a pre-023 version still works, because the
+bundle and its installer are fetched together per version.)
 
 ### 2. Install on each host, kai first, then kubs0
 
@@ -132,8 +134,7 @@ ssh kubs0 "set -eu
 `install.sh` is idempotent, verifies every fetched file against the
 published `SHA256SUMS`, asserts the binary reports the version it was
 published under, keeps the outgoing binary as `~/.local/bin/kaed.prev`, and
-restarts the unit if it was already running. It never touches config or the
-token.
+restarts the unit if it was already running. It never touches config.
 
 Add `--dry-run` to rehearse: in store mode it still fetches and verifies, so
 a dry run answers "is that version published and intact" without installing.
@@ -164,7 +165,7 @@ GOT=$(kaed --version | awk '{ gsub(/[()]/, "", $3); print $2 "-" $3 }')
 
 ```sh
 curl -s -X POST "https://<host>.${TN}:4870/mcp" \
-  -H "Authorization: Bearer $(cat ~/.config/kaed/token)" \
+  -H "X-Homelab-Agent: claude-<host>" \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"deploy-verify","version":"0"}}}'
@@ -174,8 +175,9 @@ The response's `result.serverInfo.version` must be the same stamp
 `kaed --version` printed. That is the check that closes the loop: the binary
 on disk and the server answering the network are the same build.
 
-**Never print the token.** Read it in a subshell as above; do not echo it,
-and do not pass it anywhere it will be logged.
+The identity is a declared name, not a secret, so it is safe in a command
+line and in this file. Use the identity that host allow-lists — a name
+`[auth]` does not carry is a `401`, which is the check doing its job.
 
 ### 4. Report
 
@@ -210,10 +212,11 @@ migration coupling them.
   in this repo. `install.sh` writes a starter config only when none exists.
   Once k-homelab #926 lands, its recipe asserts those; until then they are
   hand-maintained and this skill must not touch them.
-- **Tokens.** Never generated, never rotated, never read except to
-  authenticate a verification call. Rotation is `kaed-new-token --rotate`
-  (installed on every host since sprint 005) and is a deliberate, separate
-  act.
+- **Identities.** `[auth]` is a per-host allow-list of declared names and is
+  config, not this skill's business. Since sprint 023 there is no token to
+  generate or rotate — a verification call authenticates by sending
+  `X-Homelab-Agent: <identity>`. `install.sh` deletes a stale
+  `kaed-new-token` if it finds one.
 - **`tailscale serve`.** Set once per host at first deploy; k-homelab's
   `tailscale-serve` recipe owns it.
 - **Client wiring.** Adding a host to a client's MCP config is separate, and

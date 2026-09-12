@@ -176,6 +176,10 @@ more than a policy saying not to.
 
 *2026-08-06. Selects option 3 of the three in `brainstorm-gateway-mcp.md`
 § "The thing that must not break". Implemented in #1050.*
+*~~Mechanism superseded by PD-10, 2026-09-12 (sprint 023, korg #2392) —
+option 2 was taken, on the trigger this decision itself named. **The
+principle below is NOT superseded**: identity fidelity still beats
+token-count reduction, and it is what PD-10 preserves.~~*
 
 The gateway holds a per-agent token for each backend and proxies with the
 caller's real identity. Nothing about backend auth changes.
@@ -191,6 +195,13 @@ token-count reduction.**
 Signed author assertions (option 1) and allowlisted-peer forwarded headers
 (option 2) are more elegant and remain open if token sprawl actually starts to
 hurt. Do not build them speculatively.
+
+**It hurt, and option 2 was taken — see PD-10.** The trigger fired exactly as
+worded: nine `(backend × author)` credentials for three authors and three
+backends, no inventory anywhere (PD-7 already said so), and k-homelab WI 1353
+blocked for a year on "k-homelab must never hold kaed tokens". The identity
+fidelity this decision protected is intact; only the proof of the name
+changed.
 
 ---
 
@@ -302,10 +313,15 @@ That is the honest price of PD-4 + PD-7 together, and it is the argument for
 `krot` learning about kaed before a fourth client is added — not an argument
 for going back to a shared token.
 
+*(That multiplication is gone as of PD-10: the gateway forwards the caller's
+name and holds no credential, so the fleet's nine became zero. **The grain
+decided here is unchanged and now settles KP-5** — one identity per machine,
+still, because the thing you revoke is a line in a file on a host. It is a
+config line rather than a credential, which makes the grain cheaper, not
+different.)*
+
 A backend must list authors that never dial it, because they arrive proxied.
-`config.rs` already refuses to start on the converse mistake — a
-`[peers.x.tokens]` entry for an author absent from `[auth]` — on the grounds
-that nobody can authenticate as an identity the host does not know.
+That remains true and is now the *only* configuration the gateway adds.
 
 ---
 
@@ -437,3 +453,85 @@ was one) is throwaway precisely because nothing owns it, and if it stops being
 throwaway the first step is giving it a home, not editing it in place. This is
 input to the agent-skills slice (korg #1559 / proposal 1562), whose "kaed does
 not cover X — for those, do Y" list is where an agent will actually read it.
+
+---
+
+## PD-10 — Identity is a declared name inside a tailnet perimeter, not a bearer token
+
+*2026-09-12. Sprint 023 (korg #2392, #2393), slice 5 of korg program 2440
+("simplify homelab secrets"). Takes PD-4's option 2 on PD-4's own trigger.
+Ken's decision, 2026-09-11.*
+
+kaed's bearer tokens were **name tags, not locks**. Under the threat model
+kaed has always documented — one human, his agents, one tailnet, agents
+holding sudo on the hosts they edit — a token's only job was to say *which
+agent*, and it was held by the very agents it distinguished. It bought
+attribution and nothing else, at the price of a credential to mint, copy,
+inventory and rotate for every (agent × host) pair.
+
+**Decided:** `[auth]` is an allow-list of identities. A caller declares one in
+`X-Homelab-Agent`; an unknown name is refused exactly as an unknown token was.
+The gateway forwards the caller's declared name to peers. The caller's tailnet
+node is recorded beside the name on every journaled mutation and secrets audit
+row, record-only.
+
+What each half is now responsible for, stated plainly because the old scheme
+blurred it:
+
+- **The perimeter does access control.** `tailscale serve` and the tailnet.
+  Anything that can reach the port can claim any allow-listed name.
+- **The declared name does attribution.** Which it always actually did.
+- **whois does forensics.** A name claimed from an unexpected machine is
+  visible afterwards, and can be *enforced* per identity, off by default
+  (023 D-5).
+
+This is a real reduction in what kaed asserts, and SECURITY.md says so in
+those words rather than implying the old scheme was stronger than it was.
+
+**What it costs elsewhere, which is the point of recording it here:** k-homelab
+may now render `~/.claude.json` (its WI 1353, blocked a year on "k-homelab must
+never hold kaed tokens" — there are none to hold), krot's nine `kaed-*` rows
+are deleted by its shrink, karc's leg-toolbox credential question (WI 1861)
+**dissolves** rather than being answered, and the grace-window machinery of
+sprint 019 is retired entire. 019 was not wasted: it is what made the nine
+credentials legible enough to count, and counting them is what triggered PD-4's
+own escape clause.
+
+---
+
+## PD-11 — `/etc/klams` (and its siblings) do not become kaed roots
+
+*2026-09-12. Sprint 023, recording a decision korg program 2440 asked this
+slice to settle. Written onto krot WI 2466.*
+
+**The question.** A leg verifying klams identity rows read
+`/etc/klams/klams.toml` through the shell and printed the Postgres password
+into its transcript (krot WI 2466). Would a kaed classified root over
+`/etc/klams/` have sealed it?
+
+**Measured, on kubs0, 2026-09-12:** kaed runs as `ken`, and `/etc/klams/` is
+not readable by `ken` — `ls` on the directory is `Permission denied`. The leg
+read the file with `sudo`; kaed cannot read it at all.
+
+**Decided: no**, and the measurement is the reason. Classification requires
+*reading the bytes to classify them*, and the OS refuses first — the root
+would answer `not_readable_by_service_identity` (014 D-1), never a redacted
+read. It would be dormant policy that arms itself only if a mode changes,
+exactly like kubsdb's five classified files in 014, except that here the mode
+is 0600 root-owned **on purpose** and should stay that way.
+
+The alternative — giving kaed privileged read of `/etc/<service>/` — is
+rejected without much agonising. It would invert 008's model (kaed is a
+constrained editor, not a privileged one) and hand the single most attractive
+target on the host to a network service, in exchange for redacting a file the
+caller could already `sudo cat`.
+
+**What actually prevents a recurrence** is what the program already ruled: use
+the service's own tooling (`klams-token identity list`), never a read of the
+file. That is a working control because it does not require kaed to be able to
+do something kaed deliberately cannot.
+
+Generalised, so the next `/etc/<service>` question does not re-run this:
+**a classified root is worth adding only where kaed's service identity can
+actually read the file.** Where it cannot, the root adds a promise kaed cannot
+keep, and the honest answer is the service's own CLI.

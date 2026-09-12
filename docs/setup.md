@@ -23,19 +23,19 @@ If you would rather have an agent do this, skip to
 git clone https://github.com/kenhia/kaed
 cd kaed
 ./deploy/install.sh          # binary, systemd user unit, starter config
-$EDITOR ~/.config/kaed/config.toml     # roots — the one thing to get right
-./deploy/new-token.sh        # mints a token; never prints it
+$EDITOR ~/.config/kaed/config.toml     # roots, and the [auth] allow-list
 kaed check-config            # read the roots and deny rules it prints
 systemctl --user start kaed
 ```
 
-`install.sh` is idempotent, and re-running it is how you upgrade. It never
-overwrites an existing config and never touches the token — the two things
-you cannot safely regenerate underneath a running host. `--dry-run` prints
-what it would do.
+There is no token to mint. A caller declares its identity in a header and
+kaed checks the name against `[auth]`; see
+[Identities](#2-allow-list-your-identities) for what that does and does not
+protect.
 
-It also installs `kaed-new-token` next to the binary, so minting and rotating
-tokens does not need the checkout later.
+`install.sh` is idempotent, and re-running it is how you upgrade. It never
+overwrites an existing config — the one thing you cannot safely regenerate
+underneath a running host. `--dry-run` prints what it would do.
 
 If you keep published builds somewhere, the same script can install one
 instead of building — no clone and no Rust toolchain on the target host. See
@@ -95,7 +95,6 @@ artifacts/kaed/<version>/kaed-x86_64-linux   # the binary, named for its arch
 artifacts/kaed/<version>/install.sh
 artifacts/kaed/<version>/kaed.service
 artifacts/kaed/<version>/config.example.toml
-artifacts/kaed/<version>/new-token.sh
 artifacts/kaed/<version>/SHA256SUMS
 ```
 
@@ -122,41 +121,64 @@ publishing is worth the trouble at all.
 store; it refuses a dirty tree, and reads the version out of the binary it
 just built so the label cannot drift from the stamp.
 
-## 2. Create the token
+## 2. Allow-list your identities
 
-One bearer token per agent identity. This is the only thing standing between
-the network and your files:
+A caller tells kaed who it is:
 
-```sh
-./deploy/new-token.sh        # or `kaed-new-token`, which install.sh puts on PATH
+```
+X-Homelab-Agent: claude-kai
 ```
 
-which is this, with a refusal to overwrite an existing token bolted on:
+kaed looks that name up in `[auth]`. A name that is there is accepted and
+recorded on every journal entry it writes; a name that is not is refused
+with `401`. There is no token, no expiry, and nothing to rotate.
 
-```sh
-mkdir -p ~/.config/kaed
-head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 48 > ~/.config/kaed/token
-chmod 600 ~/.config/kaed/token
+```toml
+[auth]
+claude       = {}
+claude-kai   = {}
+claude-kubs0 = {}
 ```
 
-The file's trimmed contents are the token. Never commit it, and keep it out of
-any directory kaed serves — which kaed enforces for you, since its own config
-directory is refused unconditionally.
+**Be clear about what this is.** A declared name is *attribution*, not
+authentication — anything that can reach kaed's port can claim any name on
+that list. The access-control boundary is the network: bind loopback, front
+it with something that restricts who can connect (`tailscale serve` in the
+reference deployment), and treat the set of hosts that can reach the port as
+the set of hosts you would hand a shell to. [SECURITY.md](../SECURITY.md)
+sets out the trade in full.
 
-**The script does not print the token, deliberately.** Read it with `cat`
-when you are ready to paste it into a client. This project's first token had
-to be rotated because it landed in a transcript.
+kaed also records the caller's tailnet node beside the declared name, so a
+name claimed from an unexpected machine is visible in the journal afterwards
+— see [whois](#tailnet-whois-and-node-pinning).
 
-For any identity beyond the first, name it and let the script read its paths
-out of your config rather than inventing a filename:
+Adding or removing an identity changes the config *shape*, so it needs a
+**restart**, not `SIGHUP`. The symptom of forgetting is a `401` that reads
+like a wrong credential.
 
-```sh
-kaed-new-token --identity claude-kai
+One identity per client **machine**, not per harness or per human: the thing
+you revoke is a line in a file on a host. A backend behind a gateway must
+list the identities that reach it *proxied*, even though they never dial it
+directly.
+
+### The transition window
+
+An identity may also keep a `token_file`, and while it does, that bearer
+still authenticates it alongside the header:
+
+```toml
+claude = { token_file = "~/.config/kaed/token" }
 ```
 
-It refuses an identity `[auth]` does not declare — minting to a path nothing
-references gives you a credential that authenticates nothing and looks
-exactly like one that does.
+The rows **are** the flag — there is no separate switch. Deleting the field
+closes the window for that identity, and kaed warns at startup naming every
+identity still holding one. `prev_token_file` is retired: it still parses,
+so an existing config starts, and it is ignored.
+
+Order matters if a name is unknown and a bearer is valid: the declared name
+is checked first and an unknown one is **refused**, never quietly downgraded
+to the bearer. Authenticating a caller as something it did not claim to be
+would be the least honest outcome available.
 
 ## 3. Write the config
 
@@ -200,8 +222,15 @@ description = "scratch space"
 # url    = "https://otherhost.example.ts.net:4870/mcp"
 
 [auth]
-# One entry per agent identity; the name is recorded on every journal entry.
-claude = { token_file = "~/.config/kaed/token" }
+# An allow-list of identities. The name arrives in `X-Homelab-Agent`, and is
+# recorded on every journal entry. No token; see "Allow-list your
+# identities" above for what that does and does not protect.
+claude = {}
+
+[whois]
+# Record the caller's tailnet node beside the identity. Data, not a check.
+enabled = true
+enforce = false
 
 [limits]
 max_read_bytes = 262144       # per-response byte budget
@@ -286,45 +315,43 @@ and absence starts to mean something.
 A peer entry with a `url` is more than a declaration — the instance will
 **proxy** calls addressing that peer's roots, so a client wired to one host
 can edit files on all of them. What makes this safe to audit is identity:
-the gateway proxies as *the caller*, using a per-author token you configure
-per peer, and refuses (naming the fix) when it has none for the calling
-identity. It never borrows another identity's credential — an edit on the
-target is journaled under the same author as a direct call.
+the gateway **forwards the caller's own declared name** to the peer, so an
+edit on the target is journaled under the same author as a direct call. It
+never substitutes a name of its own.
 
 ```toml
 [peers.buildbox]
 status = "active"
 url    = "https://buildbox.example.ts.net:4870/mcp"
-
-[peers.buildbox.tokens]
-claude = { token_file = "/home/you/.config/kaed/peer-tokens/buildbox-claude" }
 ```
 
-The token value is the same bearer token that identity uses when talking to
-`buildbox` directly.
+That is the whole of it — the gateway holds no credential for its peers and
+needs none. A backend that does not allow-list the forwarded name refuses
+the call (`peer_credential_rejected`, naming the identity and the fix),
+which is the right answer: a misattributed journal row on the backend would
+be worse than a refused call.
 
 **Give each machine its own identity, not each person or each tool.** Once
 more than one client exists, a shared identity means the journal can only
 say "some agent somewhere" — and the point of the journal is to answer
-"which machine changed this". It also ties the clients together for
-revocation: one compromised client costs all of them a rotation. Name the
-identity after the host the credential lives on (`claude-buildbox`), since
-that is the thing that can actually be stolen and the thing that can
-actually be revoked.
+"which machine changed this". Name the identity after the host it is
+configured on (`claude-buildbox`), since that is the thing you can actually
+revoke.
 
-Budget for the multiplication before you start: with a gateway, credentials
-grow as **identities × endpoints**, because the gateway holds a separate
-token per (identity, peer) pair rather than one per peer. Two identities
-across a gateway and two backends is six token files. That is the price of
-proxying as the caller instead of substituting a shared credential, and it
-is worth paying — but decide where you will keep track of them first.
+Every backend must list the identities that reach it **proxied**, even
+though they never dial it directly. That is the one configuration step the
+gateway adds, and forgetting it produces a `401` at the backend that
+surfaces as `peer_credential_rejected` naming the missing name. Because the
+allow-list is config *shape*, adding it is a restart, not a `SIGHUP`.
 
-Note the backends must list identities that never dial them directly: they
-arrive proxied. kaed refuses to start on the converse mistake — a
-`[peers.<host>.tokens]` entry for an identity missing from this host's
-`[auth]` — since nobody could authenticate as it anyway. Token files re-read on `SIGHUP`, like every other
-credential; `token_env` works but needs a restart. With routing configured,
-`roots` **probes** peers live (under the caller's credential): an answering
+This used to cost far more. Before sprint 023 the gateway held a bearer
+token per (identity, peer) pair — two identities across a gateway and two
+backends was six token files, on top of each backend's own — and that
+multiplication is what retired the scheme. Forwarding the caller's name
+buys the same attribution for nothing.
+
+With routing configured,
+`roots` **probes** peers live (under the caller's identity): an answering
 peer shows up `verified: true` with its version and its roots merged in; one
 that stopped answering becomes `status: "unreachable"` with the observed
 `since`, its last-known roots still listed and labelled. `search` accepts a
@@ -347,11 +374,16 @@ fallback.
 | `server.allowed_hosts` | Extra `Host` header values accepted beyond loopback. **Required when proxied.** |
 | `server.host` | This instance's fleet name and the prefix on every root name. Defaults to the short system hostname; startup fails if neither yields one. |
 | `roots[]` | `name` (local, no `:` or `/`), `path`, optional `description`. `path` may use `~/`. Canonicalized at startup; duplicates and denied roots are refused. |
-| `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. With a `url`, calls addressing that host's roots are proxied there. Omit the whole table to declare nothing. |
-| `peers.<host>.tokens.<identity>` | That identity's bearer token *for this peer* (`token_file` re-reads on `SIGHUP`; `token_env` needs a restart). The gateway proxies as the caller — an identity with no entry is refused, never impersonated. |
-| `auth.<identity>.token_file` | File holding the token. Re-read on `SIGHUP`. **Adding a new identity is not** — see below. |
-| `auth.<identity>.token_env` | Alternative: an env var. Works, but **cannot be reloaded** — see [rotation](#rotating-a-token). |
-| `auth.<identity>.prev_token_file` | Grace-window token during a rotation. Requires `token_file`. **Set it on every identity**, before it is needed: without it a rotation is a hard cut, `kaed-new-token --rotate` refuses, and kaed warns at startup naming each identity that lacks one. |
+| `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. With a `url`, calls addressing that host's roots are proxied there, under the caller's own forwarded identity. Omit the whole table to declare nothing. |
+| `auth.<identity>` | An allow-listed identity, ordinarily an empty table (`claude-kai = {}`). The name arrives in `X-Homelab-Agent`; an unknown one is `401`. **Adding or removing one needs a restart** — see below. |
+| `auth.<identity>.nodes` | Tailnet nodes this identity may arrive from. Empty (default) = unpinned. Recorded either way; only *enforced* when `whois.enforce` is on. |
+| `auth.<identity>.token_file` | **Transition window only.** A legacy bearer accepted alongside the declared name. Re-read on `SIGHUP`; deleting the field closes the window for that identity. |
+| `auth.<identity>.token_env` | As above, from an env var. Cannot be reloaded (a process cannot re-read its own `EnvironmentFile`). |
+| `auth.<identity>.prev_token_file` | **Retired.** Still parsed so an existing config starts; ignored, and named in a startup warning. |
+| `whois.enabled` | Resolve the caller's tailnet node (default `true`). `false` records `unknown` for everything — a supported deployment, e.g. a host with no `tailscale` binary. |
+| `whois.enforce` | Refuse a caller whose node is not in its identity's `nodes` (default `false`). An unresolvable node counts as "not in the list". |
+| `whois.ttl_secs` | Cache lifetime, negative answers included (default 300). |
+| `whois.binary` | Path to `tailscale` (default `tailscale`). |
 | `limits.*` | Response and file size budgets. |
 | `journal.path` | Defaults to `$XDG_DATA_HOME/kaed/journal.db`. |
 | `journal.retention_days` | Blob content retention. Metadata is kept forever — so past this window `journal` still shows what changed and when, while `diff`/`revert` can name a version they can no longer reconstruct (they say so, with the window, rather than returning an empty diff). |
@@ -365,26 +397,59 @@ fallback.
 
 ### What reloads, and what needs a restart
 
-`SIGHUP` re-reads the token **files** the running process already knows
-about. It does not re-read the config, so anything that changes the *shape*
-of `[auth]` or `[peers]` needs `systemctl --user restart kaed`:
+`SIGHUP` re-reads the legacy token **files** of identities the running
+process already knows about. It does not re-read the config, so anything
+that changes the *shape* of `[auth]`, `[whois]` or `[peers]` needs
+`systemctl --user restart kaed`:
 
 | Change | `systemctl --user reload` is enough |
 |---|---|
-| New value in an existing token file | **yes** — this is what rotation uses |
+| New value in an existing legacy token file | **yes** |
+| Deleting a legacy token file (closing the window) | **yes** |
 | New `[auth]` identity | no — restart |
-| Adding `prev_token_file` to an identity | no — restart |
-| New `[peers.<host>.tokens]` entry | no — restart |
+| Pinning an identity to `nodes` | no — restart |
+| Any `[whois]` setting | no — restart |
 | New peer, or a changed peer `url` | no — restart |
 
-Rotation got the hot path because rotation is the frequent operation.
-Adding an identity is rare, and a restart is the honest cost of loading a
-config that might not validate.
+Since 023 almost everything here is a restart, because almost everything
+here is now config shape rather than file contents — which is the direct
+consequence of there being no credential left to reload.
 
 The failure this prevents is mildly misleading if you hit it: SIGHUP
-succeeds, the new identity never appears, and the client gets a `401`
-saying the token matches no configured identity — which reads as "wrong
-token" rather than "the server never loaded your identity."
+succeeds, the new identity never appears, and the client gets a `401` —
+which reads as "wrong credential" rather than "the server never loaded your
+identity."
+
+### Tailnet whois and node pinning
+
+A declared name says *who*; it says nothing about *where from*. kaed asks
+`tailscale whois` for the caller's node and records it beside the identity
+on every journaled mutation and every secrets audit row, so "why did a write
+from `claude` show up here" is answerable after the fact.
+
+Behind `tailscale serve` the socket peer is always loopback, so the address
+comes from the first entry of `X-Forwarded-For`; a direct deployment falls
+back to the socket peer.
+
+It is **data, not a check**. tailscaled down, no `tailscale` binary, an
+address the tailnet does not know, and `enabled = false` all record the same
+thing — `unknown` — and none of them refuses a request.
+
+If you want it to be a check, pin an identity and turn enforcement on:
+
+```toml
+[auth]
+claude-buildbox = { nodes = ["buildbox"] }
+
+[whois]
+enforce = true
+```
+
+Only identities that declare `nodes` are constrained; everything else stays
+unpinned. A pinned identity whose node cannot be resolved is refused, since
+"unknown" is not in any allow-list. Note that a call arriving through a
+gateway resolves to the *gateway's* node, not the original client's — so
+pin proxied identities to the gateway as well as their own host.
 
 ### Validate it
 
@@ -393,8 +458,8 @@ kaed check-config
 ```
 
 This prints the host name it resolved, the resolved roots (host-qualified, as
-tools will address them), the declared fleet, which identities resolved a
-token, the limits, the journal path, and **every deny rule in force**. It
+tools will address them), the declared fleet, the allow-listed identities
+(and which still hold a legacy token), the limits, the journal path, and **every deny rule in force**. It
 exits non-zero on anything invalid. Read the deny list it prints — that is the
 real one, not the one you think you wrote.
 
@@ -429,8 +494,9 @@ systemctl --user status kaed
 loginctl enable-linger "$USER"   # so it survives logout
 ```
 
-`ExecReload` is what makes [token rotation](#rotating-a-token) non-breaking.
-Include it.
+`ExecReload` is what lets the legacy token files be re-read without dropping
+live sessions — see [closing the transition
+window](#closing-the-transition-window). Include it.
 
 ## 5. Expose it (optional)
 
@@ -582,101 +648,62 @@ restart the client.
 
 ---
 
-## Rotating a token
+## Revoking an identity
 
-kaed re-reads token files on `SIGHUP`, and can honour the previous token
-during a grace window. Together those make rotation non-breaking on the server
-side — no restart, so live sessions survive:
-
-```sh
-kaed-new-token --rotate    # new token live, old one still works
-# … update your clients; they pick it up when they next restart …
-kaed-new-token --close     # old token stops working
-```
-
-(`kaed-new-token` is `deploy/new-token.sh`, installed onto `PATH` by
-`install.sh` — rotation is ongoing operator work and shouldn't require the
-host to still have a checkout. From a checkout, `./deploy/new-token.sh` is
-the same script.)
-
-To rotate one of several identities, name it — the script reads that
-identity's `token_file` and `prev_token_file` out of `config.toml` instead of
-assuming the default pair:
+There is no rotation, because there is no secret. To stop an identity being
+accepted, delete its line from `[auth]` and restart:
 
 ```sh
-kaed-new-token --identity claude-kai --rotate
-kaed-new-token --identity claude-kai --close
+$EDITOR ~/.config/kaed/config.toml     # remove `claude-oldbox = {}`
+systemctl --user restart kaed
 ```
 
-`--rotate` **refuses** unless `prev_token_file` is configured for that token,
-because without it the old value dies at reload and the window buys you
-nothing. The script cannot edit your config for you, so it stops and tells
-you the line to add. `--force` rotates anyway, deliberately cutting every
-live session off; it writes no `.prev` file, since one nothing honours is
-just a live-looking credential lying on disk.
+A restart rather than `SIGHUP`, because the allow-list is config *shape*; a
+reload would succeed and change nothing, and the identity would keep
+working. That is the one failure mode worth remembering here.
 
-That refusal replaces a printed reminder that did not work: sprint 019 found
-eight of this fleet's nine credentials configured with no grace window at
-all. kaed also names them at startup now, so the state is visible from the
-host rather than by reading every config by hand:
+Revocation is per host. An identity that reaches a backend *through* a
+gateway is allow-listed on the backend, so removing it there is what stops
+it — the gateway holds nothing to take away.
+
+**What this does not do** is keep out whoever could reach the port. Deleting
+a name stops that name being *recorded*, and stops a caller using it by
+accident; it is not a security boundary against anything already inside the
+perimeter. If that is what you need, the fix is at the network layer. See
+[SECURITY.md](../SECURITY.md).
+
+### Closing the transition window
+
+If an identity still carries a legacy `token_file`, it accepts that bearer
+too. Deleting the field (or the file) closes the window:
+
+```sh
+rm ~/.config/kaed/token-claude-kai
+$EDITOR ~/.config/kaed/config.toml     # `claude-kai = { token_file = … }` → `claude-kai = {}`
+systemctl --user reload kaed           # the token half reloads
+```
+
+The identity keeps working throughout — it is the credential now. kaed warns
+at startup naming every identity that still holds a token, so the state of
+the cutover is readable from the host rather than by opening each config by
+hand:
 
 ```
-WARN kaed::config: no prev_token_file: rotating these is a HARD CUT …
+WARN kaed::config: transition window OPEN: these identities still accept a
+     bearer token as well as X-Homelab-Agent …
      identities=["claude-kai", "claude-kubs0"]
 ```
 
-**If the credential is consumed by a gateway, the rotation has two ends.**
-kai proxies to its peers as the caller (`[peers.<host>.tokens]`), so a
-backend identity's new value has to reach kai's copy too. Rotate on the
-backend, copy the new value into kai's peer-token file, `systemctl --user
-reload kaed` there, then `--close` on the backend. The grace window is
-exactly what makes that an ordered sequence you can take your time over
-rather than a race in which both orderings `401`.
-
-Longhand, which is what those two commands do:
-
-```sh
-cd ~/.config/kaed
-
-# 1. open the grace window: old token keeps working
-cp token token.prev
-
-# 2. mint and install the new one
-head -c 48 /dev/urandom | base64 | tr -d '/+=' | head -c 48 > token
-chmod 600 token token.prev
-
-# 3. load both — no restart
-systemctl --user reload kaed
-
-# … update your clients; they pick it up when they next restart …
-
-# 4. close the window
-rm token.prev
-systemctl --user reload kaed
-```
-
-While the window is open, every request still using the old token logs:
-
-```
-WARN kaed::server: authenticated with the PREVIOUS token; this client has not
-picked up the new one yet author="claude"
-```
-
-That line is how you know it is safe to close the window. It is the only
-signal available — 401s are rejected before the transaction layer, so the
-journal never sees them.
-
-**`token_env` cannot participate in this.** A process cannot re-read its own
-systemd `EnvironmentFile`; those variables were set at exec and are frozen for
-its lifetime. Env-var tokens still work, but changing one means restarting the
-daemon, which drops every live session. Use `token_file`.
-
 ## Operating notes
 
-**Tokens never expire.** A 401 means the presented token matches no configured
-identity — wrong, or rotated. kaed says so in the `WWW-Authenticate` header
+**A 401 says which of three things is wrong.** An `X-Homelab-Agent` naming
+no configured identity; a legacy bearer matching none; or no credential at
+all. kaed distinguishes them in the `WWW-Authenticate` header and the body
 per RFC 6750, because clients otherwise render a bare 401 as "token expired"
-and send you hunting for a TTL that does not exist.
+and send you hunting for a TTL that does not exist. A *declared* name that
+is unknown is refused outright — it never falls through to the bearer path,
+because authenticating a caller as something it did not claim to be would be
+worse than refusing it.
 
 **The journal is sensitive.** `~/.local/share/kaed/journal.db` holds the
 content of files kaed has edited. It is created `0600` and blob content ages

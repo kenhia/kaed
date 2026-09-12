@@ -30,8 +30,8 @@ async fn start_server() -> anyhow::Result<TestServer> {
         std::collections::BTreeMap::new(),
         vec![Identity {
             author: "claude".into(),
-            token: TOKEN.into(),
-            prev_token: None,
+            token: Some(TOKEN.into()),
+            nodes: std::sync::Arc::new(Vec::new()),
         }],
     )
     .await
@@ -94,6 +94,7 @@ async fn start_server_with(
         deny: std::sync::Arc::new(kaed::deny::DenyList::empty()),
         classify: std::sync::Arc::new(kaed::policy::Classifier::empty()),
         auth: auth_spec,
+        whois: kaed::config::WhoisConfig::default(),
         secrets: Default::default(),
     };
     let (app, auth) = kaed::server::build_app(resolved)?;
@@ -185,15 +186,103 @@ async fn rejects_missing_and_bad_tokens() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #914: rotation should not be a hard cut. Reload is the load-bearing
-/// half — the process restart is what kills live sessions, independent of
-/// tokens — and the grace window is what makes the reload safe for clients
-/// that have not restarted yet.
+/// 023 D-1, the ordering contract, end to end over real HTTP.
+///
+/// Three assertions, and the middle one is the one that matters: a
+/// *declared* name that is not on the allow-list must be **refused**, not
+/// quietly downgraded to the bearer path. A fallthrough would authenticate
+/// the caller as something it did not claim to be, which is the least
+/// honest outcome available and exactly what the identity model is for.
 #[tokio::test]
-async fn rotation_reloads_in_place_with_a_grace_window() -> anyhow::Result<()> {
+async fn a_declared_identity_beats_a_bearer_and_an_unknown_name_never_falls_through()
+-> anyhow::Result<()> {
+    let server = start_server().await?;
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/mcp", server.addr);
+    let probe = |agent: Option<&str>, token: Option<&str>| {
+        let (http, url) = (http.clone(), url.clone());
+        let (agent, token) = (agent.map(str::to_owned), token.map(str::to_owned));
+        async move {
+            let mut r = http.post(&url);
+            if let Some(a) = agent {
+                r = r.header("x-homelab-agent", a);
+            }
+            if let Some(t) = token {
+                r = r.header("authorization", format!("Bearer {t}"));
+            }
+            r.body("{}").send().await.map(|x| x.status())
+        }
+    };
+
+    // The declared name alone is a credential (400-something from the MCP
+    // layer means it got past auth; 401 means it did not).
+    assert_ne!(probe(Some("claude"), None).await?, 401);
+    // The legacy bearer still works while the window is open.
+    assert_ne!(probe(None, Some(TOKEN)).await?, 401);
+    // Both together: legal mid-cutover, and the identity wins.
+    assert_ne!(probe(Some("claude"), Some(TOKEN)).await?, 401);
+
+    // An unknown name is refused even when a VALID bearer rides along.
+    assert_eq!(
+        probe(Some("mallory"), Some(TOKEN)).await?,
+        401,
+        "a declared name must never fall through to the bearer path"
+    );
+    // Whitespace is not a declaration, so this is the bearer's call.
+    assert_ne!(probe(Some("   "), Some(TOKEN)).await?, 401);
+    assert_eq!(probe(Some("   "), None).await?, 401);
+    assert_eq!(probe(None, None).await?, 401);
+
+    server.ct.cancel();
+    Ok(())
+}
+
+/// The 401 body says which of the three things is wrong, because each
+/// needs a different fix. cleo's client once rendered a bare 401 as "token
+/// expired" and sent a live test hunting for a TTL kaed has never had.
+#[tokio::test]
+async fn the_401_distinguishes_an_unknown_name_from_a_bad_token_from_neither() -> anyhow::Result<()>
+{
+    let server = start_server().await?;
+    let http = reqwest::Client::new();
+    let url = format!("http://{}/mcp", server.addr);
+
+    let unknown_name = http
+        .post(&url)
+        .header("x-homelab-agent", "mallory")
+        .body("{}")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(unknown_name.contains("X-Homelab-Agent"), "{unknown_name}");
+
+    let bad_token = http
+        .post(&url)
+        .header("authorization", "Bearer nope")
+        .body("{}")
+        .send()
+        .await?
+        .text()
+        .await?;
+    assert!(bad_token.contains("do not expire"), "{bad_token}");
+
+    let nothing = http.post(&url).body("{}").send().await?.text().await?;
+    assert!(nothing.contains("X-Homelab-Agent"), "{nothing}");
+    assert!(!nothing.contains("do not expire"), "{nothing}");
+
+    server.ct.cancel();
+    Ok(())
+}
+
+/// Closing the transition window is a config edit, not a code change
+/// (D-2): delete the token and the bearer stops working, with the declared
+/// name unaffected. Reload does the token half in place; the allow-list
+/// itself is config shape and still needs a restart (018 D-3).
+#[tokio::test]
+async fn deleting_the_token_closes_the_window_for_that_identity() -> anyhow::Result<()> {
     let secrets = tempfile::tempdir()?;
     let current = secrets.path().join("claude.token");
-    let previous = secrets.path().join("claude.token.prev");
     std::fs::write(&current, "token-v1\n")?;
 
     let mut spec = std::collections::BTreeMap::new();
@@ -202,53 +291,58 @@ async fn rotation_reloads_in_place_with_a_grace_window() -> anyhow::Result<()> {
         AuthEntry {
             token_env: None,
             token_file: Some(current.display().to_string()),
-            prev_token_file: Some(previous.display().to_string()),
+            prev_token_file: None,
+            nodes: Vec::new(),
         },
     );
     let server = start_server_with(
         spec,
         vec![Identity {
             author: "claude".into(),
-            token: "token-v1".into(),
-            prev_token: None,
+            token: Some("token-v1".into()),
+            nodes: std::sync::Arc::new(Vec::new()),
         }],
     )
     .await?;
 
     let http = reqwest::Client::new();
     let url = format!("http://{}/mcp", server.addr);
-    let probe = |token: &str| {
-        let (http, url, token) = (http.clone(), url.clone(), token.to_string());
+    let by_token = || {
+        let (http, url) = (http.clone(), url.clone());
         async move {
             http.post(&url)
-                .header("authorization", format!("Bearer {token}"))
+                .header("authorization", "Bearer token-v1")
                 .body("{}")
                 .send()
                 .await
                 .map(|r| r.status())
         }
     };
-    // v1 authenticates (400-something from the MCP layer, not 401)
-    assert_ne!(probe("token-v1").await?, 401);
-    assert_eq!(probe("token-v2").await?, 401);
+    let by_name = || {
+        let (http, url) = (http.clone(), url.clone());
+        async move {
+            http.post(&url)
+                .header("x-homelab-agent", "claude")
+                .body("{}")
+                .send()
+                .await
+                .map(|r| r.status())
+        }
+    };
 
-    // rotate: v2 becomes current, v1 moves to the grace slot. No restart.
-    std::fs::write(&current, "token-v2\n")?;
-    std::fs::write(&previous, "token-v1\n")?;
+    assert_ne!(by_token().await?, 401, "the window is open");
+    assert_ne!(by_name().await?, 401);
+
+    // The cutover: the token file goes away. No restart.
+    std::fs::remove_file(&current)?;
     server.auth.reload();
 
-    assert_ne!(probe("token-v2").await?, 401, "the new token must work");
+    assert_eq!(by_token().await?, 401, "the window is closed");
     assert_ne!(
-        probe("token-v1").await?,
+        by_name().await?,
         401,
-        "the grace window must still honour the old token"
+        "the identity must OUTLIVE its retired token — it is the credential now"
     );
-
-    // grace window closes: the old token dies, still with no restart
-    std::fs::remove_file(&previous)?;
-    server.auth.reload();
-    assert_ne!(probe("token-v2").await?, 401);
-    assert_eq!(probe("token-v1").await?, 401);
 
     server.ct.cancel();
     Ok(())

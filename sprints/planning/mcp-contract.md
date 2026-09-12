@@ -9,16 +9,17 @@ agent-filed feedback. Nothing here is frozen.
 - **Streamable HTTP MCP** (the current MCP HTTP transport), served by the
   kaed daemon on a loopback port; HTTPS exposure to the tailnet via
   `tailscale serve`, following the homelab convention used by klams/korg.
-- **Auth:** `Authorization: Bearer <token>`; one token per agent identity
-  (e.g. `claude`, `ghcp`). The token binds an **author identity** recorded
-  on every journal entry. No anonymous mutation.
-- **Tokens do not expire.** A 401 means the presented token matches no
-  configured identity — wrong or rotated — and says so in the
-  `WWW-Authenticate` challenge (RFC 6750: `error="invalid_token"` plus a
-  description). There is no TTL to hunt for. Rotation is non-breaking
-  server-side: a previous token can be honoured during a grace window and
-  new tokens load on `SIGHUP` without dropping live sessions. Clients
-  still learn a new secret only when they restart.
+- **Auth:** `X-Homelab-Agent: <identity>` against `[auth]`, an allow-list of
+  names (e.g. `claude`, `claude-kai`). The name binds an **author identity**
+  recorded on every journal entry. No anonymous mutation. See R13 for what
+  this does and does not assert — it is attribution, and the perimeter is
+  the access control.
+- **A 401 says which of three things is wrong.** A declared name matching no
+  configured identity; a legacy bearer matching none; or no credential at
+  all. All three are distinguished in the `WWW-Authenticate` challenge and
+  the body (RFC 6750: `error="invalid_token"` plus a description), because a
+  bare 401 gets rendered by clients as "token expired" and sends a reader
+  hunting for a TTL kaed has never had.
 - **Statelessness:** no tool depends on hidden per-session server state.
   Any session, including a brand-new one, can act given only tool results.
 
@@ -243,18 +244,44 @@ agent-filed feedback. Nothing here is frozen.
   tools mark such a transaction **historical** with a structured reason,
   and `revert` refuses it saying why. (Added sprint 007; see D-6 there.)
 
+- **R13 — identity is declared, not proved, and the node is recorded
+  (023).** `[auth]` is an allow-list of names; a caller sends
+  `X-Homelab-Agent: <name>` and kaed believes it. This is deliberate and is
+  the honest description of what the previous bearer tokens achieved: they
+  had no expiry, lived in plaintext client configs, and were held by the
+  very agents they distinguished — agents that also had a shell on the host.
+  Three rules follow, and a tool must not be designed as if any of them were
+  otherwise:
+  - **A declared name is checked first, and an unknown one is refused.** It
+    never falls through to any other credential. Authenticating a caller as
+    something it did not claim to be is worse than refusing it (D-1).
+  - **The perimeter is the access control**, not the name. Anything that can
+    reach the port can claim any allow-listed name. `tailscale serve` and
+    the tailnet are what keep strangers out; SECURITY.md states the trade.
+  - **The caller's tailnet node is recorded** beside the identity on every
+    journaled mutation and every secrets audit row — `unknown` whenever
+    whois cannot answer, which is never a reason to refuse a call.
+    Enforcement (per-identity `nodes` + `[whois] enforce`) exists and is
+    **off by default** (D-5).
+
+  A **transition window** exists per identity while its `[auth]` entry still
+  declares a token: that bearer is accepted alongside the name. The rows are
+  the flag (D-2); deleting the field closes it.
+
 - **R10 — any instance can be the fleet's gateway (010).** An instance
   whose `[peers.<host>]` entries carry a `url` proxies calls addressing
   that peer's roots — same tools, same signatures, no new addressing
   vocabulary: the host prefix R8 introduced *is* the routing key. Rules
   that hold on every proxied call:
-  - **Identity survives the hop.** The gateway holds per-author tokens per
-    backend (`[peers.<host>.tokens]`, PD-4) and proxies as the caller;
-    journal attribution on the target is identical to a direct call. No
-    token for the calling author → `denied` with
-    `reason: no_peer_credential` — never a borrowed identity. A token the
-    backend rejects → `denied` / `peer_credential_rejected`. Peer token
-    files reload on SIGHUP, like every other credential (#914).
+  - **Identity survives the hop.** The gateway **forwards the caller's own
+    declared name** to the backend (PD-10, 023 D-3), so journal attribution
+    on the target is identical to a direct call and is never a borrowed or
+    substituted identity. It holds no credential of its own and needs none;
+    `[peers.<host>.tokens]` and `reason: no_peer_credential` are retired. A
+    backend whose `[auth]` does not carry the forwarded name answers 401,
+    surfaced as `denied` / `peer_credential_rejected` naming the identity
+    and the remedy (add it there and **restart** — the allow-list is config
+    shape, so SIGHUP will not pick it up).
   - **Patterns are expanded by the instance that was asked (014).**
     Routing reads the host prefix, so a pattern naming exactly one peer
     (`kubsdb:*`) used to forward wholesale — and the peer ran the fan-out
@@ -500,8 +527,10 @@ What this instance serves, and which hosts are supposed to.
   `reason`, plus `merge_dropped`
   for what the *merge* discarded over budget (top-level `truncated` goes
   true either way). Hosts that could not be searched are named in
-  `hosts_unavailable[]` (`unreachable` + `since`, `no_credential`,
-  `no_url`, `deferred` + `ref`) — a fleet search is never silently
+  `hosts_unavailable[]` (`unreachable` + `since`, `identity_refused` +
+  `author`, `no_url`, `deferred` + `ref` — a host that *answered* and
+  declined the forwarded name is refused, not unreachable, and carries no
+  `since` because nothing went down) — a fleet search is never silently
   narrower than the fleet. A pattern matching no known root gets
   `reason: root_pattern_matched_no_roots` with the known names (#1066's
   rule, fleet edition). Patterns are `invalid_input` on every other tool:

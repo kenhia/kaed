@@ -1,8 +1,10 @@
 # Security
 
 kaed is a network service that reads and writes files on the machine it runs
-on, authenticated by a bearer token. Please read this before deploying it
-anywhere that matters.
+on. Callers **declare an identity** — a name on an allow-list, sent as
+`X-Homelab-Agent` — and the network perimeter is what keeps strangers out.
+Please read this before deploying it anywhere that matters, because that
+sentence is doing real work.
 
 **Status: early beta.** It is dogfooded daily on one host by its author. It
 has not been audited, pen-tested, or run by anyone else in anger.
@@ -10,7 +12,24 @@ has not been audited, pen-tested, or run by anyone else in anger.
 ## Threat model, honestly
 
 kaed's protections are **blast-radius reduction and ergonomics, not an
-access-control boundary.**
+access-control boundary.** Its identity model says the same thing out loud:
+**a declared name is attribution, not authentication.** Anything that can
+reach kaed's port can claim any name on the allow-list. What the name buys
+is that every edit is recorded against the agent that made it, and that a
+name nobody configured is refused rather than served anonymously.
+
+That is a deliberate change (sprint 023), not an omission. kaed previously
+issued a bearer token per identity, which read like authentication and was
+not: the tokens had no expiry, lived in plaintext client configs on every
+machine that talked to kaed, and were held *by the very agents* they were
+meant to distinguish — agents that also had a shell on the same host. They
+bought attribution and nothing else, at the cost of a credential to mint,
+copy, inventory and rotate for every (agent × host) pair. Now the perimeter
+does the access control it was always actually doing, and the name does the
+attribution it was always actually doing.
+
+**So the perimeter is load-bearing.** See "An untrusted network" below; it
+is no longer a secondary control.
 
 That distinction is the whole thing, so to be concrete: the deny list stops
 kaed from serving your `.ssh` keys. It does *not* stop the agent holding
@@ -72,26 +91,32 @@ Nothing in kaed is designed on the assumption that it is.
 ### What it does not
 
 - **A compromised or injected agent.** See above.
-- **A stolen token.** Tokens are bearer credentials with **no expiry**. A
-  leaked token is valid until you rotate it. (Rotation is non-breaking when
-  the identity has a grace window configured, which the config template ships
-  by default and `kaed-new-token --rotate` refuses to proceed without — see
-  [docs/setup.md](docs/setup.md). Cutting a leaked token off *immediately* is
-  the one case where you want `--force`.)
-- **An untrusted network.** kaed binds loopback by default and expects to be
-  fronted by something that provides transport security and network-level
-  access control — the reference deployment uses `tailscale serve`. Do not
-  put it on a public interface.
-- **A hostile local user.** Anyone who can read `~/.config/kaed/token` is
-  kaed, as far as kaed is concerned.
-- **A compromised gateway host.** An instance configured to proxy to peers
-  (`[peers.<host>.tokens]`) holds bearer tokens **valid on those peers**, so
-  compromising the gateway machine yields credentials for every backend it
-  routes to — one machine's compromise is the fleet's, for the identities
-  configured there. That is a deliberate trade (the alternative was a shared
-  gateway identity, which destroys journal attribution). If that radius is
-  unacceptable, don't configure peer tokens: every host remains directly
-  reachable with per-host credentials, and routing simply refuses.
+- **Anyone who can reach the port.** There is no secret to steal, and no
+  secret to check: a caller names itself and kaed believes it. Revoking an
+  identity means deleting it from `[auth]` and restarting; keeping a
+  stranger out means the network layer. This is the trade the identity
+  model makes explicitly.
+- **An untrusted network.** **This is the access-control boundary.** kaed
+  binds loopback by default and expects to be fronted by something that
+  provides transport security *and* network-level access control — the
+  reference deployment uses `tailscale serve`, which keeps the port on a
+  private tailnet. Do not put it on a public interface. Do not run it
+  anywhere the set of hosts that can reach it is not the set of hosts you
+  would hand a shell to.
+- **A spoofed identity from inside the perimeter.** kaed records the
+  caller's tailnet node (`tailscale whois`) beside the declared name on
+  every journaled mutation, so a name claimed from an unexpected machine is
+  *visible afterwards*. It is recorded, not enforced, unless you pin
+  identities to nodes (`nodes = [...]` plus `[whois] enforce`), which is off
+  by default. Even pinned, this is a tailnet-address check, not a
+  cryptographic one.
+- **A compromised gateway host.** An instance that proxies to peers
+  forwards the **caller's own declared name**, so compromising the gateway
+  lets it claim any name its backends allow-list — but it yields no
+  credential, because there is none to steal. Before sprint 023 the gateway
+  held a bearer token per (author, backend) pair and its compromise handed
+  over all of them; that radius is gone, and what remains is the radius of
+  being inside the perimeter at all.
 - **Your journal.** `journal.db` stores the content of files kaed has
   edited, so it is as sensitive as the most sensitive file kaed is allowed
   to touch. It is created `0600` and its blob content ages out on a
@@ -116,9 +141,10 @@ Nothing in kaed is designed on the assumption that it is.
 2. Use narrow, explicit roots. Do not root at `$HOME` — that is how kaed
    ended up serving its own token during its first live test, and it is why
    the deny list exists at all.
-3. Keep the token file `0600`, and never commit it. The same goes for any
-   peer token files a gateway holds — and give them the same weight as the
-   backends they unlock, not the machine they sit on.
+3. Treat reachability as the credential. The list of hosts that can open a
+   connection to kaed is the list of hosts that can edit the files it
+   serves, under any name in `[auth]`. Audit that list the way you would
+   once have audited a token.
 4. Assume `journal.db` is sensitive; back it up accordingly or not at all.
 
 ## Reporting a vulnerability

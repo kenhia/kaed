@@ -22,3 +22,4 @@ pub mod server;
 pub mod shapes;
 pub mod txn;
 pub mod version;
+pub mod whois;
