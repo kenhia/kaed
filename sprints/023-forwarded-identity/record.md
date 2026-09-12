@@ -184,3 +184,88 @@ token, and the karc leg toolbox keeps working throughout the window.
   the cross-project plan as KP-6.
 - **krot WI 2466** gets PD-11's answer: `/etc/klams` does not become a kaed
   root, because kaed runs as `ken` and cannot read it at all.
+
+## Deployed
+
+**`0.1.0-2615f76` on kai, kubs0 and kubsdb, 2026-09-12**, published from
+committed `main` (merge `2615f76`, PR #28) and installed from the package
+store on every host. Deploy and cutover both run from **kai**, which is the
+host that does the work.
+
+| host | binary | unit | `check-config` | MCP `serverInfo` | `kaed-new-token` |
+|---|---|---|---|---|---|
+| kai | `0.1.0-2615f76` | active | ok | matches | removed by install |
+| kubs0 | `0.1.0-2615f76` | active | ok | matches | removed by install |
+| kubsdb | `0.1.0-2615f76` | active | ok | matches | removed by install |
+
+`install.sh` deleting the retired `kaed-new-token` is D-9 observed rather
+than inferred — it fired on all three hosts.
+
+### The cutover (WI 2393)
+
+Ordered so it could not cut off the session performing it, and so no client
+broke at any point: deploy with the window open → every client onto the
+header → verify → **then** delete credentials.
+
+**Clients.** kai's Claude Code (`claude-kai`), kai's karc leg toolbox
+(`claude-kai`), kubs0's Claude Code (`claude-kubs0`, still pointed at kai per
+018 D-1), and cleo (`claude`). **kubsdb has no client at all** — it is a pure
+backend, so the fleet is four clients, not five.
+
+Each was changed with the *application's own tooling* (`claude mcp
+remove` + `add`), never by hand-editing its JSON; only karc's own toolbox,
+which no app owns, was edited directly (atomically, mode preserved).
+
+**Two things about cleo that the proposal had wrong, and that matter for the
+next slice:**
+
+- **cleo's `kaed-kai` entry is Claude Code's, not Claude Desktop's.** There
+  is no `claude_desktop_config.json` on the host, and the `claude` CLI is
+  installed. The MSIX virtualisation warning does not apply to this file.
+- **`ConvertFrom-Json` cannot read cleo's `~/.claude.json` at all.** PowerShell
+  is 5.1, and the file contains project keys differing only in case
+  (`d:/ClaudeWorks/krot` vs `D:/ClaudeWorks/krot`), which 5.1 rejects as
+  duplicates. **Any PowerShell JSON round-trip of that file fails**, so the
+  "targeted edit" the proposal imagined was not available — and forcing one is
+  exactly what wiped cleo's MCP servers in korg #931. The app's own CLI was
+  the way through.
+
+Verified from ssh afterwards, against the pre-edit backup: byte counts,
+`mcpServers` count, project-key counts and top-level key count all identical
+(65/65) — the duplicate keys survived, and the only change was the header
+swap. No BOM was introduced. All five of cleo's MCP servers report Connected.
+
+**Credentials deleted: nine inbound token files (three per host) and the
+gateway's six peer-token copies. `~/.config/kaed` on every host now contains
+no file matching `token`.** The `[auth]` rows became `claude = {}` and the two
+`[peers.*.tokens]` tables were removed; each host was **restarted**, not
+reloaded, because the allow-list is config shape (018 D-3).
+
+### Verified live, after the cutover
+
+| check | kai | kubs0 | kubsdb |
+|---|---|---|---|
+| declared identity | `200` | `200` | `200` |
+| stale bearer | `401` | `401` | `401` |
+| token files present | 0 | 0 | 0 |
+
+And the two acceptance criteria, end to end with **no credential anywhere in
+the fleet**:
+
+- `edit` through the kai gateway to `kubs0:scratch` as `claude-kai` → kubs0's
+  own journal records `author=claude-kai, node=kai`. That is WI 2392's
+  criterion verbatim.
+- `edit` through the kai gateway to `kubsdb:src` as `claude-kubs0`, *after*
+  every peer token was deleted → kubsdb's journal records
+  `author=claude-kubs0, node=kai`. The caller's identity survives the hop with
+  nothing held on the gateway, which is the whole sprint in one row.
+
+All four clients report Connected on the header.
+
+### Repaired in passing (ops)
+
+The client-config backups this cutover took contained **other services'** live
+bearer tokens (klams, karc). Once the cutover was verified they were extra
+copies of live credentials sitting on four machines, so they were deleted. The
+kaed `config.toml` backups are kept — they carry `token_file` *paths*, never
+values, and they are the rollback path.
