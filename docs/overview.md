@@ -194,7 +194,10 @@ deliberately without an instance. An instance with configured peers is also
 the fleet's **gateway**: calls addressing another host's roots are proxied
 there under the caller's own identity, a host that stops answering becomes
 data (`status: "unreachable", since: …`) rather than a connection failure,
-and a root pattern (`*:*`) searches the whole fleet in one call.
+and a root pattern (`*:*`) searches the whole fleet in one call. A fan-out
+never chains: a call that arrived from another instance is answered from that
+host's own knowledge, so the fleet's peer declarations can be symmetric
+without a `roots` call recursing through them.
 
 The sprints so far:
 
@@ -242,11 +245,11 @@ The sprints so far:
   stream that makes "has any agent ever seen this token?" answerable.
   Revealing plaintext is deliberately a separate, always-journaled tool.
 
-Sprints 012–024 are not summarised here yet — write-side leak detection, a
+Sprints 012–025 are not summarised here yet — write-side leak detection, a
 third host, legible OS permissions, the MCP protocol revision, per-host client
-identities, and two passes of feedback triage. Each has its own record under
-[`sprints/`](../sprints/), which is the authority; this list is a narrative
-and it lags.
+identities, two passes of feedback triage, and a fan-out that terminates. Each
+has its own record under [`sprints/`](../sprints/), which is the authority;
+this list is a narrative and it lags.
 
 Two of those cancelled each other out, which is worth knowing before reading
 the older records: sprint 019 built rotation grace windows for the bearer

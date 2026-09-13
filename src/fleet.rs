@@ -38,6 +38,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// An in-flight proxied call. Expiry here is NOT a connect failure: the
 /// peer may have applied the call, and the error says so (D-8).
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Before rebuilding a session whose transport closed under us (025 D-2).
+const RETRY_BACKOFF: Duration = Duration::from_millis(100);
 
 /// The revision the gateway asks a peer for — pinned, and deliberately
 /// **below** what kaed's own server serves (016 D-2).
@@ -82,8 +84,17 @@ pub fn pattern_admits_host(pattern: &str, host: &str) -> bool {
     }
 }
 
-struct CachedSession {
-    svc: Arc<Session>,
+/// One cache entry per `(host, author)`, and the lock that makes a miss
+/// build **exactly one** session (025 D-2).
+///
+/// The map lock is held only long enough to hand out the slot; the slot's
+/// own lock is held across the connect, so N concurrent misses for the same
+/// key wait for the first one's session instead of building N of them. That
+/// is the whole of the descriptor bound: peers × authors sessions, whatever
+/// the traffic.
+#[derive(Default)]
+struct SessionSlot {
+    live: tokio::sync::Mutex<Option<Arc<Session>>>,
 }
 
 /// What this process has *observed* about one peer — never persisted, and
@@ -107,8 +118,17 @@ pub struct Peers {
     this_host: String,
     /// `None` = no `[peers]` table — never-declared, not an empty fleet.
     declared: Option<Vec<Peer>>,
-    sessions: tokio::sync::Mutex<HashMap<(String, String), CachedSession>>,
+    sessions: tokio::sync::Mutex<HashMap<(String, String), Arc<SessionSlot>>>,
     sight: RwLock<HashMap<String, PeerSight>>,
+    /// Every peer session this process has ever established. The leak was
+    /// invisible in `sessions` by construction — a racing insert REPLACED the
+    /// entry, so the map showed one session while eight were alive — and a
+    /// defect nothing can count is a defect nothing can gate (025 D-2).
+    sessions_built: std::sync::atomic::AtomicU64,
+    /// One HTTP client for every peer session this process opens (025 D-3).
+    /// Built once, lazily, and **fallibly** — rmcp's own constructor
+    /// `.expect()`s it on a worker thread.
+    http: std::sync::OnceLock<std::result::Result<reqwest::Client, String>>,
 }
 
 impl Peers {
@@ -118,6 +138,8 @@ impl Peers {
             declared,
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             sight: RwLock::new(HashMap::new()),
+            sessions_built: std::sync::atomic::AtomicU64::new(0),
+            http: std::sync::OnceLock::new(),
         }
     }
 
@@ -136,6 +158,29 @@ impl Peers {
     pub fn routable(&self, host: &str) -> Option<&Peer> {
         self.find(host)
             .filter(|p| p.status != PeerStatus::Deferred && p.url.is_some())
+    }
+
+    /// How many peer sessions this process has established since it started.
+    /// Flat under load is the property 025 bought; climbing with call volume
+    /// is the leak, whatever the fd count happens to be at the time.
+    pub fn sessions_built(&self) -> u64 {
+        self.sessions_built
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many peer sessions this process is holding open. The descriptor
+    /// bound 025 bought is `peers × authors`, and a bound nothing can read is
+    /// a claim nothing can check — this is what the regression test asserts
+    /// after a burst of concurrent proxied calls.
+    pub async fn live_sessions(&self) -> usize {
+        let slots: Vec<Arc<SessionSlot>> = self.sessions.lock().await.values().cloned().collect();
+        let mut live = 0;
+        for slot in slots {
+            if slot.live.lock().await.is_some() {
+                live += 1;
+            }
+        }
+        live
     }
 
     pub fn sight_of(&self, host: &str) -> PeerSight {
@@ -214,6 +259,12 @@ impl Peers {
                         if attempt == 0 =>
                     {
                         self.drop_session(&peer.host, author).await;
+                        // A pause before rebuilding. The retry used to be
+                        // immediate, which under descriptor exhaustion meant
+                        // every failure was attempted twice as fast as it
+                        // could fail (WI 2587's amplifier). Short enough that
+                        // an ordinary reconnect is still invisible.
+                        tokio::time::sleep(RETRY_BACKOFF).await;
                         continue;
                     }
                     other => return Err(self.map_call_error(peer, author, tool, other).await),
@@ -245,12 +296,61 @@ impl Peers {
         Ok(payload)
     }
 
+    /// The one HTTP client every peer session shares (025 D-3).
+    ///
+    /// rmcp's `from_config` builds a fresh `reqwest::Client` per transport
+    /// and `.expect()`s the build, which is how a full descriptor table
+    /// became `No CA certificates were loaded from the system` panicking a
+    /// tokio worker per connection attempt, ~100k times a host (WI 2537).
+    /// Building it here once means the CA bundle is opened once, a failure
+    /// is a structured error the caller can read, and one connection pool
+    /// serves the fleet.
+    ///
+    /// The builder settings are rmcp's own, kept deliberately: no idle
+    /// pooling (it avoids ~40 ms delayed-ACK stalls on Linux, and keeps no
+    /// socket open that no call is using), and no redirects, so forwarded
+    /// identity headers can never be replayed to a redirect target.
+    fn http_client(&self) -> Result<reqwest::Client, KaedError> {
+        self.http
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .pool_max_idle_per_host(0)
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .clone()
+            .map_err(|detail| {
+                KaedError::internal(format!(
+                    "this host cannot build an HTTP client for peer calls ({detail}), so \
+                     nothing can be proxied from here; every local root still works. A \
+                     failure to load the system CA bundle is the usual cause — check \
+                     /etc/ssl/certs and this service's descriptor limit"
+                ))
+            })
+    }
+
     async fn checkout(&self, peer: &Peer, author: &str) -> Result<Arc<Session>, KaedError> {
         let key = (peer.host.clone(), author.to_string());
-        {
-            let sessions = self.sessions.lock().await;
-            if let Some(cached) = sessions.get(&key) {
-                return Ok(cached.svc.clone());
+        // Two locks, and the order matters: the map lock only hands out the
+        // slot, and the slot lock is held across the connect below. Before
+        // 025 the map lock was released between the miss and the insert, so
+        // concurrent misses each built a session — and the insert replaced
+        // the previous one without cancelling it.
+        let slot = {
+            let mut sessions = self.sessions.lock().await;
+            Arc::clone(sessions.entry(key).or_default())
+        };
+        let mut live = slot.live.lock().await;
+        if let Some(svc) = live.as_ref() {
+            // A session whose transport has died is worse than no session:
+            // it costs a failed call before the retry rebuilds it.
+            if svc.is_closed() {
+                if let Some(dead) = live.take() {
+                    dead.cancellation_token().cancel();
+                }
+            } else {
+                return Ok(svc.clone());
             }
         }
         let url = peer.url.as_deref().expect("routable peers carry a url");
@@ -272,9 +372,23 @@ impl Peers {
             }
             Err(_) => return Err(self.unforwardable_identity(peer, author)),
         }
+        // The hop marker (025 D-1): every call on this session is a
+        // forwarded one, so the peer answers it from its own knowledge and
+        // never fans out again. One header is the whole termination
+        // argument — the fleet's peer declarations are symmetric, so without
+        // it a `roots` anywhere recurses until something times out.
+        //
+        // This host's name is the value, which makes a storm self-describing
+        // if one is ever seen again. `this_host` comes from config and is a
+        // hostname; a value that is somehow not header-safe loses the marker
+        // rather than the call, so the guard degrades to today's behaviour
+        // instead of refusing to proxy.
+        if let Ok(v) = http::HeaderValue::from_str(&self.this_host) {
+            custom_headers.insert(http::HeaderName::from_static(crate::server::HOP_HEADER), v);
+        }
         let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
             .custom_headers(custom_headers);
-        let transport = StreamableHttpClientTransport::from_config(config);
+        let transport = StreamableHttpClientTransport::with_client(self.http_client()?, config);
         let mut info = ClientInfo::default();
         info.protocol_version = PEER_PROTOCOL_VERSION;
         info.client_info = Implementation::new("kaed", crate::version::FULL);
@@ -299,19 +413,32 @@ impl Peers {
             svc.peer_info()
                 .and_then(|pi| pi.server_info.as_ref().map(|si| si.version.to_string())),
         );
+        self.sessions_built
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let svc = Arc::new(svc);
-        self.sessions
-            .lock()
-            .await
-            .insert(key, CachedSession { svc: svc.clone() });
+        *live = Some(svc.clone());
         Ok(svc)
     }
 
+    /// Evict one session and **end** it. Cancelling explicitly rather than
+    /// leaving it to rmcp's drop guard is the second half of the leak fix
+    /// (025 D-2): the guard fires when the last `Arc` clone drops, and a
+    /// caller mid-call holds one for up to `CALL_TIMEOUT` — so an evicted
+    /// session kept its SSE stream and its sockets for 30 seconds after it
+    /// stopped being reachable. Eviction only happens on a transport that
+    /// already failed, so there is no live call to cut short.
     async fn drop_session(&self, host: &str, author: &str) {
-        self.sessions
-            .lock()
-            .await
-            .remove(&(host.to_string(), author.to_string()));
+        let slot = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(&(host.to_string(), author.to_string()))
+                .cloned()
+        };
+        if let Some(slot) = slot
+            && let Some(dead) = slot.live.lock().await.take()
+        {
+            dead.cancellation_token().cancel();
+        }
     }
 
     async fn map_call_error(

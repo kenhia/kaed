@@ -777,6 +777,11 @@ impl KaedServer {
 
         let mut hosts = vec![state.self_fleet_entry()];
         let declared = state.fleet.declared().map(<[Peer]>::to_vec);
+        // A call that arrived through a gateway answers from local knowledge
+        // and probes nobody (025 D-1). Without this the fan-out recurses for
+        // as long as any two hosts declare each other, which every host in
+        // this fleet does.
+        let hop = forwarded_from(&parts);
         if let Some(peers) = &declared {
             // Probe every routable peer in parallel, under the caller's own
             // identity — the gateway forwards the caller's declared name and
@@ -785,7 +790,7 @@ impl KaedServer {
             // be missing, the only reasons not to probe are structural.
             let mut probes = tokio::task::JoinSet::new();
             for peer in peers {
-                if peer.status == PeerStatus::Deferred || peer.url.is_none() {
+                if hop.is_some() || peer.status == PeerStatus::Deferred || peer.url.is_none() {
                     continue;
                 }
                 let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
@@ -812,6 +817,21 @@ impl KaedServer {
                     None if peer.url.is_none() => AppState::declared_fleet_entry(
                         peer,
                         Some(json!({"status": "skipped", "detail": "no url declared"})),
+                    ),
+                    // The hop case says so rather than reporting a bare "not
+                    // probed": a gateway reading this answer needs to know it
+                    // is looking at one host's knowledge by design, not at a
+                    // fleet that failed to answer.
+                    None if hop.is_some() => AppState::declared_fleet_entry(
+                        peer,
+                        Some(json!({
+                            "status": "skipped",
+                            "detail": format!(
+                                "not probed: this call arrived forwarded from {:?}, and a \
+                                 forwarded call never fans out (R10)",
+                                hop.as_deref().unwrap_or_default(),
+                            ),
+                        })),
                     ),
                     None => AppState::declared_fleet_entry(
                         peer,
@@ -1068,7 +1088,7 @@ impl KaedServer {
     ) -> Result<CallToolResult, ErrorData> {
         if fleet::is_pattern(&p.root) {
             let author = author_of(&parts)?;
-            return self.fleet_search(author, p).await;
+            return self.fleet_search(author, forwarded_from(&parts), p).await;
         }
         let state = self.state.clone();
         run(move || {
@@ -1883,6 +1903,7 @@ impl KaedServer {
     async fn fleet_search(
         &self,
         author: Author,
+        hop: Option<String>,
         p: SearchParams,
     ) -> Result<CallToolResult, ErrorData> {
         let state = self.state.clone();
@@ -1933,6 +1954,23 @@ impl KaedServer {
                 }
                 if peer.url.is_none() {
                     unavailable.push(json!({"host": peer.host, "status": "no_url"}));
+                    continue;
+                }
+                // A forwarded call expands the pattern over its OWN roots and
+                // probes nobody (025 D-1). 014 D-5 already says a pattern is
+                // expanded by the instance that was asked and never proxied,
+                // so this arm is unreachable from a well-behaved gateway —
+                // and reporting it honestly is what keeps "the fleet was
+                // searched" from ever being quietly narrower than the fleet.
+                if let Some(from) = &hop {
+                    unavailable.push(json!({
+                        "host": peer.host,
+                        "status": "not_probed",
+                        "detail": format!(
+                            "this call arrived forwarded from {from:?}, and a forwarded \
+                             call never fans out (R10)"
+                        ),
+                    }));
                     continue;
                 }
                 let (fleet, peer, author) = (state.fleet.clone(), peer.clone(), author.0.clone());
@@ -2137,6 +2175,13 @@ fn node_of(parts: &http::request::Parts) -> String {
         .map_or_else(|| crate::whois::UNKNOWN_NODE.to_string(), |n| n.0.clone())
 }
 
+/// The host that forwarded this call, if it arrived through a gateway
+/// (025 D-1). `None` means an agent asked this instance directly — the only
+/// case in which a fan-out is this instance's to run.
+fn forwarded_from(parts: &http::request::Parts) -> Option<String> {
+    parts.extensions.get::<Forwarded>().map(|f| f.0.clone())
+}
+
 fn author_of(parts: &http::request::Parts) -> Result<Author, ErrorData> {
     parts
         .extensions
@@ -2263,7 +2308,12 @@ impl ServerHandler for KaedServer {
              anchors over whole-file reads. Some paths are refused: `denied` \
              is permanent, don't retry it — its data carries a `reason` \
              (server_denylist, kaedignore, in_file_marker, classified_opaque) \
-             and a `hint` naming what to do instead. The OS refuses too, \
+             and a `hint` naming what to do instead. The opposite case is \
+             worth one retry and no more: an `internal` whose data says \
+             `retryable: true` is a transient host condition (this host ran \
+             out of file descriptors), not a fact about your path — retry it \
+             once, or narrow a deep `list`/`search`, rather than falling back \
+             to ssh. The OS refuses too, \
              under the same code: not_readable_by_service_identity / \
              not_writable_by_service_identity mean unix ownership, not kaed \
              policy, and the data names the owner, the uid kaed runs as, and \
@@ -2410,11 +2460,28 @@ impl AuthState {
 /// client config is one line whatever it is talking to.
 pub const AGENT_HEADER: &str = "x-homelab-agent";
 
+/// How a gateway says "this call is already a hop" (025, R10's hop rule).
+/// Set by [`crate::fleet::Peers::checkout`] on every session a gateway
+/// opens to a peer, and the whole of what makes the fan-out terminate: a
+/// call carrying it is answered from local knowledge only and never fans
+/// out again.
+///
+/// The value is the forwarding host's name — diagnostic, so a journal or a
+/// `roots` answer can say where a call came from. Presence is what is
+/// load-bearing.
+pub const HOP_HEADER: &str = "x-kaed-hop";
+
 /// The tailnet node the request came from, resolved by whois and stamped
 /// beside [`Author`]. Always present; [`crate::whois::UNKNOWN_NODE`] when
 /// it could not be determined (D-4).
 #[derive(Clone, Debug)]
 pub struct Node(pub String);
+
+/// Present when the request arrived through a gateway rather than from an
+/// agent — the forwarding host's own name (025 D-1). Absent on a direct
+/// call, which is the only kind allowed to fan out.
+#[derive(Clone, Debug)]
+pub struct Forwarded(pub String);
 
 async fn auth_middleware(
     State(auth): State<Arc<AuthState>>,
@@ -2492,6 +2559,22 @@ async fn auth_middleware(
             )
                 .into_response();
         }
+    }
+
+    // A hop marker is not a credential and is not checked against anything
+    // (025 D-1): a caller that sets it by hand narrows its own call to this
+    // host's knowledge, which is a degradation of its own answer and not an
+    // escalation. What it cannot do is make a fan-out go one level deeper,
+    // and that is the whole property being bought.
+    if let Some(from) = req
+        .headers()
+        .get(HOP_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_owned)
+    {
+        req.extensions_mut().insert(Forwarded(from));
     }
 
     req.extensions_mut().insert(Author(author));

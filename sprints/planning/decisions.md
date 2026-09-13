@@ -550,3 +550,49 @@ Generalised, so the next `/etc/<service>` question does not re-run this:
 **a classified root is worth adding only where kaed's service identity can
 actually read the file.** Where it cannot, the root adds a promise kaed cannot
 keep, and the honest answer is the service's own CLI.
+
+## PD-12 — The fleet mesh stays symmetric; what terminates a fan-out is a hop marker, not a topology
+
+*Sprint 025 (WI 2587, korg:2588). Supersedes nothing; constrains every future
+fan-out tool. Contract home: R10's hop bullet.*
+
+Every host in the fleet declares every other — kai declares kubs0 and kubsdb,
+kubs0 declares kai and kubsdb, kubsdb declares kai and kubs0 — and `roots`
+(plus root-pattern expansion) answers by probing each declared peer's own
+`roots`. With no way to tell a peer-forwarded call from an agent's, that
+recursed: one call anywhere, and each level timed out upward at 30 s while the
+level below kept going. It filled all three hosts' 1024-descriptor tables in
+under half a minute, and a restart of any one host could not clear it while
+another was still recursing.
+
+Two fixes were on the table and only one of them is code.
+
+**The alternative was a star**: make kai the sole gateway and stop kubs0 and
+kubsdb declaring anyone. Config-only, no build, and it would have worked that
+night. **Rejected**, for a reason that outlives the incident: it pays for
+termination with the fleet's own redundancy. 018's documented fallback is that
+every host's URL keeps working when the gateway is down — a star leaves kubs0's
+direct URL serving two roots and no fleet, so the fallback stops being a
+fallback. It also makes the property *unenforced*: nothing in the code would
+stop the next `[peers]` block from recreating the loop, and the config that
+must not be written is the least reviewed file in the fleet.
+
+**Decided: the mesh stays symmetric, and a forwarded call is marked.** One
+header, `X-Kaed-Hop: <forwarding host>`, set on every session a gateway opens
+to a peer; a call carrying it answers from local knowledge and never fans out
+again. Termination becomes a property of the code rather than of a
+configuration that happens to be acyclic, so it holds for whatever topology an
+operator writes — including the star, if Ken ever wants it for other reasons.
+
+Consequences to carry, not to re-derive:
+
+- **Any new tool that fans out inherits this.** The check is on the
+  *instance*, not on the tool, but the fan-out sites are per-tool: `roots` and
+  the pattern expansion each have their own. A third one needs its own, and a
+  test for it, exactly as R7's deny list needs one per enumerating tool.
+- **The marker is not a credential.** It is not checked, cannot be, and does
+  not need to be: setting it by hand narrows your own answer. Anything that
+  ever *trusts* it for more than this is a design error.
+- **Descriptor use is now bounded by `peers × authors`** (025 D-2), which is
+  what makes the fan-out safe rather than merely finite: a bounded recursion
+  that opened a session per level would still exhaust the table.

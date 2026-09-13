@@ -165,7 +165,29 @@ impl KaedError {
         Self::new(ErrorCode::IsBinary, message)
     }
 
+    /// `internal`, with one classification applied on the way through: a
+    /// descriptor exhaustion is **transient**, and saying so is the whole of
+    /// WI 2512's and WI 2559's second halves (025 D-4).
+    ///
+    /// Classified here rather than at the call sites because here is where
+    /// every IO failure in the process already funnels — `From<io::Error>`,
+    /// `fsops`' canonicalize arms, the `ignore` walker's own wrapped
+    /// message. Decorating the sites instead means decorating a dozen and
+    /// missing the thirteenth, which is how WI 2559's agent got a bare
+    /// `internal` and gave up on kaed for `ssh`.
     pub fn internal(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if is_descriptor_exhaustion(&message) {
+            return Self::new(ErrorCode::Internal, message).with_data(serde_json::json!({
+                "reason": "resource_exhausted",
+                "retryable": true,
+                "hint": "this host's kaed had no free file descriptor — a transient \
+                         condition, not a policy refusal and not a fact about the path. \
+                         Retry the call once; if a recursive `list` or `search` keeps \
+                         failing where a narrow `read` works, narrow `path` or lower \
+                         `depth` and it will succeed",
+            }));
+        }
         Self::new(ErrorCode::Internal, message)
     }
 
@@ -385,6 +407,22 @@ fn clip_line(line: &str) -> String {
     s
 }
 
+/// EMFILE (24) and ENFILE (23), by number and by text — the number is what
+/// Linux's `io::Error` Display carries, the text is what a wrapper like the
+/// `ignore` walker puts in front of it.
+///
+/// A string test, because the walker hands over a formatted message rather
+/// than an `io::Error`. The false positive it admits is a *path* containing
+/// this phrase: it would gain a retry hint on an unrelated internal error,
+/// which costs one wasted retry and no wrong answer.
+fn is_descriptor_exhaustion(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("too many open files")
+        || m.contains("os error 24")
+        || m.contains("os error 23")
+        || m.contains("file table overflow")
+}
+
 impl From<std::io::Error> for KaedError {
     fn from(e: std::io::Error) -> Self {
         match e.kind() {
@@ -416,6 +454,49 @@ mod tests {
         ] {
             assert_eq!(code.to_string(), wire);
         }
+    }
+
+    /// WI 2512 and WI 2559 both ended at the same complaint: EMFILE arrived
+    /// as a bare `internal`, so the agent's only reasonable move was to give
+    /// up on kaed and shell out — the one route the journal cannot see. The
+    /// code stays `internal` (014 D-1: `reason` is the field whose job this
+    /// is, not a new wire code); what changes is that it says retry.
+    #[test]
+    fn a_descriptor_exhaustion_says_it_is_retryable() {
+        for message in [
+            "tools/krot/crates: IO error for operation on /home/ken/src/tools/krot/crates: \
+             Too many open files (os error 24)",
+            "hello.txt: Too many open files (os error 24)",
+            "opening the journal: os error 23",
+        ] {
+            let v = serde_json::to_value(KaedError::internal(message)).unwrap();
+            assert_eq!(v["code"], "internal", "{message}");
+            assert_eq!(v["data"]["reason"], "resource_exhausted", "{message}");
+            assert_eq!(v["data"]["retryable"], true, "{message}");
+            assert!(
+                v["data"]["hint"].as_str().unwrap().contains("Retry"),
+                "{message}"
+            );
+        }
+    }
+
+    /// The classifier is narrow on purpose: an ordinary internal error gains
+    /// no `retryable`, because "try again" is wrong for most of them.
+    #[test]
+    fn an_ordinary_internal_error_gains_no_retry_hint() {
+        let v =
+            serde_json::to_value(KaedError::internal("serializing read: invalid utf-8")).unwrap();
+        assert_eq!(v["code"], "internal");
+        assert!(v.get("data").is_none(), "{v}");
+    }
+
+    /// The `From<io::Error>` path is the one nobody would think to decorate,
+    /// and it is where a raw EMFILE arrives.
+    #[test]
+    fn an_io_error_carries_the_same_classification() {
+        let e = std::io::Error::from_raw_os_error(24);
+        let v = serde_json::to_value(KaedError::from(e)).unwrap();
+        assert_eq!(v["data"]["reason"], "resource_exhausted", "{v}");
     }
 
     #[test]

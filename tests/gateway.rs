@@ -41,6 +41,21 @@ async fn start_instance_with_roots(
     auth_spec: BTreeMap<String, AuthEntry>,
     peers: Option<Vec<Peer>>,
 ) -> anyhow::Result<Instance> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    start_instance_on(listener, host, extra_roots, identities, auth_spec, peers).await
+}
+
+/// `start_instance_with_roots` on a listener the caller already bound — the
+/// only way to build a pair that declares each OTHER (025): both addresses
+/// have to exist before either config does.
+async fn start_instance_on(
+    listener: tokio::net::TcpListener,
+    host: &str,
+    extra_roots: Vec<(&str, std::path::PathBuf)>,
+    identities: Vec<Identity>,
+    auth_spec: BTreeMap<String, AuthEntry>,
+    peers: Option<Vec<Peer>>,
+) -> anyhow::Result<Instance> {
     let workdir = tempfile::tempdir()?;
     let workdir_path = workdir.path().canonicalize()?;
     std::fs::write(
@@ -74,7 +89,6 @@ async fn start_instance_with_roots(
         secrets: Default::default(),
     };
     let (app, _auth) = kaed::server::build_app(resolved)?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let ct = tokio_util::sync::CancellationToken::new();
     tokio::spawn({
@@ -1161,6 +1175,246 @@ async fn a_proxied_result_is_stamped_for_the_revision_it_is_returned_on() -> any
     assert_eq!(refused["resultType"], "complete");
 
     alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+// ------------------------------------------------------- 025: the hop guard
+
+/// `connect_as`, plus the marker a gateway puts on every session it opens to
+/// a peer (025 D-1). A client can set it by hand — nothing checks it, and
+/// this is how the guard is tested without standing up a third instance.
+async fn connect_as_forwarded(
+    addr: std::net::SocketAddr,
+    author: &str,
+    from: &str,
+) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        http::HeaderName::from_static("x-homelab-agent"),
+        http::HeaderValue::from_str(author)?,
+    );
+    headers.insert(
+        http::HeaderName::from_static("x-kaed-hop"),
+        http::HeaderValue::from_str(from)?,
+    );
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
+            .custom_headers(headers),
+    );
+    Ok(ClientInfo::default().serve(transport).await?)
+}
+
+/// The fleet's peer declarations are SYMMETRIC — kai declares kubs0 and
+/// kubs0 declares kai — which is what turned one `roots` call into a storm
+/// that filled every host's descriptor table in under half a minute
+/// (WI 2587). This is that topology in two instances.
+async fn start_symmetric_pair() -> anyhow::Result<(Instance, Instance)> {
+    // Both listeners first: each config has to name the other's address.
+    let alpha_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let beta_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let (alpha_addr, beta_addr) = (alpha_listener.local_addr()?, beta_listener.local_addr()?);
+    let declaring = |host: &'static str, addr: std::net::SocketAddr| {
+        Some(vec![Peer {
+            url: Some(format!("http://{addr}/mcp")),
+            ..Peer::declared(host, PeerStatus::Active)
+        }])
+    };
+    let alpha = start_instance_on(
+        alpha_listener,
+        "alpha",
+        vec![],
+        vec![identity("claude")],
+        BTreeMap::new(),
+        declaring("beta", beta_addr),
+    )
+    .await?;
+    let beta = start_instance_on(
+        beta_listener,
+        "beta",
+        vec![],
+        vec![identity("claude")],
+        BTreeMap::new(),
+        declaring("alpha", alpha_addr),
+    )
+    .await?;
+    Ok((alpha, beta))
+}
+
+/// WI 2587's mechanism, in the smallest topology that has it: two hosts
+/// declaring each other. Before 025 this call recursed — alpha probing beta,
+/// beta probing alpha, each level under a 30 s timeout while the level below
+/// kept going — so it answered in ~30 s with beta reported unreachable, and
+/// left an unbounded number of sessions behind.
+///
+/// The 10 s budget is the assertion: a fleet this size answers in
+/// milliseconds, and anything approaching `CALL_TIMEOUT` means the recursion
+/// is back.
+#[tokio::test]
+async fn a_symmetric_peer_mesh_answers_roots_without_recursing() -> anyhow::Result<()> {
+    let (alpha, beta) = start_symmetric_pair().await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        call(&gw, "roots", json!({})),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("`roots` did not answer in 10s — the fan-out is recursing"))?;
+
+    let v = structured(&result);
+    let beta_host = v["fleet"]["hosts"]
+        .as_array()
+        .expect("hosts is an array")
+        .iter()
+        .find(|h| h["host"] == "beta")
+        .expect("beta is in the fleet block")
+        .clone();
+    assert_eq!(
+        beta_host["status"], "active",
+        "beta answered, so it is active: {beta_host}"
+    );
+    assert_eq!(beta_host["verified"], true, "{beta_host}");
+
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// The guard itself: a call that arrived through a gateway answers from local
+/// knowledge and probes nobody. The peer is up and would answer — so a
+/// `skipped` probe here is the rule being applied, not an outage.
+#[tokio::test]
+async fn a_forwarded_roots_probes_no_peers_and_says_why() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+
+    let direct = connect_as(alpha.addr, "claude").await?;
+    let direct = structured(&call(&direct, "roots", json!({})).await);
+    let probed = direct["fleet"]["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["host"] == "beta")
+        .unwrap()
+        .clone();
+    assert_eq!(probed["verified"], true, "control: a direct call probes");
+
+    let fwd = connect_as_forwarded(alpha.addr, "claude", "kubs0").await?;
+    let forwarded = structured(&call(&fwd, "roots", json!({})).await);
+    let hosts = forwarded["fleet"]["hosts"].as_array().unwrap();
+    let beta_host = hosts.iter().find(|h| h["host"] == "beta").unwrap();
+    assert_eq!(beta_host["verified"], false, "{beta_host}");
+    assert_eq!(beta_host["probe"]["status"], "skipped", "{beta_host}");
+    let detail = beta_host["probe"]["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("kubs0") && detail.contains("forwarded"),
+        "the skip should name the hop it came from: {detail}"
+    );
+    // The host's own roots are still the whole point of the answer.
+    let names: Vec<&str> = forwarded["roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["alpha:scratch"], "{forwarded}");
+
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// The same rule on the other fan-out site: a root PATTERN on a forwarded
+/// call expands over this host's own roots only. 014 D-5 already says a
+/// pattern is never proxied, so this arm is unreachable from a well-behaved
+/// gateway — and the peer it did not probe is still reported, because "the
+/// fleet was searched" must never be quietly narrower than the fleet.
+#[tokio::test]
+async fn a_forwarded_pattern_search_expands_locally_and_reports_the_peer() -> anyhow::Result<()> {
+    let (alpha, beta, _secrets) = start_pair().await?;
+    let fwd = connect_as_forwarded(alpha.addr, "claude", "kubs0").await?;
+
+    let v = structured(
+        &call(
+            &fwd,
+            "search",
+            json!({"root": "*:*", "pattern": "old_name"}),
+        )
+        .await,
+    );
+    let roots_hit: Vec<&str> = v["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["root"].as_str().unwrap_or("alpha:scratch"))
+        .collect();
+    assert!(
+        roots_hit.iter().all(|r| r.starts_with("alpha:")),
+        "a forwarded pattern must not reach beta: {v}"
+    );
+    let unavailable = v["hosts_unavailable"].as_array().unwrap();
+    let beta_entry = unavailable
+        .iter()
+        .find(|h| h["host"] == "beta")
+        .unwrap_or_else(|| panic!("beta must be reported, not silently dropped: {v}"));
+    assert_eq!(beta_entry["status"], "not_probed", "{beta_entry}");
+
+    alpha.ct.cancel();
+    beta.ct.cancel();
+    Ok(())
+}
+
+/// The leak, as a bound rather than a symptom (025 D-2): a burst of
+/// concurrent proxied calls to one peer leaves **one** session behind.
+///
+/// Before 025 `checkout` released the map lock between the miss and the
+/// insert, so every call in a burst built its own session — its own reqwest
+/// client, its own pool, its own standalone SSE stream — and the insert
+/// replaced the previous one without cancelling it. Eight calls, seven
+/// leaked sessions, and that is what filled a 1024-descriptor table in
+/// under four hours of fleet traffic.
+#[tokio::test]
+async fn concurrent_proxied_calls_to_one_peer_build_one_session() -> anyhow::Result<()> {
+    let beta = start_instance("beta", vec![identity("claude")], BTreeMap::new(), None).await?;
+    let peers = std::sync::Arc::new(kaed::fleet::Peers::new(
+        "alpha".into(),
+        Some(vec![Peer {
+            url: Some(format!("http://{}/mcp", beta.addr)),
+            ..Peer::declared("beta", PeerStatus::Active)
+        }]),
+    ));
+    let peer = peers.routable("beta").expect("beta is routable").clone();
+
+    let mut burst = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let (peers, peer) = (peers.clone(), peer.clone());
+        burst.spawn(async move {
+            peers
+                .call(
+                    &peer,
+                    "claude",
+                    "stat",
+                    Some(args(json!({"root": "beta:scratch", "path": "hello.txt"}))),
+                    None,
+                )
+                .await
+                .map(|r| r.is_error == Some(true))
+        });
+    }
+    while let Some(joined) = burst.join_next().await {
+        assert!(
+            !joined?.map_err(|e| anyhow::anyhow!("{e}"))?,
+            "every call in the burst should succeed"
+        );
+    }
+
+    assert_eq!(
+        peers.sessions_built(),
+        1,
+        "eight concurrent misses for one (host, author) must BUILD one session, not eight"
+    );
+    assert_eq!(peers.live_sessions().await, 1, "and hold exactly that one");
+
     beta.ct.cancel();
     Ok(())
 }

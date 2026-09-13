@@ -54,7 +54,7 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–024):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–025):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
 `journal`/`diff`/`revert`/`feedback` over streamable HTTP with
 **identity-only auth** (declared name; no bearer exists since 024),
@@ -401,6 +401,49 @@ fails, and what the journal structurally cannot tell you — see
   a documented signal in an *installed* unit file; every `[auth]`,
   `[whois]` and `[peers]` change is a restart, and the test pins that a
   reload neither drops an identity nor invents one).
+- **A forwarded call never fans out, since 025** (R10's hop bullet + **PD-12**;
+  `sprints/025-hop-guard-and-session-leak/decisions.md`; korg #2587, #2588).
+  Every session a gateway opens to a peer carries `X-Kaed-Hop: <forwarding
+  host>`, and a call arriving with it answers from local knowledge — `roots`
+  probes nobody, a root pattern expands over local roots only, and the peers
+  it skipped are still reported with a `detail` naming the hop. Before it, the
+  symmetric three-way mesh (every host declares every other) made one `roots`
+  call recurse until something timed out, and it filled all three 1024-fd
+  tables in under half a minute; the `No CA certificates were loaded` panic
+  and every EMFILE were downstream of the full table, not separate bugs.
+  **The star topology was rejected, not overlooked** (PD-12) — it buys
+  termination with 018's fallback and leaves the property unenforced, so the
+  next `[peers]` edit can recreate the loop. Five things not to re-derive:
+  **the marker is not a credential and nothing checks it** (D-1 — there is no
+  proof of origin under declared identity, and spoofing it narrows your own
+  answer; what it cannot do is add a level to a fan-out);
+  **a forwarded call may still serve an addressed root of its own** — only the
+  fan-out is refused, because routing reads the host prefix so an addressed
+  proxy terminates by construction, and refusing to chain outright would break
+  cross-host `secret rotate` (011 D-5);
+  **descriptor use is bounded by `peers × authors`** (D-2 — `checkout` holds a
+  per-key slot lock across the connect, so concurrent misses coalesce; the
+  pre-025 race built one session *per call*, which is what actually filled the
+  table. `RunningService` carries a `DropGuard`, so a dropped session did
+  cancel — 30 seconds late, when the last `Arc` clone dropped — which is why
+  the filed "uncancelled eviction" diagnosis was second-order);
+  **`sessions_built` is a counter and the map is not the observable** (D-2 — a
+  racing insert *replaces* the entry, so asserting on the map's size passes
+  with the bug present; that mistake was made and caught here);
+  and **kaed builds its own `reqwest::Client`, once, fallibly** (D-3 — rmcp's
+  `from_config` `.expect()`s it per transport, which is the whole of the
+  panic; neither of #2537's filed options — pinning a TLS root store, or
+  fixing the environment — was needed, because the bundle was always loadable
+  and the process had no descriptor to open it with). Also here: EMFILE keeps
+  code `internal` and gains `reason: "resource_exhausted"` + `retryable` + a
+  hint, classified inside `KaedError::internal` because that is the funnel
+  every IO failure already passes through (D-4, on 014 D-1's precedent);
+  **"call `roots` first" stays in the instructions** (D-5 — the recursion is
+  impossible now, and the advice is how an agent learns host-qualified names);
+  and the **inbound** half is deliberately still open (korg #2589 — rmcp's
+  server has no session idle TTL, `legacy_session_mode` is on by default, and
+  choosing between a custom `session_store` and stateless legacy service needs
+  a measurement that only exists after this deploy).
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is
