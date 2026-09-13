@@ -16,6 +16,21 @@ ExecStart=%h/.local/bin/kaed serve
 # Token files are re-read on SIGHUP. Without this line, rotating a token
 # means a restart, and a restart drops every live agent session.
 ExecReload=/bin/kill -HUP $MAINPID
+# Headroom, not a fix (sprint 025, korg #2587/#2590). kaed is a network
+# service that holds a session per peer and per client; the systemd *user*
+# default soft limit is 1024, and on 2026-09-12 a fan-out recursion took all
+# three hosts to that ceiling within hours. 025 bounded the real cause — peer
+# sessions are now peers × authors — so this is margin, and it converts the
+# next leak of this class from an outage in hours into something a monitor
+# sees first.
+#
+# It belongs HERE and nowhere else: install.sh overwrites
+# ~/.config/systemd/user/kaed.service from this file on every deploy, so a
+# limit set in the installed copy — or in another repo's recipe — is reverted
+# by the next upgrade, silently. k-homelab's kaed-service recipe asserts this
+# line is present, exactly as it asserts ExecReload, and that assertion is
+# what catches a host running an older unit.
+LimitNOFILE=65536
 Environment=RUST_LOG=kaed=info
 Restart=on-failure
 RestartSec=2
