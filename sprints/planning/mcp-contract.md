@@ -288,6 +288,22 @@ agent-filed feedback. Nothing here is frozen.
     surfaced as `denied` / `peer_credential_rejected` naming the identity
     and the remedy (add it there and **restart** — the allow-list is config
     shape, so SIGHUP will not pick it up).
+  - **A forwarded call never fans out (025, PD-12).** Every session a
+    gateway opens to a peer carries `X-Kaed-Hop: <forwarding host>`
+    alongside the identity header, and a call that arrives with it is
+    answered from that host's own knowledge: `roots` probes no peers, a
+    root pattern expands over local roots only. Fleet declarations are
+    symmetric by design — every host declares every other — so without
+    this one header a single `roots` call recurses until something times
+    out, and it filled all three hosts' 1024-descriptor tables in under
+    half a minute. The marker is not a credential and nothing checks it: a
+    client that sets it by hand narrows its own answer, which is a
+    degradation of that answer and not an escalation. What a peer *may*
+    still do on a forwarded call is serve an addressed root of its own —
+    routing reads the host prefix, so an addressed proxy terminates at the
+    host that owns the root. The hosts it did not probe are still
+    reported, with a `detail` naming the hop: a fan-out that skipped a
+    host must never look like a fleet that answered.
   - **Patterns are expanded by the instance that was asked (014).**
     Routing reads the host prefix, so a pattern naming exactly one peer
     (`kubsdb:*`) used to forward wholesale — and the peer ran the fan-out
