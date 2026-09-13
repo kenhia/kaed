@@ -217,3 +217,35 @@ the measurement korg:2589 needs, and it can only be taken now that this is
 live. Six fan-outs proves the bound holds under a burst; it does not prove
 inbound client sessions stop accumulating over a host's uptime, which is
 exactly what that item is for.
+
+### Follow-on: `0.1.0-5c89bc5`, the descriptor headroom (korg:2590)
+
+Ken asked for the file-handle limit raised rather than left as a decision, so
+it shipped the same day: `LimitNOFILE=65536` in `deploy/kaed.service` (PR #31),
+published and installed on all three hosts, verified at **65536 soft and hard**
+on each with the unit carrying the line and `0.1.0-5c89bc5` answering on the
+network.
+
+**The work item's premise about where the limit lives was wrong, and it would
+have failed silently.** Both WI 2587 and WI 2590 recorded k-homelab's
+`kaed-service` recipe as the unit's source of truth. It is not — the recipe's
+own README says so, and `install.sh` overwrites
+`~/.config/systemd/user/kaed.service` from this repo's `deploy/kaed.service` on
+**every** deploy. A limit set in the recipe, in the installed copy, or as a
+`kaed.service.d/` drop-in would have been reverted by the next kaed upgrade
+with nothing reported: the quietest form of the second-source-of-truth mistake.
+That is why the line is here and the recipe only *asserts* it.
+
+k-homelab's half (`18d3a6d` there): `recipes/kaed-service/apply.sh` asserts
+`^LimitNOFILE=` exactly as it already asserts `^ExecReload=`, with the same
+diagnosis — absence means the installed unit predates the build that ships it,
+so the fix is an install. The README's ownership table says so, including an
+explicit "asserts the limit and must never set it". Each host's
+`min_build_date` rose to `2026-09-12`.
+
+Two things checked rather than assumed. `bin/apply <host> kaed-service` reports
+`ok` on all three, so the assertion passes and no config was touched. And the
+assertion was tested in **both** directions against real content — silent on
+the shipped unit, firing on the pre-`5c89bc5` one from git — because the two
+sprint-025 builds share a build date, so the date floor alone cannot tell a
+host running the older unit from one running this.
