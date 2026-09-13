@@ -128,6 +128,30 @@ sample from sprint 001 — corrected.
   and re-run. Worth recording because the assert doing its job is the only
   reason a silently-wrong edit did not land.
 
+## Cross-repo changes made
+
+**cleo's Copilot `klams` entry, fixed here rather than filed — inviting the
+ruling.** Found while checking the same file for kaed's entry: it still sent
+`Authorization` and no name, so it was dead too (401 stored, 401 no-credential,
+401 unknown name). My first read was that this is klams's roster and therefore
+klams's decision, and I said so on the proposal thread. Measuring changed the
+answer: `X-Homelab-Agent: ghcp` authenticates against klams **from cleo**
+(200, both controls 401), so the name already exists, klams's grain is
+per-application, and there was no decision left to own — only a config line
+klams's own cutover missed on the historically-missed host. That makes it a
+repair under the decision-ownership test, not a filing, and "pre-existing" is
+not a reason to file.
+
+Applied with the same script and the same structural asserts, verified from
+cleo with both controls, byte-checked (no BOM, LF-only). It mints nothing,
+creates no artifact and follows the pattern klams itself established on kai.
+klams's own slice korg:2503 can treat this as already done.
+
+A consequence worth having: **none of the three Copilot configs now holds a
+credential-shaped header at all** (`Authorization` / `X-API-Key` / `Cookie`
+swept on kai, kubs0 and cleo — all `NONE`). cleo's copy is mode `0666` on
+Windows and was holding a live klams bearer until this change.
+
 ## Two things that cost a round and are worth not re-deriving
 
 - **The SSE stream stays open behind `tailscale serve`.** A probe that does
