@@ -161,24 +161,27 @@ you revoke is a line in a file on a host. A backend behind a gateway must
 list the identities that reach it *proxied*, even though they never dial it
 directly.
 
-### The transition window
+### A declared name is the only credential
 
-An identity may also keep a `token_file`, and while it does, that bearer
-still authenticates it alongside the header:
+An unknown name is **refused**, never quietly resolved to something else:
+authenticating a caller as something it did not claim to be would be the
+least honest outcome available, and there is no second mechanism it could
+fall through to. Sprint 023 introduced declared identity alongside a bearer
+token; sprint 024 deleted the bearer, so `token_file`, `token_env` and
+`prev_token_file` no longer exist.
 
-```toml
-claude = { token_file = "~/.config/kaed/token" }
+A config still naming one of those fields will **not start** — deliberately,
+because `install.sh` never rewrites a config and a surviving credential row
+would otherwise be invisible. kaed says so by name rather than leaving you
+with a bare parse error:
+
+```
+Error: config ~/.config/kaed/config.toml still carries retired credential
+fields (token_file). kaed has accepted only declared identities since sprint
+023 … Delete them: an `[auth]` entry is now `<name> = {}` …
 ```
 
-The rows **are** the flag — there is no separate switch. Deleting the field
-closes the window for that identity, and kaed warns at startup naming every
-identity still holding one. `prev_token_file` is retired: it still parses,
-so an existing config starts, and it is ignored.
-
-Order matters if a name is unknown and a bearer is valid: the declared name
-is checked first and an unknown one is **refused**, never quietly downgraded
-to the bearer. Authenticating a caller as something it did not claim to be
-would be the least honest outcome available.
+The fix is the one the message names: delete the field. An entry is a name.
 
 ## 3. Write the config
 
@@ -377,9 +380,6 @@ fallback.
 | `peers.<host>` | Declared fleet member. `status` = `active` \| `deferred` (needs `ref`) \| `unreachable` (needs `since`), plus optional `note` and `url`. With a `url`, calls addressing that host's roots are proxied there, under the caller's own forwarded identity. Omit the whole table to declare nothing. |
 | `auth.<identity>` | An allow-listed identity, ordinarily an empty table (`claude-kai = {}`). The name arrives in `X-Homelab-Agent`; an unknown one is `401`. **Adding or removing one needs a restart** — see below. |
 | `auth.<identity>.nodes` | Tailnet nodes this identity may arrive from. Empty (default) = unpinned. Recorded either way; only *enforced* when `whois.enforce` is on. |
-| `auth.<identity>.token_file` | **Transition window only.** A legacy bearer accepted alongside the declared name. Re-read on `SIGHUP`; deleting the field closes the window for that identity. |
-| `auth.<identity>.token_env` | As above, from an env var. Cannot be reloaded (a process cannot re-read its own `EnvironmentFile`). |
-| `auth.<identity>.prev_token_file` | **Retired.** Still parsed so an existing config starts; ignored, and named in a startup warning. |
 | `whois.enabled` | Resolve the caller's tailnet node (default `true`). `false` records `unknown` for everything — a supported deployment, e.g. a host with no `tailscale` binary. |
 | `whois.enforce` | Refuse a caller whose node is not in its identity's `nodes` (default `false`). An unresolvable node counts as "not in the list". |
 | `whois.ttl_secs` | Cache lifetime, negative answers included (default 300). |
@@ -397,19 +397,22 @@ fallback.
 
 ### What reloads, and what needs a restart
 
-`SIGHUP` re-reads the legacy token **files** of identities the running
-process already knows about. It does not re-read the config, so anything
-that changes the *shape* of `[auth]`, `[whois]` or `[peers]` needs
-`systemctl --user restart kaed`:
+`SIGHUP` re-resolves the identity allow-list from the spec the process
+captured at startup. It does not re-read the config file, so **every**
+change below needs `systemctl --user restart kaed`:
 
 | Change | `systemctl --user reload` is enough |
 |---|---|
-| New value in an existing legacy token file | **yes** |
-| Deleting a legacy token file (closing the window) | **yes** |
 | New `[auth]` identity | no — restart |
+| Removing an `[auth]` identity | no — restart |
 | Pinning an identity to `nodes` | no — restart |
 | Any `[whois]` setting | no — restart |
 | New peer, or a changed peer `url` | no — restart |
+
+Since 024 there is nothing a reload can usefully change: the credential
+files it existed to re-read are gone. It is kept because `SIGHUP` is a
+documented signal and removing it silently would be a contract change — but
+if you are reaching for it, the answer is almost certainly a restart.
 
 Since 023 almost everything here is a restart, because almost everything
 here is now config shape rather than file contents — which is the direct
@@ -459,7 +462,7 @@ kaed check-config
 
 This prints the host name it resolved, the resolved roots (host-qualified, as
 tools will address them), the declared fleet, the allow-listed identities
-(and which still hold a legacy token), the limits, the journal path, and **every deny rule in force**. It
+(with any `nodes` pin), the limits, the journal path, and **every deny rule in force**. It
 exits non-zero on anything invalid. Read the deny list it prints — that is the
 real one, not the one you think you wrote.
 
@@ -494,9 +497,10 @@ systemctl --user status kaed
 loginctl enable-linger "$USER"   # so it survives logout
 ```
 
-`ExecReload` is what lets the legacy token files be re-read without dropping
-live sessions — see [closing the transition
-window](#closing-the-transition-window). Include it.
+`ExecReload` wires `SIGHUP` to the allow-list re-resolve. Since 024 that
+changes nothing on its own — see [what reloads](#what-reloads-and-what-needs-a-restart)
+— but keep it: the unit is installed, not generated, and a host that loses it
+loses the signal rather than gaining anything.
 
 ## 5. Expose it (optional)
 
@@ -530,18 +534,27 @@ the `Host` header must be listed.
 
 ## 6. Verify
 
+Three probes, and the two refusals are not optional: a single accepted call
+passes against a server that accepts anything, so without the controls it
+only proves the port is open.
+
 ```sh
-# no token → 401 with a bare challenge
+# no credential → 401 with a bare challenge
 curl -s -i -X POST http://127.0.0.1:4870/mcp -d '{}' | head -3
 
-# wrong token → 401 that says what's actually wrong
+# a stale bearer → 401 naming the header to send and the one to drop
 curl -s -X POST http://127.0.0.1:4870/mcp \
   -H 'Authorization: Bearer nonsense' -d '{}'
-# → unauthorized: token matches no configured identity; kaed tokens do not expire
+# → unauthorized: kaed no longer accepts bearer tokens (sprint 024): send
+#   X-Homelab-Agent: <your identity> instead, and drop the Authorization header
 
-# right token → anything but 401
+# an unknown name → 401, never a downgrade to something else
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4870/mcp \
-  -H "Authorization: Bearer $(cat ~/.config/kaed/token)" -d '{}'
+  -H 'X-Homelab-Agent: nobody' -d '{}'
+
+# an allow-listed name → anything but 401
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4870/mcp \
+  -H 'X-Homelab-Agent: claude-thishost' -d '{}'
 ```
 
 A `406` on that last one is success: you authenticated, and the MCP layer then
@@ -568,7 +581,9 @@ Add kaed as a custom MCP server / connector:
 
 - **URL:** `https://<host>.<tailnet>.ts.net:4870/mcp` (or
   `http://127.0.0.1:4870/mcp` when the agent runs on the same box)
-- **Auth header:** `Authorization: Bearer <the token>`
+- **Auth header:** `X-Homelab-Agent: <your identity>` — the name you
+  allow-listed for *this machine*. There is no token; an `Authorization`
+  header is ignored and, on its own, gets a `401` that says so.
 
 **Prefer the client's own tooling — `claude mcp add` for Claude Code.** It
 owns that file's format and encoding. Hand-editing it is where the accidents
@@ -600,8 +615,9 @@ For Claude Code, `.claude.json`:
 If your client offers no way to set an auth header, it needs a bridge — and
 that is worth telling us about.
 
-**Clients load MCP config at session start.** After changing a token or URL,
-restart the client.
+**Clients load MCP config at session start.** After changing the identity or
+the URL, restart the client — a running session keeps the config it loaded,
+so it will go on sending the old header and getting `401` until you do.
 
 ### Name every entry after its host
 
@@ -672,38 +688,22 @@ accident; it is not a security boundary against anything already inside the
 perimeter. If that is what you need, the fix is at the network layer. See
 [SECURITY.md](../SECURITY.md).
 
-### Closing the transition window
-
-If an identity still carries a legacy `token_file`, it accepts that bearer
-too. Deleting the field (or the file) closes the window:
-
-```sh
-rm ~/.config/kaed/token-claude-kai
-$EDITOR ~/.config/kaed/config.toml     # `claude-kai = { token_file = … }` → `claude-kai = {}`
-systemctl --user reload kaed           # the token half reloads
-```
-
-The identity keeps working throughout — it is the credential now. kaed warns
-at startup naming every identity that still holds a token, so the state of
-the cutover is readable from the host rather than by opening each config by
-hand:
-
-```
-WARN kaed::config: transition window OPEN: these identities still accept a
-     bearer token as well as X-Homelab-Agent …
-     identities=["claude-kai", "claude-kubs0"]
-```
-
 ## Operating notes
 
 **A 401 says which of three things is wrong.** An `X-Homelab-Agent` naming
-no configured identity; a legacy bearer matching none; or no credential at
-all. kaed distinguishes them in the `WWW-Authenticate` header and the body
-per RFC 6750, because clients otherwise render a bare 401 as "token expired"
-and send you hunting for a TTL that does not exist. A *declared* name that
-is unknown is refused outright — it never falls through to the bearer path,
-because authenticating a caller as something it did not claim to be would be
-worse than refusing it.
+no configured identity; an `Authorization` header and **no** name — the shape
+of a client that missed the cutover, which the body names explicitly along
+with the header to send and the one to drop; or no credential at all. kaed
+distinguishes them in the `WWW-Authenticate` header and the body per RFC
+6750, because clients otherwise render a bare 401 as "token expired" and send
+you hunting for a TTL that does not exist. A *declared* name that is unknown
+is refused outright, because authenticating a caller as something it did not
+claim to be would be worse than refusing it.
+
+The challenge still names the `Bearer` scheme even though no bearer is
+accepted: a 401 must carry `WWW-Authenticate` (RFC 9110 §15.5.2) and no
+registered scheme describes "declare a name in a header", so the scheme is
+the envelope and `error_description` carries the truth.
 
 **The journal is sensitive.** `~/.local/share/kaed/journal.db` holds the
 content of files kaed has edited. It is created `0600` and blob content ages
@@ -729,7 +729,7 @@ seeing what torn states actually look like.
 | Symptom | Cause |
 |---|---|
 | 4xx before auth, only via the proxy | `Host` not in `server.allowed_hosts`. Add both bare and `:port` forms. |
-| `401` with a token you believe is right | Client hasn't restarted since the token changed, or you're sending the old one. Tokens do not expire. If you just *added* the identity, the daemon needs a **restart**, not a reload — SIGHUP does not re-read `[auth]`. |
+| `401` with an identity you believe is right | If you just *added* it, the daemon needs a **restart**, not a reload — SIGHUP does not re-read `[auth]`, so the name is genuinely not in the running allow-list. Otherwise the client hasn't restarted since its config changed. Check the response body: it distinguishes an unknown name from a client still sending a bearer. |
 | `denied` on a path you expected to read | The deny list. Run `kaed check-config` to see every active rule. This is permanent — no path correction will work. |
 | `outside_root` | The path escapes its root, or is absolute. Paths are always root-relative. |
 | `list`/`search` results look short | Check `denied_hidden` (the deny list), `classified_hidden` (secret-bearing files with no redacted surface) and `unreadable_hidden` (the OS refused) in the response. |
@@ -739,7 +739,8 @@ seeing what torn states actually look like.
 | `search` found nothing and you expected hits | Check `files_searched`. Zero means your `glob`/`path` selected nothing, not that the pattern is absent — `glob` matches **root-relative** paths and is not re-anchored by `path`. The `reason` in the response names the fix. |
 | `not_found` on a root you are sure exists | Root names are host-qualified: `myhost:src`, not `src`. The error carries `data.did_you_mean`. |
 | `not_found` naming another host | Read `data.reason`. `host_deferred` means that host deliberately has no instance (`data.ref` says why) — do not install one. `host_never_declared` means this host's config says nothing about it. |
-| Identity missing from `check-config` | Token file unreadable or empty. kaed warns and disables that identity rather than failing to start. |
+| Identity missing from `check-config` | It is not in `[auth]`. Nothing else can hide one: a name on the allow-list resolves unconditionally, reading no files. |
+| `still carries retired credential fields` | This config predates sprint 024 and names `token_file` / `token_env` / `prev_token_file`. Delete them; an `[auth]` entry is `<name> = {}` and `[peers.<host>.tokens]` tables go entirely. |
 | Service won't start | `kaed check-config` first; it fails loudly on bad roots, duplicate names, roots inside denied areas, malformed `[auth]` entries, and `[peers]` statuses missing their required `ref`/`since`. |
 
 ---
@@ -760,24 +761,22 @@ enough for it to do the install. Paste it, filling in the two bracketed parts.
 > 1. **Do not root at `$HOME`.** Use the directories I listed, nothing
 >    broader. If one of them looks like it contains credentials, tell me
 >    before proceeding rather than adding a deny rule and moving on.
-> 2. Generate a fresh random token into `~/.config/kaed/token` with mode
->    0600. Do not print it. Tell me where it is so I can copy it into my
->    client myself.
-> 3. Use `token_file`, not `token_env`, and include `ExecReload` in the
->    systemd unit — otherwise token rotation requires a restart that kills
->    live sessions.
-> 4. Run `kaed check-config` and show me the output, especially the resolved
+> 2. Allow-list **one identity per client machine**, named after the host it
+>    is configured on. There is no credential to generate: a caller declares
+>    its name in `X-Homelab-Agent` and an unknown name is refused.
+> 3. Run `kaed check-config` and show me the output, especially the resolved
 >    roots and the deny rules. I want to see what it can reach before it is
 >    running.
-> 5. Verify with curl that a missing token, a wrong token, and the real token
->    behave as the setup doc describes, and show me those three results.
+> 4. Verify with curl that the declared name is accepted, and that **no
+>    credential** and an **unknown name** are both refused. Show me all three
+>    results — the two refusals are the controls, and without them the first
+>    result only proves the port is open.
 >
-> Do not commit anything, and do not put the token in any file under a
-> configured root.
+> Do not commit anything.
 
-Two things worth knowing about that prompt. It asks the agent **not to print
-the token** — the value would otherwise land in a transcript, which is exactly
-how this project's first token had to be rotated. And it asks to see
-`check-config` output **before** trusting the deploy, because the resolved
-roots are the entire security boundary and they are easy to get wrong in a way
-that looks fine.
+Two things worth knowing about that prompt. It asks for the two **refusals**
+as well as the success: a probe that only shows the accepted case passes
+against a server that accepts everything, which is a real failure mode and not
+a hypothetical one. And it asks to see `check-config` output **before**
+trusting the deploy, because the resolved roots are the entire security
+boundary and they are easy to get wrong in a way that looks fine.

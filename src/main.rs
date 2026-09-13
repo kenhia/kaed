@@ -78,17 +78,7 @@ async fn main() -> anyhow::Result<()> {
                         // report (PD-10, D-3).
                         let routing = match &p.url {
                             None => "no url — declaration only".to_string(),
-                            Some(url) => {
-                                let legacy = if p.tokens.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        " (plus retired peer tokens for {:?} — delete them)",
-                                        p.tokens.keys().collect::<Vec<_>>()
-                                    )
-                                };
-                                format!("url {url}, proxies as the caller{legacy}")
-                            }
+                            Some(url) => format!("url {url}, proxies as the caller"),
                         };
                         println!(
                             "  {:<20} {:<12} declared {why}{} — {routing}",
@@ -99,23 +89,18 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+            // No credential to annotate since 024: a name on this list is
+            // the whole of what kaed accepts, so the only thing worth
+            // printing beside it is a `nodes` pin — which is the one field
+            // that changes whether a declared name is enough.
             println!("identities (allow-listed names, X-Homelab-Agent):");
             for id in &resolved.identities {
-                // The legacy bearer is the only thing worth annotating: it
-                // is what the 023 cutover is removing, and "which of these
-                // is still off the header" is the question this command
-                // gets asked during it.
-                let window = if id.token.is_some() {
-                    "  [transition window OPEN: also accepts a bearer]"
-                } else {
-                    ""
-                };
                 let pinned = if id.nodes.is_empty() {
                     String::new()
                 } else {
                     format!("  nodes={:?}", id.nodes)
                 };
-                println!("  {}{pinned}{window}", id.author);
+                println!("  {}{pinned}", id.author);
             }
             println!(
                 "whois: enabled={} enforce={} (node recorded beside every identity)",

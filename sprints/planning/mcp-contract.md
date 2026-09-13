@@ -15,11 +15,13 @@ agent-filed feedback. Nothing here is frozen.
   this does and does not assert — it is attribution, and the perimeter is
   the access control.
 - **A 401 says which of three things is wrong.** A declared name matching no
-  configured identity; a legacy bearer matching none; or no credential at
-  all. All three are distinguished in the `WWW-Authenticate` challenge and
-  the body (RFC 6750: `error="invalid_token"` plus a description), because a
-  bare 401 gets rendered by clients as "token expired" and sends a reader
-  hunting for a TTL kaed has never had.
+  configured identity; an `Authorization` header with **no** name — the shape
+  of a client that missed the cutover, named explicitly since 024 along with
+  the header to send and the one to drop; or no credential at all. All three
+  are distinguished in the `WWW-Authenticate` challenge and the body (RFC
+  6750: `error="invalid_token"` plus a description), because a bare 401 gets
+  rendered by clients as "token expired" and sends a reader hunting for a TTL
+  kaed has never had.
 - **Statelessness:** no tool depends on hidden per-session server state.
   Any session, including a brand-new one, can act given only tool results.
 
@@ -264,9 +266,13 @@ agent-filed feedback. Nothing here is frozen.
     Enforcement (per-identity `nodes` + `[whois] enforce`) exists and is
     **off by default** (D-5).
 
-  A **transition window** exists per identity while its `[auth]` entry still
-  declares a token: that bearer is accepted alongside the name. The rows are
-  the flag (D-2); deleting the field closes it.
+  023 shipped this alongside a per-identity **transition window** — a bearer
+  still accepted while an `[auth]` entry declared one. Sprint 024 closed the
+  window and deleted the path: `token_file`, `token_env`, `prev_token_file`
+  and `[peers.<host>.tokens]` are gone from the config surface, and a config
+  still naming one does not start (024 D-1 makes that refusal name the field
+  and the fix). The first rule above is therefore structural rather than a
+  matter of check order — there is no longer anything to fall through to.
 
 - **R10 — any instance can be the fleet's gateway (010).** An instance
   whose `[peers.<host>]` entries carry a `url` proxies calls addressing

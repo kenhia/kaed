@@ -93,7 +93,7 @@ description = "scratch space"
 #
 # An ALLOW-LIST of identities, not a token table (sprint 023). A caller
 # declares itself with `X-Homelab-Agent: <name>`; a name that is not here is
-# refused with 401, exactly as an unknown token was. The name is what every
+# refused with 401. The name is what every
 # journal entry records, and it is not a secret — under this threat model
 # (one human, his agents, one tailnet, sudo everywhere) the bearer token
 # only ever said *which agent*, and a declared name does that without a
@@ -106,7 +106,8 @@ description = "scratch space"
 # and [whois] below is what records where a caller actually came from.
 #
 # There is nothing to mint: `kaed-new-token` is retired and install.sh
-# deletes any stale copy it finds.
+# deletes any stale copy it finds. Since 024 there is nothing to present
+# either — the bearer path is gone from the binary, not merely unused.
 
 [auth]
 claude = {}
@@ -126,18 +127,17 @@ claude = {}
 # claude-kubs0 = { nodes = ["kubs0", "kai"] }   # direct, or proxied via kai
 #
 # Adding or removing an identity is a change to the config *shape*, so it
-# needs `systemctl --user restart kaed`. SIGHUP re-reads token files for
-# identities the process already knows; it cannot learn a new name. The
-# symptom of forgetting is a 401 that reads like a wrong credential.
+# needs `systemctl --user restart kaed`. SIGHUP re-resolves the same names
+# and cannot learn a new one. The symptom of forgetting is a 401 that reads
+# like a wrong credential.
 #
-# TRANSITION WINDOW (023 D-2). An identity may also keep a `token_file`,
-# and while it does, that bearer still authenticates it. The rows ARE the
-# flag — there is no separate switch — so deleting the field is what closes
-# the window, and kaed warns at startup naming every identity still holding
-# one. `prev_token_file` is retired: it parses, so an old config still
-# starts, and is ignored.
-#
-# claude = { token_file = "~/.config/kaed/token" }
+# A name and an optional `nodes` pin are the WHOLE of an entry. 023's
+# transition window kept `token_file` / `token_env` / `prev_token_file`
+# parsing so a pre-cutover config would still start; 024 deleted them, and a
+# config still naming one will not start — deliberately, since install.sh
+# never rewrites a config and a surviving credential row would otherwise be
+# invisible. kaed names the field and the fix rather than leaving you with a
+# parse error.
 
 # ---------------------------------------------------------------- whois
 #

@@ -2,9 +2,9 @@
 //!
 //! Since sprint 023 `[auth]` is an **allow-list of declared identities**,
 //! not a token table: a caller names itself in `X-Homelab-Agent` and an
-//! unknown name is refused exactly as an unknown token was. The token
-//! fields that remain are the transition window (023 D-2) and are what
-//! the cutover deletes. `resolve()` is the validation gate: it
+//! unknown name is refused. Sprint 024 deleted the token fields that had
+//! been kept through the transition window, so an entry is a name and at
+//! most a `nodes` pin. `resolve()` is the validation gate: it
 //! canonicalizes roots, rejects duplicates, and produces the runtime view
 //! the server uses.
 //!
@@ -30,7 +30,7 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub roots: Vec<RootConfig>,
-    /// author identity -> where its bearer token lives
+    /// The allow-list: identity name -> its (optional) node pin.
     #[serde(default)]
     pub auth: BTreeMap<String, AuthEntry>,
     #[serde(default)]
@@ -151,30 +151,6 @@ pub struct PeerConfig {
     /// what makes an `active` peer *routable*: calls addressing its roots
     /// are proxied there. Without it the peer is declaration only.
     pub url: Option<String>,
-    /// **Retired in 023.** The gateway now forwards the caller's declared
-    /// identity (D-3), so it needs no credential of its own and an author
-    /// without one is no longer refused. PD-4's guarantee survives in the
-    /// stronger form: the caller's own name goes to the peer verbatim and
-    /// is never substituted.
-    ///
-    /// Still parsed, and still sent alongside the header while a row
-    /// survives, for the same two reasons `prev_token_file` is still
-    /// parsed: `deny_unknown_fields` would refuse a stale config outright,
-    /// and `install.sh` never rewrites one. The cutover empties the table.
-    #[serde(default)]
-    pub tokens: BTreeMap<String, PeerTokenEntry>,
-}
-
-/// Where one author's token for one peer lives. Exactly one source, same
-/// rules as [`AuthEntry`] — except no grace slot: a grace window is a
-/// *server-side* affordance, and this is the client half of the exchange.
-/// `token_file` re-reads on SIGHUP (#914, extended to peer credentials in
-/// 010); `token_env` is frozen at exec and needs a restart, same as always.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PeerTokenEntry {
-    pub token_env: Option<String>,
-    pub token_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
@@ -308,34 +284,17 @@ pub struct RootConfig {
 
 /// One allow-listed identity.
 ///
-/// Since 023 the ordinary entry is **empty** — `claude-kai = {}` — because
-/// an identity is a declared name (`X-Homelab-Agent`), not a secret. The
-/// token fields are the transition window (D-2): while an entry still
-/// carries one, that identity may also authenticate with a bearer, and
-/// deleting the field is what closes the window for it.
-///
-/// `token_file` is what made rotation non-breaking (#914): a process
-/// cannot re-read its own systemd `EnvironmentFile` — those vars were
-/// injected at exec and are frozen for its life. That reasoning is now
-/// history; nothing here is rotated, because nothing here is a secret.
+/// The ordinary entry is **empty** — `claude-kai = {}` — because an
+/// identity is a declared name (`X-Homelab-Agent`), not a secret. Since
+/// 024 that is the only shape there is: the `token_env` / `token_file` /
+/// `prev_token_file` fields are gone, and [`retired_fields`] turns the
+/// `deny_unknown_fields` refusal a stale config would hit into a message
+/// naming them.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthEntry {
-    /// Legacy (transition window). Frozen at exec; needs a restart.
-    pub token_env: Option<String>,
-    /// Legacy (transition window). Trimmed contents are the token,
-    /// re-read on SIGHUP.
-    pub token_file: Option<String>,
-    /// **Retired in 023** and ignored wherever it still appears.
-    ///
-    /// Kept in the struct rather than deleted because `deny_unknown_fields`
-    /// would otherwise turn a stale config into a daemon that will not
-    /// start — and `install.sh` deliberately never rewrites a config, so
-    /// the new binary meets the old file on every host it is deployed to.
-    /// The startup warning names it; the cutover removes it.
-    pub prev_token_file: Option<String>,
     /// Tailnet nodes this identity may arrive from. Empty = unpinned.
-    /// Consulted only when `[whois] enforce` is on (D-5).
+    /// Consulted only when `[whois] enforce` is on (023 D-5).
     #[serde(default)]
     pub nodes: Vec<String>,
 }
@@ -409,16 +368,28 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        if let Some(found) = retired_fields(&text) {
+            bail!(
+                "config {} still carries retired credential fields ({}). kaed has \
+                 accepted only declared identities since sprint 023 and the fields \
+                 were deleted in 024, so `deny_unknown_fields` would refuse this \
+                 file with only a field name to go on. Delete them: an `[auth]` \
+                 entry is now `<name> = {{}}`, and `[peers.<host>.tokens]` tables \
+                 go entirely — the gateway forwards the caller's own name and holds \
+                 no credential.",
+                path.display(),
+                found.join(", ")
+            );
+        }
         toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
     }
 
     /// Validate and produce the runtime view. Fails on bad roots or
-    /// duplicate names; a missing token env var is a warning (the identity
-    /// is skipped), because one host rarely defines every agent's token.
+    /// duplicate names.
     ///
     /// `config_path` is where this config was loaded from — its directory
-    /// is refused unconditionally, so kaed can never serve the token file
-    /// that sits beside it. Pass `None` only when there is no file (tests).
+    /// is refused unconditionally, so kaed can never serve its own config.
+    /// Pass `None` only when there is no file (tests).
     pub fn resolve(&self, config_path: Option<&Path>) -> anyhow::Result<Resolved> {
         let journal_path = match &self.journal.path {
             Some(p) => expand_home(p),
@@ -518,40 +489,6 @@ impl Config {
             });
         }
 
-        for (author, entry) in &self.auth {
-            if entry.token_env.is_some() && entry.token_file.is_some() {
-                bail!("auth {author:?}: set token_env or token_file, not both");
-            }
-        }
-        // Startup only, deliberately not in `resolve_identities`: both of
-        // these are properties of the config *shape*, which SIGHUP cannot
-        // change (019 D-3), so repeating them on every reload would be
-        // noise about something no reload can have altered.
-        let with_tokens = identities_still_carrying_a_token(&self.auth);
-        if with_tokens.is_empty() {
-            tracing::info!("identity-only auth: no bearer is accepted on this host");
-        } else {
-            tracing::warn!(
-                identities = ?with_tokens,
-                "transition window OPEN: these identities still accept a bearer \
-                 token as well as X-Homelab-Agent. Delete their token_env / \
-                 token_file to close it (023 D-2)"
-            );
-        }
-        let graced: Vec<&str> = self
-            .auth
-            .iter()
-            .filter(|(_, e)| e.prev_token_file.is_some())
-            .map(|(a, _)| a.as_str())
-            .collect();
-        if !graced.is_empty() {
-            tracing::warn!(
-                identities = ?graced,
-                "prev_token_file is RETIRED (023) and ignored: there is nothing to \
-                 rotate, because a declared identity is not a secret. Remove the \
-                 field"
-            );
-        }
         let identities = resolve_identities(&self.auth);
         let peers = self.resolve_peers(&host)?;
 
@@ -620,42 +557,6 @@ impl Config {
                 ),
                 _ => {}
             }
-            for (author, entry) in &p.tokens {
-                match (&entry.token_env, &entry.token_file) {
-                    (Some(_), Some(_)) => bail!(
-                        "peer {name:?} token for {author:?}: set token_env or \
-                         token_file, not both"
-                    ),
-                    (None, None) => bail!(
-                        "peer {name:?} token for {author:?}: needs token_env or \
-                         token_file"
-                    ),
-                    _ => {}
-                }
-                if !self.auth.contains_key(author) {
-                    tracing::warn!(
-                        peer = name,
-                        author,
-                        "peer token for an author this host's [auth] does not know — \
-                         nobody can authenticate here as that identity, so the token \
-                         is unusable (typo?)"
-                    );
-                }
-            }
-            if !p.tokens.is_empty() && p.status == PeerStatus::Deferred {
-                tracing::warn!(
-                    peer = name,
-                    "tokens configured for a deferred peer: it deliberately runs no \
-                     kaed, so these credentials route nowhere"
-                );
-            }
-            if !p.tokens.is_empty() && p.url.is_none() {
-                tracing::warn!(
-                    peer = name,
-                    "peer tokens without a `url`: nothing can be proxied there until \
-                     one is declared"
-                );
-            }
             peers.push(Peer {
                 host: name.clone(),
                 status: p.status,
@@ -663,71 +564,59 @@ impl Config {
                 note: p.note.clone(),
                 since: p.since.clone(),
                 url: p.url.clone(),
-                tokens: p.tokens.clone(),
             });
         }
         Ok(Some(peers))
     }
 }
 
-/// Identities that still accept a bearer as well as a declared name —
-/// which is exactly the set for which the 023 transition window is still
-/// open. The rows *are* the flag (D-2): there is no separate switch, and
-/// deleting the token field is what closes the window.
-pub fn identities_still_carrying_a_token(auth: &BTreeMap<String, AuthEntry>) -> Vec<&str> {
-    auth.iter()
-        .filter(|(_, e)| e.token_file.is_some() || e.token_env.is_some())
-        .map(|(author, _)| author.as_str())
-        .collect()
-}
-
-/// Resolve every allow-listed identity, reading any legacy token from
-/// wherever it lives. Called at startup and again on every SIGHUP — so
-/// this must stay pure I/O over the config spec, holding no state.
+/// Retired credential field names present in a raw config, if any (024 D-1).
 ///
-/// An identity with no token is the ordinary case since 023, not a
-/// failure: the declared name is the credential. A token that is
-/// *configured* but unreadable drops only the bearer half, leaving the
-/// identity working — a reload that disabled an agent over an unreadable
-/// legacy file would break the very clients the window exists to protect.
+/// The fields are gone from the structs, and `deny_unknown_fields` means a
+/// host whose `config.toml` still names one will not start — which is the
+/// intended outcome, since `install.sh` deliberately never rewrites a
+/// config and a surviving token row would otherwise be invisible. What is
+/// *not* intended is diagnosing that from serde's bare "unknown field"
+/// error, so this runs first and names the field, the sprint and the fix.
+///
+/// Deliberately a text scan rather than a permissive parse: a second
+/// deserialization shape for fields that no longer exist would be the very
+/// thing being deleted, kept alive to describe its own absence.
+fn retired_fields(text: &str) -> Option<Vec<String>> {
+    // Longest first, and each match is consumed: `prev_token_file` contains
+    // `token_file`, so a naive scan reports a field the file never named.
+    const RETIRED: [&str; 3] = ["prev_token_file", "token_file", "token_env"];
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut code = line.split('#').next().unwrap_or("").to_string();
+        for field in RETIRED {
+            if code.contains(field) {
+                code = code.replace(field, "");
+                if !found.iter().any(|f| f == field) {
+                    found.push(field.to_string());
+                }
+            }
+        }
+    }
+    found.sort();
+    (!found.is_empty()).then_some(found)
+}
+
+/// Resolve every allow-listed identity. Called at startup and again on
+/// every SIGHUP — so this must stay pure over the config spec, holding no
+/// state. Since 024 it reads nothing from disk: an identity *is* its name,
+/// so the mapping is total and cannot fail.
+///
+/// It never filters. 023 D-6 is the reason: this function used to drop an
+/// identity whose token would not resolve, which at the moment the cutover
+/// deleted the token files would have deleted every agent on the fleet.
 pub fn resolve_identities(auth: &BTreeMap<String, AuthEntry>) -> Vec<Identity> {
-    let mut identities = Vec::new();
-    for (author, entry) in auth {
-        let token = entry.current_token();
-        if token.is_none() && (entry.token_file.is_some() || entry.token_env.is_some()) {
-            tracing::warn!(
-                author,
-                "legacy token configured but unset or empty; this identity now \
-                 authenticates by declared name only"
-            );
-        }
-        identities.push(Identity {
+    auth.iter()
+        .map(|(author, entry)| Identity {
             author: author.clone(),
-            token,
             nodes: Arc::new(entry.nodes.clone()),
-        });
-    }
-    identities
-}
-
-impl AuthEntry {
-    fn current_token(&self) -> Option<String> {
-        match (&self.token_file, &self.token_env) {
-            (Some(path), _) => read_token(path),
-            (None, Some(var)) => std::env::var(var).ok().filter(|t| !t.is_empty()),
-            (None, None) => None,
-        }
-    }
-}
-
-fn read_token(path: &str) -> Option<String> {
-    match std::fs::read_to_string(expand_home(path)) {
-        Ok(s) => Some(s.trim().to_string()).filter(|t| !t.is_empty()),
-        Err(e) => {
-            tracing::warn!(path, error = %e, "could not read token file");
-            None
-        }
-    }
+        })
+        .collect()
 }
 
 /// One validated fleet member. Still the *declaration*: whether the host
@@ -742,10 +631,6 @@ pub struct Peer {
     pub note: Option<String>,
     pub since: Option<String>,
     pub url: Option<String>,
-    /// Author → token source for proxying to this peer (PD-4). The spec,
-    /// not the secret: values are resolved by [`resolve_peer_tokens`] at
-    /// startup and on every SIGHUP.
-    pub tokens: BTreeMap<String, PeerTokenEntry>,
 }
 
 impl Peer {
@@ -759,40 +644,8 @@ impl Peer {
             note: None,
             since: None,
             url: None,
-            tokens: BTreeMap::new(),
         }
     }
-}
-
-/// Read every peer token from wherever it lives: `(peer host, author)` →
-/// bearer token. Pure I/O over the config spec, like [`resolve_identities`]
-/// — called at startup and again on every SIGHUP, so a rotated peer token
-/// file takes effect without a restart (#914 extended, 010 D-2). A missing
-/// or empty token just leaves that (peer, author) pair unroutable, with a
-/// warning; refusing to serve over it would let one stale file take down
-/// every local tool.
-pub fn resolve_peer_tokens(peers: &[Peer]) -> BTreeMap<(String, String), String> {
-    let mut tokens = BTreeMap::new();
-    for peer in peers {
-        for (author, entry) in &peer.tokens {
-            let token = match (&entry.token_file, &entry.token_env) {
-                (Some(path), _) => read_token(path),
-                (None, Some(var)) => std::env::var(var).ok().filter(|t| !t.is_empty()),
-                (None, None) => None,
-            };
-            match token {
-                Some(t) => {
-                    tokens.insert((peer.host.clone(), author.clone()), t);
-                }
-                None => tracing::warn!(
-                    peer = peer.host,
-                    author,
-                    "peer token unset or empty; this identity cannot be proxied there"
-                ),
-            }
-        }
-    }
-    tokens
 }
 
 /// The validated runtime view of the config.
@@ -812,8 +665,8 @@ pub struct Resolved {
     pub journal_retention_days: u32,
     pub deny: Arc<DenyList>,
     pub classify: Arc<crate::policy::Classifier>,
-    /// Where each identity's token lives, kept so SIGHUP can re-read them
-    /// without reparsing the config file.
+    /// The `[auth]` spec as written, kept so SIGHUP can re-resolve the
+    /// allow-list without reparsing the config file.
     pub auth: BTreeMap<String, AuthEntry>,
     pub secrets: ResolvedSecrets,
     pub whois: WhoisConfig,
@@ -902,10 +755,6 @@ impl ResolvedRoot {
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub author: String,
-    /// The legacy bearer, while this identity's transition window is open
-    /// (D-2). `None` — the ordinary state after the cutover — means the
-    /// declared name is the only way in.
-    pub token: Option<String>,
     /// Tailnet nodes this identity may arrive from. Empty = unpinned.
     /// Consulted only when `[whois] enforce` is on (D-5).
     pub nodes: Arc<Vec<String>>,
@@ -959,7 +808,7 @@ mod tests {
             description = "everything under ~"
 
             [auth]
-            claude = { token_env = "KAED_TOKEN_CLAUDE" }
+            claude = {}
 
             [limits]
             max_read_bytes = 1024
@@ -971,10 +820,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.server.bind.port(), 4999);
         assert_eq!(cfg.roots[0].name, "home");
-        assert_eq!(
-            cfg.auth["claude"].token_env.as_deref(),
-            Some("KAED_TOKEN_CLAUDE")
-        );
+        assert!(cfg.auth.contains_key("claude"));
         assert_eq!(cfg.limits.max_read_bytes, 1024);
         // unspecified limits keep their defaults
         assert_eq!(cfg.limits.max_file_bytes, 8_388_608);
@@ -986,109 +832,84 @@ mod tests {
         assert!(toml::from_str::<Config>("[server]\nbindd = \"x\"").is_err());
     }
 
-    /// The ordinary entry since 023 carries no token at all: the declared
-    /// name IS the credential, and an empty table is a complete identity.
+    /// An identity IS its name: an empty table is a complete entry, and
+    /// since 024 it is the only entry there is.
     #[test]
-    fn an_identity_needs_no_token() {
+    fn an_identity_is_just_its_name() {
         let cfg: Config = toml::from_str("[auth]\nclaude-kai = {}\n").unwrap();
         let ids = cfg.resolve(None).unwrap().identities;
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0].author, "claude-kai");
-        assert_eq!(ids[0].token, None);
         assert!(ids[0].nodes.is_empty(), "unpinned by default");
     }
 
-    /// The transition window, and the only thing that opens it: a token
-    /// field beside the name (D-2). There is no separate flag to forget to
-    /// flip, which is the point — the rows are the flag.
+    /// 023 D-6, and the reason `resolve_identities` has no filter at all:
+    /// it once dropped an identity whose token would not resolve, which at
+    /// the moment the cutover deleted the token files would have deleted
+    /// every agent on the fleet. Nothing may reintroduce a condition here.
     #[test]
-    fn a_legacy_token_is_read_and_re_read_while_the_window_is_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let cur = dir.path().join("claude.token");
-        std::fs::write(&cur, "  v1\n").unwrap(); // trimmed on read
-        let cfg: Config = toml::from_str(&format!(
-            "[auth]\nclaude = {{ token_file = \"{}\" }}\n",
-            cur.display()
-        ))
-        .unwrap();
-
-        let first = cfg.resolve(None).unwrap().identities;
-        assert_eq!(first[0].token.as_deref(), Some("v1"));
-
-        // re-resolve the way SIGHUP does
-        std::fs::write(&cur, "v2\n").unwrap();
-        let after = resolve_identities(&cfg.auth);
-        assert_eq!(after[0].token.as_deref(), Some("v2"));
-    }
-
-    /// Deleting the token is what closes the window — and it must leave
-    /// the identity *working*, not disabled. An earlier model dropped any
-    /// identity whose token would not resolve; under declared identity
-    /// that would have deleted the agent along with its retired secret.
-    #[test]
-    fn an_unreadable_legacy_token_leaves_the_identity_alive() {
+    fn every_allow_listed_name_resolves_and_none_is_ever_dropped() {
         let cfg: Config =
-            toml::from_str("[auth]\nclaude = { token_file = \"/nonexistent/token\" }\n").unwrap();
-        let ids = cfg.resolve(None).unwrap().identities;
-        assert_eq!(ids.len(), 1, "the identity survives its missing token");
-        assert_eq!(ids[0].token, None);
-    }
-
-    #[test]
-    fn auth_entries_may_not_name_two_token_sources() {
-        let both: Config =
-            toml::from_str("[auth]\nc = { token_env = \"E\", token_file = \"/f\" }\n").unwrap();
-        assert!(
-            both.resolve(None)
-                .unwrap_err()
-                .to_string()
-                .contains("not both")
-        );
-    }
-
-    /// `prev_token_file` is retired, but a config still carrying one must
-    /// **parse**. `install.sh` never rewrites a config, so the new binary
-    /// meets the old file on every host it is deployed to; refusing it
-    /// would turn an upgrade into a fleet-wide outage.
-    #[test]
-    fn a_retired_grace_window_field_is_ignored_not_refused() {
-        let cfg: Config =
-            toml::from_str("[auth]\nc = { token_file = \"/t\", prev_token_file = \"/t.prev\" }\n")
-                .unwrap();
-        assert!(cfg.resolve(None).is_ok());
-    }
-
-    /// Likewise a peer token table: parsed, so a pre-023 gateway config
-    /// starts, and emptied by the cutover rather than by the binary.
-    #[test]
-    fn a_retired_peer_token_table_still_parses() {
-        let cfg: Config = toml::from_str(
-            "[peers.kubs0]\nstatus = \"active\"\nurl = \"https://example/mcp\"\n\
-             [peers.kubs0.tokens]\nclaude = { token_file = \"/t\" }\n",
-        )
-        .unwrap();
-        assert_eq!(cfg.peers.unwrap()["kubs0"].tokens.len(), 1);
-    }
-
-    /// The window's own inventory: which identities still take a bearer.
-    /// 019 asked the mirror-image question (which lack a grace window) and
-    /// had to be answered by reading three config files on three hosts.
-    #[test]
-    fn identities_still_carrying_a_token_are_named() {
-        let cfg: Config = toml::from_str(
-            "[auth]\n\
-             filed = { token_file = \"/t\" }\n\
-             enved = { token_env = \"E\" }\n\
-             clean = {}\n",
-        )
-        .unwrap();
+            toml::from_str("[auth]\na = {}\nb = { nodes = [\"kai\"] }\nc = {}\n").unwrap();
+        let ids = resolve_identities(&cfg.auth);
         assert_eq!(
-            identities_still_carrying_a_token(&cfg.auth),
-            ["enved", "filed"]
+            ids.iter().map(|i| i.author.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
         );
+    }
 
-        let cut: Config = toml::from_str("[auth]\nc = {}\n").unwrap();
-        assert!(identities_still_carrying_a_token(&cut.auth).is_empty());
+    /// The token fields are GONE from the structs (024), so a stale config
+    /// must not start — `install.sh` never rewrites one, and a surviving
+    /// token row would otherwise be invisible. What this pins is that the
+    /// refusal is *legible*: it names the field, the sprint and the fix,
+    /// rather than leaving serde's bare "unknown field" to be diagnosed.
+    #[test]
+    fn a_config_still_carrying_a_retired_token_field_is_refused_by_name() {
+        for spec in [
+            "[auth]\nc = { token_file = \"/t\" }\n",
+            "[auth]\nc = { token_env = \"E\" }\n",
+            "[auth]\nc = { prev_token_file = \"/t.prev\" }\n",
+            "[peers.kubs0]\nstatus = \"active\"\n[peers.kubs0.tokens]\nc = { token_file = \"/t\" }\n",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, spec).unwrap();
+            let err = Config::load(&path).unwrap_err().to_string();
+            assert!(err.contains("retired credential fields"), "{err}");
+            assert!(err.contains("sprint 023"), "{err}");
+        }
+    }
+
+    /// Only the field the file actually names. `prev_token_file` contains
+    /// `token_file` as a substring, and a naive scan reports both — which
+    /// would send an operator looking for a field that is not there.
+    #[test]
+    fn the_retired_field_scan_names_only_what_is_present() {
+        assert_eq!(
+            retired_fields("c = { prev_token_file = \"/t.prev\" }").unwrap(),
+            ["prev_token_file"]
+        );
+        assert_eq!(
+            retired_fields("c = { token_file = \"/t\" }").unwrap(),
+            ["token_file"]
+        );
+    }
+
+    /// A *comment* mentioning a retired field is not a retired field. The
+    /// fleet's own configs carry prose about the cutover, and refusing to
+    /// start over a comment would be the scan failing the hosts it exists
+    /// to protect.
+    #[test]
+    fn a_retired_field_named_only_in_a_comment_is_not_a_refusal() {
+        assert!(retired_fields("# token_file was deleted in 024\nc = {}\n").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[auth]\n# no prev_token_file here any more (023 retired it)\nc = {}\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_ok());
     }
 
     #[test]
@@ -1292,60 +1113,27 @@ mod tests {
         assert!(ok.resolve(None).is_ok());
     }
 
-    /// D-2 (010): peer credentials resolve from files and re-resolve the
-    /// way SIGHUP does, so a rotation needs no restart — #914's promise,
-    /// extended to the outbound direction.
+    /// A routable peer is a URL and nothing else: the gateway forwards the
+    /// caller's declared name and holds no credential of its own, so there
+    /// is no per-author table to resolve, rotate or get stale (PD-10).
     #[test]
-    fn peer_tokens_parse_resolve_and_rotate() {
-        let dir = tempfile::tempdir().unwrap();
-        let tok = dir.path().join("kubs0-claude.token");
-        std::fs::write(&tok, "  peer-v1\n").unwrap(); // trimmed on read
-        let cfg: Config = toml::from_str(&format!(
+    fn a_routable_peer_is_a_url_and_no_credential() {
+        let cfg: Config = toml::from_str(
             r#"
             [server]
             host = "kai"
             [peers.kubs0]
             status = "active"
             url = "https://kubs0.example:4870/mcp"
-            [peers.kubs0.tokens]
-            claude = {{ token_file = "{}" }}
             "#,
-            tok.display()
-        ))
+        )
         .unwrap();
         let peers = cfg.resolve(None).unwrap().peers.unwrap();
-        assert_eq!(peers[0].tokens.len(), 1);
-
-        let key = ("kubs0".to_string(), "claude".to_string());
-        let first = resolve_peer_tokens(&peers);
-        assert_eq!(first[&key], "peer-v1");
-
-        std::fs::write(&tok, "peer-v2\n").unwrap();
-        let after = resolve_peer_tokens(&peers);
-        assert_eq!(after[&key], "peer-v2");
-
-        // an unreadable token disables that pair, it does not fail the host
-        std::fs::remove_file(&tok).unwrap();
-        assert!(!resolve_peer_tokens(&peers).contains_key(&key));
-    }
-
-    #[test]
-    fn a_peer_token_needs_exactly_one_source() {
-        for (spec, msg) in [
-            (
-                "claude = { token_env = \"E\", token_file = \"/f\" }",
-                "not both",
-            ),
-            ("claude = { }", "needs token_env or token_file"),
-        ] {
-            let cfg: Config = toml::from_str(&format!(
-                "[server]\nhost = \"kai\"\n[peers.kubs0]\nstatus = \"active\"\n\
-                 [peers.kubs0.tokens]\n{spec}\n"
-            ))
-            .unwrap();
-            let err = cfg.resolve(None).unwrap_err();
-            assert!(err.to_string().contains(msg), "{err}");
-        }
+        assert_eq!(peers[0].host, "kubs0");
+        assert_eq!(
+            peers[0].url.as_deref(),
+            Some("https://kubs0.example:4870/mcp")
+        );
     }
 
     #[test]
@@ -1376,41 +1164,32 @@ mod tests {
     }
 
     #[test]
-    fn resolve_canonicalizes_roots_and_resolves_tokens() {
+    fn resolve_canonicalizes_roots_and_keeps_every_identity() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().to_str().unwrap();
-        // unique env var per test: parallel tests share the process env
-        unsafe { std::env::set_var("KAED_TEST_TOKEN_RESOLVE", "sekrit") };
         let cfg: Config = toml::from_str(&format!(
             r#"
             [[roots]]
             name = "t"
             path = "{p}"
             [auth]
-            claude = {{ token_env = "KAED_TEST_TOKEN_RESOLVE" }}
-            ghost = {{ token_env = "KAED_TEST_TOKEN_UNSET_XYZ" }}
+            claude = {{}}
+            ghost = {{}}
             "#
         ))
         .unwrap();
         let resolved = cfg.resolve(None).unwrap();
         assert!(resolved.roots[0].path.is_absolute());
-        // BOTH are identities since 023: an allow-listed name is the
-        // credential, so `ghost` is live even though its legacy env var is
-        // unset. Before this sprint an unreadable token silently deleted
-        // the identity — which under declared identity would mean an
-        // agent vanishing because a retired secret went missing.
-        assert_eq!(resolved.identities.len(), 2);
-        let claude = resolved
-            .identities
-            .iter()
-            .find(|i| i.author == "claude")
-            .unwrap();
-        assert_eq!(claude.token.as_deref(), Some("sekrit"));
-        let ghost = resolved
-            .identities
-            .iter()
-            .find(|i| i.author == "ghost")
-            .unwrap();
-        assert_eq!(ghost.token, None);
+        // Both are identities, and nothing about the host can change that:
+        // a name on the allow-list is the whole credential, so resolution
+        // reads no files and cannot partially fail.
+        assert_eq!(
+            resolved
+                .identities
+                .iter()
+                .map(|i| i.author.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "ghost"]
+        );
     }
 }

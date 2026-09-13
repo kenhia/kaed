@@ -5,9 +5,7 @@
 //! (D-4), fleet search under one budget (D-5), and credential handling
 //! that refuses rather than impersonates (D-2).
 
-use kaed::config::{
-    AuthEntry, Identity, Limits, Peer, PeerStatus, PeerTokenEntry, Resolved, ResolvedRoot,
-};
+use kaed::config::{AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, ClientInfo};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -95,28 +93,19 @@ async fn start_instance_with_roots(
     })
 }
 
-fn identity(author: &str, token: &str) -> Identity {
+/// An identity is a name. Since 024 there is no other shape: the bearer
+/// the fixtures used to carry is gone from the struct entirely.
+fn identity(author: &str) -> Identity {
     Identity {
         author: author.into(),
-        token: Some(token.into()),
         nodes: std::sync::Arc::new(Vec::new()),
     }
 }
 
-/// An identity with no bearer at all — the ordinary shape after the 023
-/// cutover, and the one the fixtures above still do not use because they
-/// also exercise the transition window.
-fn identity_only(author: &str) -> Identity {
-    Identity {
-        author: author.into(),
-        token: None,
-        nodes: std::sync::Arc::new(Vec::new()),
-    }
-}
-
-/// A gateway ("alpha") declaring one routable peer ("beta"), with a claude
-/// credential for it in a rotatable file — and a ghcp identity that has
-/// deliberately NO beta credential.
+/// A gateway ("alpha") declaring one routable peer ("beta"). Neither holds
+/// a credential of any kind — alpha forwards the caller's declared name.
+/// `ghcp` is an identity on alpha and deliberately NOT on beta, which is
+/// what makes the refusal path testable.
 async fn start_pair() -> anyhow::Result<(Instance, Instance, tempfile::TempDir)> {
     start_pair_with_beta_roots(vec![]).await
 }
@@ -129,50 +118,27 @@ async fn start_pair_with_beta_roots(
     let beta = start_instance_with_roots(
         "beta",
         beta_extra_roots,
-        vec![identity("claude", "tok-beta-claude")],
+        vec![identity("claude")],
         BTreeMap::new(),
         None,
     )
     .await?;
 
+    // Kept so the signature still hands callers a tempdir to hold: some
+    // tests write fixture files into it. Nothing credential-shaped lives
+    // here any more.
     let secrets = tempfile::tempdir()?;
-    let beta_token_file = secrets.path().join("beta-claude.token");
-    std::fs::write(&beta_token_file, "tok-beta-claude\n")?;
-
-    let mut tokens = BTreeMap::new();
-    tokens.insert(
-        "claude".to_string(),
-        PeerTokenEntry {
-            token_env: None,
-            token_file: Some(beta_token_file.display().to_string()),
-        },
-    );
     let alpha = start_instance(
         "alpha",
-        vec![
-            identity("claude", "tok-alpha-claude"),
-            identity("ghcp", "tok-alpha-ghcp"),
-        ],
+        vec![identity("claude"), identity("ghcp")],
         BTreeMap::new(),
         Some(vec![Peer {
             url: Some(format!("http://{}/mcp", beta.addr)),
-            tokens,
             ..Peer::declared("beta", PeerStatus::Active)
         }]),
     )
     .await?;
     Ok((alpha, beta, secrets))
-}
-
-async fn connect(
-    addr: std::net::SocketAddr,
-    token: &str,
-) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
-    let transport = StreamableHttpClientTransport::from_config(
-        StreamableHttpClientTransportConfig::with_uri(format!("http://{addr}/mcp"))
-            .auth_header(token),
-    );
-    Ok(ClientInfo::default().serve(transport).await?)
 }
 
 /// Connect by DECLARED IDENTITY (023) rather than by bearer: the header a
@@ -224,7 +190,7 @@ async fn call(
 /// and only showed up from cleo.
 async fn raw_call_at_2026_07_28(
     addr: std::net::SocketAddr,
-    token: &str,
+    author: &str,
     tool: &str,
     arguments: Value,
 ) -> anyhow::Result<Value> {
@@ -236,7 +202,7 @@ async fn raw_call_at_2026_07_28(
     let http = reqwest::Client::new();
     let url = format!("http://{addr}/mcp");
     let common = |req: reqwest::RequestBuilder| {
-        req.header("authorization", format!("Bearer {token}"))
+        req.header("x-homelab-agent", author)
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
     };
@@ -281,7 +247,7 @@ async fn raw_call_at_2026_07_28(
 #[tokio::test]
 async fn a_proxied_edit_journals_on_the_backend_under_the_real_author() -> anyhow::Result<()> {
     let (alpha, beta, _secrets) = start_pair().await?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     // read through the gateway: identical addressing, remote root
     let read = structured(
@@ -316,7 +282,7 @@ async fn a_proxied_edit_journals_on_the_backend_under_the_real_author() -> anyho
     assert!(on_disk.contains("new_name"));
 
     // beta's own journal, read directly: authored by claude, not "gateway"
-    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let direct = connect_as(beta.addr, "claude").await?;
     let journal = structured(&call(&direct, "journal", json!({})).await);
     let txn = &journal["entries"][0];
     assert_eq!(txn["kind"], "txn");
@@ -345,7 +311,7 @@ async fn a_proxied_edit_journals_on_the_backend_under_the_real_author() -> anyho
 #[tokio::test]
 async fn a_version_conflict_crosses_the_gateway_verbatim() -> anyhow::Result<()> {
     let (alpha, beta, _secrets) = start_pair().await?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     // Establish a journaled state first: the conflict delta renders from
     // the journal's blob of the expected version, so that version has to
@@ -418,7 +384,7 @@ async fn a_version_conflict_crosses_the_gateway_verbatim() -> anyhow::Result<()>
 #[tokio::test]
 async fn an_unreachable_peer_is_data_not_a_connection_failure() -> anyhow::Result<()> {
     let (alpha, beta, _secrets) = start_pair().await?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let up = structured(&call(&gw, "roots", json!({})).await);
     let beta_root = up["roots"]
@@ -505,7 +471,7 @@ async fn an_unreachable_peer_is_data_not_a_connection_failure() -> anyhow::Resul
     Ok(())
 }
 
-/// 023 D-3, and PD-4's guarantee in the form that survives the token
+/// 023 D-3, and PD-4's guarantee in the form that outlived the token
 /// matrix: the gateway forwards the caller's OWN declared name and never
 /// substitutes one. A peer that does not allow-list that name refuses the
 /// call — which is the right outcome, because a misattributed journal row
@@ -513,11 +479,11 @@ async fn an_unreachable_peer_is_data_not_a_connection_failure() -> anyhow::Resul
 ///
 /// `ghcp` is an identity on alpha and not on beta, so this is the whole
 /// proof in one hop: alpha could trivially have reached beta as `claude`
-/// (it holds that identity too), and does not.
+/// (it allow-lists that name too), and does not.
 #[tokio::test]
 async fn a_forwarded_identity_the_peer_rejects_is_refused_not_substituted() -> anyhow::Result<()> {
     let (alpha, beta, _secrets) = start_pair().await?;
-    let gw = connect(alpha.addr, "tok-alpha-ghcp").await?;
+    let gw = connect_as(alpha.addr, "ghcp").await?;
 
     let stat = call(&gw, "stat", json!({"root": "beta:scratch", "path": ""})).await;
     assert_eq!(stat.is_error, Some(true));
@@ -540,20 +506,19 @@ async fn a_forwarded_identity_the_peer_rejects_is_refused_not_substituted() -> a
     Ok(())
 }
 
-/// The point of the whole sprint, as one assertion: alpha declares beta
-/// with **no `[peers.beta.tokens]` table at all** and the proxied call
-/// still lands, journaled on beta under the caller's name. Nine
-/// credentials became zero, and identity fidelity did not move.
+/// 023's point, as one assertion, and since 024 the only shape a gateway
+/// has: alpha declares beta as a URL and nothing else, and the proxied call
+/// lands journaled on beta under the caller's name. Nine credentials became
+/// zero and identity fidelity did not move.
 #[tokio::test]
 async fn a_gateway_with_no_peer_credentials_still_proxies_as_the_caller() -> anyhow::Result<()> {
-    let beta = start_instance("beta", vec![identity_only("claude")], BTreeMap::new(), None).await?;
+    let beta = start_instance("beta", vec![identity("claude")], BTreeMap::new(), None).await?;
     let alpha = start_instance(
         "alpha",
-        vec![identity_only("claude")],
+        vec![identity("claude")],
         BTreeMap::new(),
         Some(vec![Peer {
             url: Some(format!("http://{}/mcp", beta.addr)),
-            tokens: BTreeMap::new(),
             ..Peer::declared("beta", PeerStatus::Active)
         }]),
     )
@@ -608,7 +573,7 @@ async fn fleet_search_merges_across_hosts_with_per_root_reporting() -> anyhow::R
         beta.workdir_path.join("b.txt"),
         "needle there\nneedle again\n",
     )?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let out = structured(&call(&gw, "search", json!({"root": "*:*", "pattern": "needle"})).await);
     assert_eq!(out["fleet"], true);
@@ -669,8 +634,7 @@ async fn fleet_search_merges_across_hosts_with_per_root_reporting() -> anyhow::R
 }
 
 /// korg #1089, reproduced with kubsdb's exact topology: a peer that
-/// **declares** the fleet (PD-5) but holds no peer tokens for it, because it
-/// is a leaf and not a gateway.
+/// **declares** the fleet (PD-5) while being a leaf and not a gateway.
 ///
 /// `beta:*` addressed to alpha used to route on the host prefix (010 D-1)
 /// before the pattern was recognised (010 D-5), so the whole call forwarded
@@ -688,9 +652,9 @@ async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyho
     };
     let beta = start_instance(
         "beta",
-        vec![identity("claude", "tok-beta-claude")],
+        vec![identity("claude")],
         BTreeMap::new(),
-        // declared, routable, and NO tokens — kubsdb's shape exactly
+        // declared and routable — kubsdb's shape exactly
         Some(vec![Peer {
             url: Some(format!("http://127.0.0.1:{beta_port}/mcp")),
             ..Peer::declared("alpha", PeerStatus::Active)
@@ -698,29 +662,18 @@ async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyho
     )
     .await?;
 
-    let secrets = tempfile::tempdir()?;
-    let beta_token_file = secrets.path().join("beta-claude.token");
-    std::fs::write(&beta_token_file, "tok-beta-claude\n")?;
-    let mut tokens = BTreeMap::new();
-    tokens.insert(
-        "claude".to_string(),
-        PeerTokenEntry {
-            token_env: None,
-            token_file: Some(beta_token_file.display().to_string()),
-        },
-    );
     let alpha = start_instance(
         "alpha",
         vec![
-            identity("claude", "tok-alpha-claude"),
-            // deliberately no beta credential, so this author has a real
-            // fleet gap to report — the control for the assertions below
-            identity("ghcp", "tok-alpha-ghcp"),
+            identity("claude"),
+            // deliberately NOT allow-listed on beta, so this author has a
+            // real fleet gap to report — the control for the assertions
+            // below
+            identity("ghcp"),
         ],
         BTreeMap::new(),
         Some(vec![Peer {
             url: Some(format!("http://{}/mcp", beta.addr)),
-            tokens,
             ..Peer::declared("beta", PeerStatus::Active)
         }]),
     )
@@ -728,7 +681,7 @@ async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyho
 
     std::fs::write(alpha.workdir_path.join("a.txt"), "needle here\n")?;
     std::fs::write(beta.workdir_path.join("b.txt"), "needle there\n")?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let single = structured(
         &call(
@@ -805,7 +758,7 @@ async fn a_single_peer_pattern_is_expanded_by_the_host_that_was_asked() -> anyho
     //     unavailable would be #1089 with the hosts swapped;
     //   - under `*:*`, beta IS part of the search and the gap is real, so
     //     it must still be reported (D-5's no-silent-gap rule).
-    let stranger = connect(alpha.addr, "tok-alpha-ghcp").await?;
+    let stranger = connect_as(alpha.addr, "ghcp").await?;
     let scoped = structured(
         &call(
             &stranger,
@@ -857,7 +810,7 @@ async fn a_cross_host_value_from_carries_the_secret_without_the_agent() -> anyho
         format!("SERVICE_TOKEN={VALUE}\n"),
     )?;
     let digest = kaed::secrets::digest_of(VALUE);
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     // gateway-local source → remote target, one proxied edit
     let edit = call(
@@ -899,7 +852,7 @@ async fn a_cross_host_value_from_carries_the_secret_without_the_agent() -> anyho
     assert_eq!(event["author"], "claude");
 
     // the TARGET journaled a redacted transaction under the real author
-    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let direct = connect_as(beta.addr, "claude").await?;
     let beta_journal = structured(&call(&direct, "journal", json!({})).await);
     let txn = &beta_journal["entries"][0];
     assert_eq!(txn["kind"], "txn");
@@ -942,7 +895,7 @@ async fn a_peer_sourced_value_from_journals_the_exit_on_the_peer() -> anyhow::Re
         format!("ISSUED_TOKEN={VALUE}\n"),
     )?;
     std::fs::write(alpha.workdir_path.join("app.env"), "")?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let version = kaed::fsops::version_of(b"");
     let edit = call(
@@ -969,7 +922,7 @@ async fn a_peer_sourced_value_from_journals_the_exit_on_the_peer() -> anyhow::Re
 
     // beta journaled the disclosure; alpha's secret stream stays empty (the
     // value ARRIVED here, it did not leave here)
-    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let direct = connect_as(beta.addr, "claude").await?;
     let exit = structured(&call(&direct, "journal", json!({"kind": ["secret"]})).await);
     let event = &exit["entries"][0];
     assert_eq!(event["action"], "transport");
@@ -1001,7 +954,7 @@ async fn rotate_writes_both_hosts_via_a_remote_also_target() -> anyhow::Result<(
         beta.workdir_path.join(".env"),
         format!("SHARED_TOKEN={VALUE}\n"),
     )?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let rotated = call(
         &gw,
@@ -1048,7 +1001,7 @@ async fn rotate_writes_both_hosts_via_a_remote_also_target() -> anyhow::Result<(
         .map(|e| e["action"].as_str().unwrap())
         .collect();
     assert_eq!(actions, ["transport", "rotate"]);
-    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let direct = connect_as(beta.addr, "claude").await?;
     let beta_journal = structured(&call(&direct, "journal", json!({})).await);
     assert_eq!(beta_journal["entries"][0]["author"], "claude");
 
@@ -1080,7 +1033,7 @@ async fn rotate_writes_a_same_host_cross_root_also_target_locally() -> anyhow::R
         beta.workdir_path.join(".env"),
         format!("SHARED_TOKEN={VALUE}\n"),
     )?;
-    let gw = connect(alpha.addr, "tok-alpha-claude").await?;
+    let gw = connect_as(alpha.addr, "claude").await?;
 
     let version = kaed::fsops::version_of(format!("SHARED_TOKEN={VALUE}\n").as_bytes());
     let rotated = call(
@@ -1129,7 +1082,7 @@ async fn rotate_writes_a_same_host_cross_root_also_target_locally() -> anyhow::R
 
     // beta journaled one rotate row per location and NO transport; the
     // gateway's secret stream stays empty — the value never touched alpha.
-    let direct = connect(beta.addr, "tok-beta-claude").await?;
+    let direct = connect_as(beta.addr, "claude").await?;
     let stream = structured(&call(&direct, "journal", json!({"kind": ["secret"]})).await);
     let mut rows: Vec<(&str, &str)> = stream["entries"]
         .as_array()
@@ -1174,7 +1127,7 @@ async fn a_proxied_result_is_stamped_for_the_revision_it_is_returned_on() -> any
     // the local half, as the control: kai's own result is rmcp's to build
     let local = raw_call_at_2026_07_28(
         alpha.addr,
-        "tok-alpha-claude",
+        "claude",
         "stat",
         json!({"root": "alpha:scratch", "path": "hello.txt"}),
     )
@@ -1185,7 +1138,7 @@ async fn a_proxied_result_is_stamped_for_the_revision_it_is_returned_on() -> any
     // and the proxied half, which is the one that regressed
     let proxied = raw_call_at_2026_07_28(
         alpha.addr,
-        "tok-alpha-claude",
+        "claude",
         "stat",
         json!({"root": "beta:scratch", "path": "hello.txt"}),
     )
@@ -1199,7 +1152,7 @@ async fn a_proxied_result_is_stamped_for_the_revision_it_is_returned_on() -> any
     // a proxied ERROR result travels the same path and needs the same stamp
     let refused = raw_call_at_2026_07_28(
         alpha.addr,
-        "tok-alpha-claude",
+        "claude",
         "stat",
         json!({"root": "beta:scratch", "path": "nope.txt"}),
     )

@@ -1,12 +1,14 @@
 //! Peer routing — the gateway half of kaed (sprint 010, korg #1050).
 //!
-//! Any instance with `[peers.<host>]` URLs and per-author tokens can proxy
-//! calls addressing a peer's roots; whichever instance a client points at
-//! becomes the gateway. Three rules govern everything here:
+//! Any instance with `[peers.<host>]` URLs can proxy calls addressing a
+//! peer's roots; whichever instance a client points at becomes the
+//! gateway. Three rules govern everything here:
 //!
-//! - **Identity survives the hop (PD-4).** A call is proxied with the
-//!   *caller's* token for that backend, never a shared gateway credential.
-//!   No token for that (peer, author) pair → refuse, don't substitute.
+//! - **Identity survives the hop (PD-4, PD-10).** A call is proxied under
+//!   the caller's own *declared name*, forwarded verbatim — the gateway
+//!   holds no credential of its own, so there is nothing it could
+//!   substitute. A peer that declines the forwarded name answers
+//!   `identity_refused`, which is data, not an outage.
 //! - **Passthrough is verbatim (D-3).** Arguments go out byte-for-byte and
 //!   results come back untouched; the one addition is a top-level `root`
 //!   tag on proxied *error* objects, so fan-out consumers can attribute
@@ -26,7 +28,7 @@ use rmcp::service::{RoleClient, RunningService, ServiceError};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -80,43 +82,8 @@ pub fn pattern_admits_host(pattern: &str, host: &str) -> bool {
     }
 }
 
-/// The resolved (peer host, author) → bearer token table, swappable behind
-/// a lock so SIGHUP can rotate peer credentials without a restart — the
-/// same shape, and the same reason, as the inbound identity table (#914).
-pub struct PeerTokens {
-    map: RwLock<BTreeMap<(String, String), String>>,
-}
-
-impl PeerTokens {
-    pub fn new(map: BTreeMap<(String, String), String>) -> Self {
-        Self {
-            map: RwLock::new(map),
-        }
-    }
-
-    /// Re-read every peer token from its configured source.
-    pub fn reload(&self, peers: &[Peer]) {
-        let fresh = crate::config::resolve_peer_tokens(peers);
-        *self.map.write().expect("peer token lock never poisoned") = fresh;
-    }
-
-    fn get(&self, peer: &str, author: &str) -> Option<String> {
-        self.map
-            .read()
-            .expect("peer token lock never poisoned")
-            .get(&(peer.to_string(), author.to_string()))
-            .cloned()
-    }
-}
-
 struct CachedSession {
     svc: Arc<Session>,
-    /// The legacy token this session was built with, if any. A SIGHUP that
-    /// changes it makes the session stale and checkout rebuilds (010 D-2).
-    /// `None` once the transition window is closed — the forwarded
-    /// identity is part of the session's key, not its credential, so there
-    /// is nothing left here to go stale.
-    token: Option<String>,
 }
 
 /// What this process has *observed* about one peer — never persisted, and
@@ -134,22 +101,21 @@ pub struct PeerSight {
 }
 
 /// The declared fleet plus everything needed to route to it: session pool,
-/// per-author peer credentials, observed health.
+/// observed health. No credentials — since 023 the gateway forwards the
+/// caller's declared name and holds nothing of its own.
 pub struct Peers {
     this_host: String,
     /// `None` = no `[peers]` table — never-declared, not an empty fleet.
     declared: Option<Vec<Peer>>,
-    tokens: Arc<PeerTokens>,
     sessions: tokio::sync::Mutex<HashMap<(String, String), CachedSession>>,
     sight: RwLock<HashMap<String, PeerSight>>,
 }
 
 impl Peers {
-    pub fn new(this_host: String, declared: Option<Vec<Peer>>, tokens: Arc<PeerTokens>) -> Self {
+    pub fn new(this_host: String, declared: Option<Vec<Peer>>) -> Self {
         Self {
             this_host,
             declared,
-            tokens,
             sessions: tokio::sync::Mutex::new(HashMap::new()),
             sight: RwLock::new(HashMap::new()),
         }
@@ -170,10 +136,6 @@ impl Peers {
     pub fn routable(&self, host: &str) -> Option<&Peer> {
         self.find(host)
             .filter(|p| p.status != PeerStatus::Deferred && p.url.is_some())
-    }
-
-    pub fn token_for(&self, peer_host: &str, author: &str) -> Option<String> {
-        self.tokens.get(peer_host, author)
     }
 
     pub fn sight_of(&self, host: &str) -> PeerSight {
@@ -225,15 +187,13 @@ impl Peers {
         arguments: Option<JsonObject>,
         root: Option<&str>,
     ) -> Result<CallToolResult, KaedError> {
-        // No credential to look up since 023: the caller's declared name
-        // IS what goes to the peer. A legacy peer token, while one
-        // survives the transition window, rides along beside the header.
-        let token = self.token_for(&peer.host, author);
+        // No credential at all: the caller's declared name IS what goes to
+        // the peer (023 D-3), and since 024 there is nothing else to send.
         // One retry, and only for failures provably before the peer
         // processed anything: session establishment, or the transport
         // closing on send. An in-flight failure is never replayed (D-8).
         for attempt in 0..2 {
-            let svc = self.checkout(peer, author, token.as_deref()).await?;
+            let svc = self.checkout(peer, author).await?;
             let params = CallToolRequestParams::new(tool.to_string())
                 .with_arguments(arguments.clone().unwrap_or_default());
             match tokio::time::timeout(CALL_TIMEOUT, svc.call_tool(params)).await {
@@ -285,18 +245,11 @@ impl Peers {
         Ok(payload)
     }
 
-    async fn checkout(
-        &self,
-        peer: &Peer,
-        author: &str,
-        token: Option<&str>,
-    ) -> Result<Arc<Session>, KaedError> {
+    async fn checkout(&self, peer: &Peer, author: &str) -> Result<Arc<Session>, KaedError> {
         let key = (peer.host.clone(), author.to_string());
         {
             let sessions = self.sessions.lock().await;
-            if let Some(cached) = sessions.get(&key)
-                && cached.token.as_deref() == token
-            {
+            if let Some(cached) = sessions.get(&key) {
                 return Ok(cached.svc.clone());
             }
         }
@@ -319,12 +272,8 @@ impl Peers {
             }
             Err(_) => return Err(self.unforwardable_identity(peer, author)),
         }
-        let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
+        let config = StreamableHttpClientTransportConfig::with_uri(url.to_string())
             .custom_headers(custom_headers);
-        // Legacy, and only while a peer token row survives (D-2).
-        if let Some(token) = token {
-            config = config.auth_header(token);
-        }
         let transport = StreamableHttpClientTransport::from_config(config);
         let mut info = ClientInfo::default();
         info.protocol_version = PEER_PROTOCOL_VERSION;
@@ -351,13 +300,10 @@ impl Peers {
                 .and_then(|pi| pi.server_info.as_ref().map(|si| si.version.to_string())),
         );
         let svc = Arc::new(svc);
-        self.sessions.lock().await.insert(
-            key,
-            CachedSession {
-                svc: svc.clone(),
-                token: token.map(str::to_owned),
-            },
-        );
+        self.sessions
+            .lock()
+            .await
+            .insert(key, CachedSession { svc: svc.clone() });
         Ok(svc)
     }
 
@@ -504,8 +450,9 @@ impl Peers {
 /// transport's error chain. rmcp's streamable HTTP client surfaces both as
 /// `AuthRequired` ("Auth required"); the string forms are a fallback for
 /// other layers. Misclassifying auth-rejection as unreachable would send
-/// whoever reads the error to debug the network instead of rotating the
-/// token, so this is matched before any `host_unreachable` verdict.
+/// whoever reads the error to debug the network instead of fixing the
+/// backend's allow-list, so this is matched before any `host_unreachable`
+/// verdict.
 fn looks_like_auth_rejection(detail: &str) -> bool {
     detail.contains("Auth required")
         || detail.contains("401")
