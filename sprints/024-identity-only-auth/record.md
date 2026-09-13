@@ -164,3 +164,63 @@ Windows and was holding a live klams bearer until this change.
   also needs its target's `base` version, so the proof scripts' cleanup step
   failed and the files were removed by hand. Not a defect — worth one line so
   the next raw JSON-RPC script does not re-learn it.
+
+## Deployed
+
+**`0.1.0-d1cc186`** — published from committed `main` (squash `d1cc186`, PR #29)
+to the package store, then installed from that artifact on **kai, kubs0 and
+kubsdb** on 2026-09-13, in that order.
+
+### Pre-restart control, per host — D-1's one risk
+
+The overseer's clearance asked for `kaed check-config` on each host immediately
+before its restart. Run, and **exit 0 on all three** — but that is not the check
+that covers D-1, and it is worth saying so: run with the *old* binary it cannot
+detect a retired field, because the old binary accepts them. The control that
+does cover it is the same text scan the new guard performs, and it reported
+**0 matches in code and 0 in comments on all three hosts**. The positive control
+was run beforehand against a pre-024 config derived from kai's, where the guard
+refused and named only `token_file`.
+
+### Verified live, after the restarts
+
+| host | installed | `kaed --version` | unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0-d1cc186` | match | active | `0.1.0 (d1cc186 2026-09-12)` |
+| kubs0 | `0.1.0-d1cc186` | match | active | `0.1.0 (d1cc186 2026-09-12)` |
+| kubsdb | `0.1.0-d1cc186` | match | active | `0.1.0 (d1cc186 2026-09-12)` |
+
+What this sprint actually changed, smoke-tested against the deployed fleet
+rather than inferred from the unit being up:
+
+- **The three 401 shapes.** A stale bearer with no name returns 401 and the body
+  names the retirement and the header to send; an unknown declared name returns
+  401 and is not downgraded; no credential returns 401. D-2 is live.
+- **The Copilot identities survive the restart** — `ghcp-kai`, `ghcp-kubs0` and
+  `ghcp-cleo` all 200 against the deployed binary.
+- **`roots` through kai's gateway reaches all three hosts**, all `active`, under
+  a declared name, with an unknown-name control at 401.
+- **A proxied write still lands with no credential anywhere** — the check this
+  sprint's deletion most deserved, since `checkout` lost its `token` parameter
+  and its `auth_header` call. An `edit` to `kubs0:scratch` through kai's gateway
+  applied in 1.1s and kubs0's journal recorded `author=claude-kai, node=kai`.
+
+Nothing on cleo was stopped, restarted or killed.
+
+### Found by the post-deploy verification, filed not repaired
+
+**korg #2537** — kaed's peer client panics a tokio worker on every outbound
+connection attempt (`No CA certificates were loaded from the system`, inside
+rmcp's `from_config`). It retries and succeeds, so routing is correct and every
+check above passed; the cost is **100k+ panic lines per host** and a 10× latency
+spread on `roots`: **3.0s on kai against 30.0s on kubs0**, measured with the
+panic lines emitted during each call counted.
+
+It predates 024 — earliest occurrence 2026-09-12 17:24:52 PDT, inside sprint
+023's build window and before either of 024's restarts. The CA bundle is
+*present* on all three hosts, so it is not a missing package, which is what
+makes it a decision rather than a repair: the fix is either kaed pinning its own
+TLS root store (a dependency-surface and security-posture change) or the
+systemd user unit's environment (k-homelab's recipe). The item names both
+owners, and notes the thing not to assume — that some attempts clearly do get a
+working client, or nothing would work at all.
