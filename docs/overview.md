@@ -242,12 +242,18 @@ The sprints so far:
   stream that makes "has any agent ever seen this token?" answerable.
   Revealing plaintext is deliberately a separate, always-journaled tool.
 
-Sprints 012–022 are not summarised here yet — write-side leak detection, a
+Sprints 012–024 are not summarised here yet — write-side leak detection, a
 third host, legible OS permissions, the MCP protocol revision, per-host client
-identities, rotation grace windows, and two passes of feedback triage. Each
-has its own record under
+identities, and two passes of feedback triage. Each has its own record under
 [`sprints/`](../sprints/), which is the authority; this list is a narrative
 and it lags.
+
+Two of those cancelled each other out, which is worth knowing before reading
+the older records: sprint 019 built rotation grace windows for the bearer
+tokens, and **sprints 023–024 deleted the bearer entirely** in favour of a
+declared identity. There is no credential to rotate, so none of that machinery
+still exists. Making nine credentials legible enough to count is what argued
+for getting rid of them.
 
 One of them is worth naming here, because this section used to hold it as an
 ambition: **the feedback loop closed.** Sprint 017 built a reader for the
