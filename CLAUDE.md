@@ -54,10 +54,11 @@ MCP server so remote agents (primarily Desktop Claude on cleo) get verified
 writes, atomic multi-file transactions, staleness detection, and a durable
 attributed journal on each host that runs it (today: kai, kubs0, kubsdb).
 
-**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–022):
+**Status: v0 live on kai + kubs0 + kubsdb** (sprints 001–024):
 `roots`/`stat`/`list`/`read`/`search`/`edit` plus
-`journal`/`diff`/`revert`/`feedback` over streamable HTTP with bearer
-auth, serving **MCP `2026-07-28`** fleet-wide since 016 (`0.1.0-af51376`) —
+`journal`/`diff`/`revert`/`feedback` over streamable HTTP with
+**identity-only auth** (declared name; no bearer exists since 024),
+serving **MCP `2026-07-28`** fleet-wide since 016 (`0.1.0-af51376`) —
 see the protocol bullet below. kubsdb joined in 013 after two sprints deferred (korg #929) — see
 the 013 bullet below for its access model. The fleet installs a
 published bundle from the package store (005) — **no host but kai has a
@@ -341,13 +342,10 @@ fails, and what the journal structurally cannot tell you — see
   name is refused, because authenticating a caller as something it did not
   claim to be is worse than refusing it; whitespace is not a declaration and
   does fall through);
-  **the transition window IS the token rows** (D-2 — no flag; deleting an
-  identity's `token_file` closes it, and startup warns naming every identity
-  still holding one);
-  **`prev_token_file` and `[peers.*.tokens]` are still PARSED** (D-2 —
-  `deny_unknown_fields` plus `install.sh` never rewriting a config means
-  deleting a field from the struct would be a fleet-wide failure to start;
-  the cutover removes them from the files, the binary never does);
+  **the transition window WAS the token rows and is now closed** (D-2 — it
+  was never a flag; 024 deleted the rows from the structs, so don't go
+  looking for `token_file`, `token_env`, `prev_token_file` or
+  `[peers.*.tokens]` — see the 024 bullet);
   **an identity outlives its token** (D-6 — `resolve_identities` used to drop
   an identity whose token would not resolve, which under declared identity
   would have deleted every agent at the moment the cutover removed the files);
@@ -368,6 +366,41 @@ fails, and what the journal structurally cannot tell you — see
   says `/etc/klams` does **not** become a kaed root — measured, kaed runs as
   `ken` and cannot read it at all, so the root would promise a redaction the
   OS refuses first.
+- **The bearer path is GONE since 024** (`sprints/024-identity-only-auth/
+  decisions.md`; korg #2471, #2490, slice 7.7 of program 2440). A declared
+  name is the only credential: `token_eq`, `Identity.token`,
+  `AuthEntry.{token_env,token_file,prev_token_file}`, `PeerConfig.tokens`,
+  `PeerTokenEntry`, `resolve_peer_tokens`, `fleet::PeerTokens`,
+  `Peers::token_for` and `AuthState.{peer_tokens,peers_spec}` are all
+  deleted — don't go looking. Four things not to re-derive:
+  **a config still naming a retired field will NOT start, and that is the
+  design** (D-1 — `deny_unknown_fields` plus `install.sh` never rewriting a
+  config means a surviving credential row would otherwise be invisible;
+  `config::retired_fields` scans the raw text *before* serde so the refusal
+  names the field, the sprint and the fix, and it strips comments and matches
+  longest-first because `prev_token_file` contains `token_file` — both
+  pinned by test, and `deploy/config.example.toml` passing `check-config` is
+  the live proof of the comment case);
+  **`Authorization` is still READ, for the 401 diagnostic only** (D-2 — it
+  authenticates nothing; an `Authorization` header with no name is a third
+  401 case whose body names the header to send and the one to drop, because
+  three Copilot configs sat silently 401 for a day and "sent a retired
+  credential" was indistinguishable from "sent nothing". The challenge still
+  says `Bearer` because a 401 MUST carry `WWW-Authenticate` and no
+  registered scheme describes declaring a name);
+  **Copilot is `ghcp-<host>` and klams's bare `ghcp` is NOT a conflict**
+  (D-3 + the PD-7 addendum — measured: Claude Code declares `claude` to
+  klams from every host and `claude-<host>` to kaed, because klams names the
+  *application* and kaed names the **machine**. 023's node field does not
+  make the per-host name redundant: a proxied call resolves to the
+  *gateway's* node, verified live as `author=ghcp-kubs0, node=kai`, so the
+  author name is the only thing distinguishing a Copilot edit from kubs0
+  from one from cleo. **korg:2470 therefore needs a per (service, host)
+  identity value**, not one per host);
+  and **SIGHUP survives and now changes nothing** (D-4 — kept because it is
+  a documented signal in an *installed* unit file; every `[auth]`,
+  `[whois]` and `[peers]` change is a restart, and the test pins that a
+  reload neither drops an identity nor invents one).
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

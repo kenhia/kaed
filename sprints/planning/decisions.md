@@ -323,6 +323,21 @@ different.)*
 A backend must list authors that never dial it, because they arrive proxied.
 That remains true and is now the *only* configuration the gateway adds.
 
+*(Addendum, 2026-09-12, sprint 024. The grain held for a **second agent**:
+GitHub Copilot got `ghcp-kai` / `ghcp-kubs0` / `ghcp-cleo`, not a shared
+`ghcp`. Two things settled with it. First, **023's node field does not make
+the per-host name redundant** — a proxied call resolves to the *gateway's*
+node (023 D-5), so kubs0's journal records `node = kai` for a Copilot edit
+whether it came from kubs0 or from cleo, and the author name is the only
+thing that tells them apart. Second, **klams chose a single bare `ghcp` and
+that is not a conflict to reconcile**: measured on the fleet, Claude Code
+already declares `claude` to klams from every host and `claude-<host>` to
+kaed. klams's roster is per-grant, so it names the *application*; kaed's
+question is which machine edited a file, so it names the **machine**. A
+client legitimately declares different names to different services, and
+anything rendering these client configs — korg:2470 — must carry a per
+(service, host) value rather than one identity per host.)*
+
 ---
 
 ## PD-8 — Root a scratch directory where one exists and is used; never invent one

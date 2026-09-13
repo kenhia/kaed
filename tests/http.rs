@@ -10,7 +10,6 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde_json::{Value, json};
 
-const TOKEN: &str = "test-token-claude";
 /// This instance's fleet name, and therefore the prefix on every root name
 /// it serves. Roots have been host-qualified since sprint 007.
 const HOST: &str = "testhost";
@@ -30,7 +29,6 @@ async fn start_server() -> anyhow::Result<TestServer> {
         std::collections::BTreeMap::new(),
         vec![Identity {
             author: "claude".into(),
-            token: Some(TOKEN.into()),
             nodes: std::sync::Arc::new(Vec::new()),
         }],
     )
@@ -131,9 +129,16 @@ async fn connect_at(
     server: &TestServer,
     protocol_version: ProtocolVersion,
 ) -> anyhow::Result<rmcp::service::RunningService<rmcp::RoleClient, ClientInfo>> {
+    // The client declares a name, exactly as every real client does since
+    // the cutover — there is no bearer to send.
+    let mut headers = std::collections::HashMap::new();
+    headers.insert(
+        http::HeaderName::from_static(kaed::server::AGENT_HEADER),
+        http::HeaderValue::from_static("claude"),
+    );
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", server.addr))
-            .auth_header(TOKEN),
+            .custom_headers(headers),
     );
     let mut info = ClientInfo::default();
     info.protocol_version = protocol_version;
@@ -152,7 +157,7 @@ fn args(v: Value) -> serde_json::Map<String, Value> {
 }
 
 #[tokio::test]
-async fn rejects_missing_and_bad_tokens() -> anyhow::Result<()> {
+async fn rejects_a_missing_and_an_unknown_credential() -> anyhow::Result<()> {
     let server = start_server().await?;
     let http = reqwest::Client::new();
     let url = format!("http://{}/mcp", server.addr);
@@ -165,36 +170,42 @@ async fn rejects_missing_and_bad_tokens() -> anyhow::Result<()> {
         .to_string();
     assert_eq!(challenge, "Bearer realm=\"kaed\"");
 
-    let bad = http
+    // A bearer is self-describing in the header and the body both, and what
+    // it describes since 024 is that bearers are gone: clients otherwise
+    // render a bare 401 as "token expired", and kaed has no expiry.
+    let stale = http
         .post(&url)
         .header("authorization", "Bearer wrong-token")
         .body("{}")
         .send()
         .await?;
-    assert_eq!(bad.status(), 401);
-    // a wrong token *is* self-describing, in the header and the body both —
-    // clients otherwise render a bare 401 as "token expired", and kaed has
-    // no expiry to go looking for
-    let challenge = bad.headers()[reqwest::header::WWW_AUTHENTICATE]
+    assert_eq!(stale.status(), 401);
+    let challenge = stale.headers()[reqwest::header::WWW_AUTHENTICATE]
         .to_str()?
         .to_string();
     assert!(challenge.contains("error=\"invalid_token\""), "{challenge}");
-    assert!(challenge.contains("do not expire"), "{challenge}");
-    assert!(bad.text().await?.contains("do not expire"));
+    assert!(
+        challenge.contains("no longer accepts bearer tokens"),
+        "{challenge}"
+    );
+    assert!(
+        stale
+            .text()
+            .await?
+            .contains("no longer accepts bearer tokens")
+    );
 
     server.ct.cancel();
     Ok(())
 }
 
-/// 023 D-1, the ordering contract, end to end over real HTTP.
-///
-/// Three assertions, and the middle one is the one that matters: a
-/// *declared* name that is not on the allow-list must be **refused**, not
-/// quietly downgraded to the bearer path. A fallthrough would authenticate
-/// the caller as something it did not claim to be, which is the least
-/// honest outcome available and exactly what the identity model is for.
+/// 023 D-1 end to end over real HTTP, in the form it takes once the bearer
+/// path is gone (024): the declared name is the whole credential, and an
+/// unknown name is refused rather than downgraded — there is no longer
+/// anything to downgrade TO, which is what makes the rule structural
+/// instead of a code-ordering discipline.
 #[tokio::test]
-async fn a_declared_identity_beats_a_bearer_and_an_unknown_name_never_falls_through()
+async fn a_declared_identity_is_the_only_credential_and_an_unknown_name_is_refused()
 -> anyhow::Result<()> {
     let server = start_server().await?;
     let http = reqwest::Client::new();
@@ -217,19 +228,22 @@ async fn a_declared_identity_beats_a_bearer_and_an_unknown_name_never_falls_thro
     // The declared name alone is a credential (400-something from the MCP
     // layer means it got past auth; 401 means it did not).
     assert_ne!(probe(Some("claude"), None).await?, 401);
-    // The legacy bearer still works while the window is open.
-    assert_ne!(probe(None, Some(TOKEN)).await?, 401);
-    // Both together: legal mid-cutover, and the identity wins.
-    assert_ne!(probe(Some("claude"), Some(TOKEN)).await?, 401);
+    // A bearer is not a credential at all since 024 — there is nothing on
+    // the server to compare it against, so any token is simply ignored.
+    assert_eq!(probe(None, Some("test-token-claude")).await?, 401);
+    // A token riding along beside a known name changes nothing.
+    assert_ne!(probe(Some("claude"), Some("test-token-claude")).await?, 401);
 
-    // An unknown name is refused even when a VALID bearer rides along.
+    // An unknown name is refused, with or without a token beside it.
     assert_eq!(
-        probe(Some("mallory"), Some(TOKEN)).await?,
+        probe(Some("mallory"), Some("test-token-claude")).await?,
         401,
-        "a declared name must never fall through to the bearer path"
+        "a declared name must never fall through to anything else"
     );
-    // Whitespace is not a declaration, so this is the bearer's call.
-    assert_ne!(probe(Some("   "), Some(TOKEN)).await?, 401);
+    assert_eq!(probe(Some("mallory"), None).await?, 401);
+    // Whitespace is not a declaration, and there is no longer a bearer for
+    // it to fall through TO — so it is simply no credential.
+    assert_eq!(probe(Some("   "), Some("test-token-claude")).await?, 401);
     assert_eq!(probe(Some("   "), None).await?, 401);
     assert_eq!(probe(None, None).await?, 401);
 
@@ -240,9 +254,13 @@ async fn a_declared_identity_beats_a_bearer_and_an_unknown_name_never_falls_thro
 /// The 401 body says which of the three things is wrong, because each
 /// needs a different fix. cleo's client once rendered a bare 401 as "token
 /// expired" and sent a live test hunting for a TTL kaed has never had.
+///
+/// Since 024 the middle case is a client that still sends a **bearer and no
+/// name** — the exact shape three Copilot configs sat in, silently, for a
+/// day (WI 2490). The body names the header to send and the one to drop.
 #[tokio::test]
-async fn the_401_distinguishes_an_unknown_name_from_a_bad_token_from_neither() -> anyhow::Result<()>
-{
+async fn the_401_distinguishes_an_unknown_name_from_a_stale_bearer_from_neither()
+-> anyhow::Result<()> {
     let server = start_server().await?;
     let http = reqwest::Client::new();
     let url = format!("http://{}/mcp", server.addr);
@@ -257,7 +275,7 @@ async fn the_401_distinguishes_an_unknown_name_from_a_bad_token_from_neither() -
         .await?;
     assert!(unknown_name.contains("X-Homelab-Agent"), "{unknown_name}");
 
-    let bad_token = http
+    let stale_bearer = http
         .post(&url)
         .header("authorization", "Bearer nope")
         .body("{}")
@@ -265,41 +283,37 @@ async fn the_401_distinguishes_an_unknown_name_from_a_bad_token_from_neither() -
         .await?
         .text()
         .await?;
-    assert!(bad_token.contains("do not expire"), "{bad_token}");
+    assert!(
+        stale_bearer.contains("no longer accepts bearer tokens"),
+        "{stale_bearer}"
+    );
+    assert!(stale_bearer.contains("X-Homelab-Agent"), "{stale_bearer}");
 
     let nothing = http.post(&url).body("{}").send().await?.text().await?;
     assert!(nothing.contains("X-Homelab-Agent"), "{nothing}");
-    assert!(!nothing.contains("do not expire"), "{nothing}");
+    assert!(
+        !nothing.contains("no longer accepts bearer"),
+        "a client that sent nothing is not a client that sent a token: {nothing}"
+    );
 
     server.ct.cancel();
     Ok(())
 }
 
-/// Closing the transition window is a config edit, not a code change
-/// (D-2): delete the token and the bearer stops working, with the declared
-/// name unaffected. Reload does the token half in place; the allow-list
-/// itself is config shape and still needs a restart (018 D-3).
+/// SIGHUP survives the bearer's deletion, and what it must NOT do is
+/// change who may connect: the allow-list is config *shape*, captured at
+/// startup (018 D-3), so a reload re-resolves the same names and a restart
+/// is still the only way to add or remove one. The symptom of forgetting
+/// that is a 401 read as a wrong credential — which is now the only kind
+/// of 401 there is, so this stays pinned.
 #[tokio::test]
-async fn deleting_the_token_closes_the_window_for_that_identity() -> anyhow::Result<()> {
-    let secrets = tempfile::tempdir()?;
-    let current = secrets.path().join("claude.token");
-    std::fs::write(&current, "token-v1\n")?;
-
+async fn a_reload_re_resolves_the_allow_list_and_cannot_change_it() -> anyhow::Result<()> {
     let mut spec = std::collections::BTreeMap::new();
-    spec.insert(
-        "claude".to_string(),
-        AuthEntry {
-            token_env: None,
-            token_file: Some(current.display().to_string()),
-            prev_token_file: None,
-            nodes: Vec::new(),
-        },
-    );
+    spec.insert("claude".to_string(), AuthEntry { nodes: Vec::new() });
     let server = start_server_with(
         spec,
         vec![Identity {
             author: "claude".into(),
-            token: Some("token-v1".into()),
             nodes: std::sync::Arc::new(Vec::new()),
         }],
     )
@@ -307,22 +321,11 @@ async fn deleting_the_token_closes_the_window_for_that_identity() -> anyhow::Res
 
     let http = reqwest::Client::new();
     let url = format!("http://{}/mcp", server.addr);
-    let by_token = || {
-        let (http, url) = (http.clone(), url.clone());
+    let by_name = |name: &str| {
+        let (http, url, name) = (http.clone(), url.clone(), name.to_string());
         async move {
             http.post(&url)
-                .header("authorization", "Bearer token-v1")
-                .body("{}")
-                .send()
-                .await
-                .map(|r| r.status())
-        }
-    };
-    let by_name = || {
-        let (http, url) = (http.clone(), url.clone());
-        async move {
-            http.post(&url)
-                .header("x-homelab-agent", "claude")
+                .header("x-homelab-agent", name)
                 .body("{}")
                 .send()
                 .await
@@ -330,18 +333,20 @@ async fn deleting_the_token_closes_the_window_for_that_identity() -> anyhow::Res
         }
     };
 
-    assert_ne!(by_token().await?, 401, "the window is open");
-    assert_ne!(by_name().await?, 401);
+    assert_ne!(by_name("claude").await?, 401);
+    assert_eq!(by_name("newcomer").await?, 401);
 
-    // The cutover: the token file goes away. No restart.
-    std::fs::remove_file(&current)?;
     server.auth.reload();
 
-    assert_eq!(by_token().await?, 401, "the window is closed");
     assert_ne!(
-        by_name().await?,
+        by_name("claude").await?,
         401,
-        "the identity must OUTLIVE its retired token — it is the credential now"
+        "a reload must not drop an identity it re-resolved"
+    );
+    assert_eq!(
+        by_name("newcomer").await?,
+        401,
+        "and must not invent one either — adding a name is a RESTART"
     );
 
     server.ct.cancel();
@@ -440,7 +445,7 @@ async fn raw_post_with(
 ) -> anyhow::Result<(Option<String>, Value)> {
     let mut req = reqwest::Client::new()
         .post(format!("http://{}/mcp", server.addr))
-        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("x-homelab-agent", "claude")
         .header("accept", "application/json, text/event-stream")
         .header("content-type", "application/json");
     for (name, value) in headers {

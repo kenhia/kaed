@@ -112,9 +112,9 @@ path = "/home/ken"
 description = "everything under ~"
 
 [auth]
-# token -> author identity; values come from the env, not this file
-claude = { token_env = "KAED_TOKEN_CLAUDE" }
-ghcp   = { token_env = "KAED_TOKEN_GHCP" }
+# an allow-list of declared names (R13); no credential, here or anywhere
+claude-kai = {}
+ghcp-kai   = {}
 
 [limits]
 max_read_bytes = 262144

@@ -1,4 +1,4 @@
-//! MCP wiring: tool registration, bearer auth, streamable HTTP.
+//! MCP wiring: tool registration, identity auth, streamable HTTP.
 //!
 //! This layer stays thin — params in, one call into fsops/search/txn,
 //! result or `KaedError` out. Failures the agent should see are `isError`
@@ -6,10 +6,12 @@
 //! structured content, with a text fallback); protocol-level `Err` is
 //! reserved for infrastructure breakage.
 //!
-//! Auth is an axum middleware in front of the MCP service: a bearer token
-//! resolves to an author identity or the request dies 401. The author
-//! rides the request extensions into tool handlers, so every journal
-//! entry is attributed. No anonymous mutation.
+//! Auth is an axum middleware in front of the MCP service: the caller's
+//! declared `X-Homelab-Agent` name resolves to an author identity on this
+//! host's allow-list, or the request dies 401 (023 PD-10; the bearer path
+//! it replaced is gone since 024). The author rides the request extensions
+//! into tool handlers, so every journal entry is attributed. No anonymous
+//! mutation.
 
 use crate::config::{
     self, AuthEntry, Identity, Limits, Peer, PeerStatus, Resolved, ResolvedRoot, ResolvedSecrets,
@@ -2374,12 +2376,6 @@ pub struct AuthState {
     identities: RwLock<Vec<Identity>>,
     /// Where the tokens live, so a reload can go back and re-read them.
     spec: BTreeMap<String, AuthEntry>,
-    /// The outbound half: this instance's credentials *for its peers*,
-    /// shared with `fleet::Peers` so proxy sessions see rotations.
-    /// Retired in 023 and empty after the cutover — kept while the
-    /// transition window holds.
-    peer_tokens: Arc<fleet::PeerTokens>,
-    peers_spec: Vec<Peer>,
     /// `None` = whois disabled; every request records `unknown` (023).
     whois: Option<Arc<dyn crate::whois::NodeResolver>>,
     /// `[whois] enforce`. Off by default (D-5).
@@ -2387,37 +2383,26 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    /// Re-read the identity allow-list, and any legacy tokens still beside
-    /// it, from the config spec. Env-var tokens come back unchanged — a
-    /// process cannot re-read its own `EnvironmentFile`, so those still
-    /// need a restart.
+    /// Re-read the identity allow-list from the config spec.
     ///
     /// Since 023 a reload cannot *remove* an identity or add one: the spec
     /// is captured at startup (018 D-3) and the allow-list is config
     /// shape, not file contents. Changing who may connect is still a
     /// restart, and the symptom of forgetting remains a 401 that reads
-    /// like a wrong credential.
+    /// like a wrong credential. With the bearer path gone (024) there is
+    /// nothing left for a reload to re-read from disk at all — it is kept
+    /// because SIGHUP is a documented signal and dropping it silently
+    /// would be a contract change, not a cleanup.
     pub fn reload(&self) {
-        self.peer_tokens.reload(&self.peers_spec);
         let fresh = config::resolve_identities(&self.spec);
         if fresh.is_empty() {
             tracing::error!("reload resolved no identities; keeping the current set");
             return;
         }
         let authors: Vec<&str> = fresh.iter().map(|i| i.author.as_str()).collect();
-        tracing::info!(identities = ?authors, "reloaded auth tokens");
+        tracing::info!(identities = ?authors, "reloaded the identity allow-list");
         *self.identities.write().expect("auth lock never poisoned") = fresh;
     }
-}
-
-/// Constant-time token comparison; length is the only thing an attacker
-/// can learn. Legacy: only the transition window still reaches it.
-fn token_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len()
-        && a.bytes()
-            .zip(b.bytes())
-            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-            == 0
 }
 
 /// How a caller declares who it is (023). The fleet-wide spelling, shared
@@ -2436,11 +2421,11 @@ async fn auth_middleware(
     mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    // Order is the contract (D-1). A *declared* name is checked first and,
-    // if it is not on the allow-list, the request dies there — it does not
-    // fall through to the bearer path. The caller said who it was and was
-    // wrong; silently authenticating it as something else would be the
-    // least honest outcome available.
+    // A *declared* name is the only credential since 024. 023 D-1 made it
+    // beat the bearer and never fall through to it; with the bearer path
+    // deleted the rule survives as the whole of the check — an unknown name
+    // is refused, because authenticating a caller as something it did not
+    // claim to be was never the honest outcome.
     let declared = req
         .headers()
         .get(AGENT_HEADER)
@@ -2449,48 +2434,32 @@ async fn auth_middleware(
         .filter(|d| !d.is_empty())
         .map(str::to_owned);
 
-    let bearer = req
-        .headers()
-        .get(http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::to_owned);
+    // Read for the DIAGNOSTIC only (024 D-2). This authenticates nothing:
+    // a bearer cannot identify a caller here any more, and the sole reason
+    // to notice one is that "still sending a token" is the likeliest way a
+    // client is broken after the cutover — and the failure that went a day
+    // unnoticed on three Copilot configs (WI 2490). Naming it in the 401 is
+    // what makes that self-diagnosing instead of a silent outage.
+    let had_bearer = req.headers().contains_key(http::header::AUTHORIZATION);
 
     let resolved = {
         let identities = auth.identities.read().expect("auth lock never poisoned");
-        match &declared {
-            Some(name) => identities
+        declared.as_ref().and_then(|name| {
+            identities
                 .iter()
                 .find(|i| &i.author == name)
-                .map(|i| (i.author.clone(), i.nodes.clone())),
-            None => bearer.as_deref().and_then(|token| {
-                identities
-                    .iter()
-                    .find(|i| i.token.as_deref().is_some_and(|t| token_eq(t, token)))
-                    .map(|i| (i.author.clone(), i.nodes.clone()))
-            }),
-        }
+                .map(|i| (i.author.clone(), i.nodes.clone()))
+        })
     };
 
     let Some((author, pinned_nodes)) = resolved else {
         tracing::warn!(
             declared = ?declared,
-            presented_bearer = bearer.is_some(),
+            presented_bearer = had_bearer,
             "401: no identity for the presented credential"
         );
-        return unauthorized(declared.is_some(), bearer.is_some());
+        return unauthorized(declared.is_some(), had_bearer);
     };
-
-    if declared.is_some() && bearer.is_some() {
-        // Not an error — a client mid-cutover legitimately sends both, and
-        // refusing would break the window this release exists to hold open.
-        // Worth one line, because "is this client off the token yet?" is
-        // the question the cutover is answering.
-        tracing::info!(
-            author,
-            "client sent both an identity and a bearer; the identity won"
-        );
-    }
 
     // Record-only unless pinning is on and this identity declares nodes.
     let peer_ip = req
@@ -2538,15 +2507,22 @@ async fn auth_middleware(
 /// had. The description goes in the header *and* the body, so a client
 /// that surfaces either one stops guessing.
 ///
-/// Three cases since 023, because they need three different fixes: a name
-/// that is not on the allow-list, a token that matches nothing, and no
-/// credential at all. Per §3.1 the last gets the challenge without an
-/// error code — there is nothing invalid to describe, and the client may
-/// simply not have known auth was needed.
-fn unauthorized(declared_name: bool, had_token: bool) -> Response {
+/// Three cases, because they need three different fixes: a name that is
+/// not on the allow-list, a **bearer token and no name** — the shape of a
+/// client that missed the cutover, which is worth saying out loud (024
+/// D-2) — and no credential at all. Per §3.1 the last gets the challenge
+/// without an error code: there is nothing invalid to describe, and the
+/// client may simply not have known auth was needed.
+///
+/// The challenge still names the `Bearer` scheme. Nothing here accepts a
+/// bearer, but a 401 MUST carry `WWW-Authenticate` (RFC 9110 §15.5.2) and
+/// no registered scheme describes "declare a name in a header" — so the
+/// scheme is the envelope and `error_description` carries the truth.
+fn unauthorized(declared_name: bool, had_bearer: bool) -> Response {
     const UNKNOWN_NAME: &str = "X-Homelab-Agent names no configured identity on this host; \
-         a declared name is never silently downgraded to the bearer";
-    const NO_EXPIRY: &str = "token matches no configured identity; kaed tokens do not expire";
+         a declared name is never silently downgraded to anything else";
+    const BEARER_RETIRED: &str = "kaed no longer accepts bearer tokens (sprint 024): send \
+         X-Homelab-Agent: <your identity> instead, and drop the Authorization header";
     let (challenge, body) = if declared_name {
         (
             format!(
@@ -2554,12 +2530,12 @@ fn unauthorized(declared_name: bool, had_token: bool) -> Response {
             ),
             format!("unauthorized: {UNKNOWN_NAME}\n"),
         )
-    } else if had_token {
+    } else if had_bearer {
         (
             format!(
-                "Bearer realm=\"kaed\", error=\"invalid_token\", error_description=\"{NO_EXPIRY}\""
+                "Bearer realm=\"kaed\", error=\"invalid_token\", error_description=\"{BEARER_RETIRED}\""
             ),
-            format!("unauthorized: {NO_EXPIRY}\n"),
+            format!("unauthorized: {BEARER_RETIRED}\n"),
         )
     } else {
         (
@@ -2602,21 +2578,10 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
         );
     }
 
-    // Peer credentials resolve once here and re-resolve on SIGHUP; the
-    // same Arc feeds both the reload handle and the routing layer, so a
-    // rotation is visible to in-flight session checkout immediately.
-    let peers_spec: Vec<Peer> = resolved.peers.clone().unwrap_or_default();
-    let peer_tokens = Arc::new(fleet::PeerTokens::new(config::resolve_peer_tokens(
-        &peers_spec,
-    )));
     let state = Arc::new(AppState {
         host: resolved.host.clone(),
         roots: resolved.roots,
-        fleet: Arc::new(fleet::Peers::new(
-            resolved.host,
-            resolved.peers,
-            peer_tokens.clone(),
-        )),
+        fleet: Arc::new(fleet::Peers::new(resolved.host, resolved.peers)),
         limits: resolved.limits,
         journal,
         secrets: resolved.secrets,
@@ -2642,8 +2607,6 @@ pub fn build_app(resolved: Resolved) -> anyhow::Result<(axum::Router, Arc<AuthSt
     let auth = Arc::new(AuthState {
         identities: RwLock::new(resolved.identities),
         spec: resolved.auth,
-        peer_tokens,
-        peers_spec,
         whois,
         enforce_nodes: resolved.whois.enforce,
     });

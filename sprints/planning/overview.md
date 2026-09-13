@@ -127,6 +127,9 @@ rules R1–R6:
   defer to Next; let dogfooding say whether it's missed.
 - **Feedback → korg flow** — feedback lands in kaed's own store first;
   does a periodic job promote it to korg work items, or is that manual?
-- **Port/auth conventions** — one port across hosts, bearer token per agent
-  identity (mirroring klams/korg); exact values decided at first deploy.
+- ~~**Port/auth conventions**~~ — *settled.* One port across hosts (4870),
+  and auth is a **declared identity**, not a bearer: `X-Homelab-Agent:
+  <name>` against an allow-list, one name per machine (PD-7). The bearer
+  token this bullet assumed was shipped in 001, retired in 023 and deleted
+  in 024 — see PD-10 and R13.
 - **ksandbox** — in scope in principle; deploy after the contract settles.
