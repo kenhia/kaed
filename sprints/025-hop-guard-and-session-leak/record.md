@@ -166,3 +166,54 @@ attaching to korg:2589: `ls /proc/$(pgrep -x kaed)/fd | wc -l` hourly on each
 host, and one `roots` through kai timed with the journal's panic count read
 before and after.
 
+
+## Deployed
+
+**`0.1.0-1b80351` (the squash-merge of PR #30), 2026-09-13, all three hosts** —
+published to the package store from clean `main` on kai with `just publish`,
+then installed from that artifact on kai, kubs0 and kubsdb with
+`install.sh --from-store`. No config was touched on any host.
+
+| host | installed | `kaed --version` | unit | MCP `serverInfo.version` |
+|---|---|---|---|---|
+| kai | `0.1.0-1b80351` | matches | active | matches |
+| kubs0 | `0.1.0-1b80351` | matches | active | matches |
+| kubsdb | `0.1.0-1b80351` | matches | active | matches |
+
+One verification detail worth keeping for the next deploy: **kubsdb's `[auth]`
+does not carry `claude-kubsdb`, and should not** — no agent runs there, so the
+identity the round-trip check must use is one kubsdb actually allow-lists
+(`claude-kai`). The first attempt used the host's own name and got a 401 whose
+body named the problem exactly, which is the check working rather than
+failing.
+
+### Verified live — this is WI 2587's second acceptance bullet
+
+The fan-out that was the storm's trigger, with all three hosts on this build:
+
+- **Five sequential `roots` through kai's gateway: 0.057 s each, 3/3 hosts
+  `active` and `verified` every time.** Before: 3 s on kai and **30 s** on
+  kubs0, with a peer intermittently reported unreachable.
+- **A fleet-wide `search` over `*:*`: 0.517 s, 8 roots searched, no host
+  unavailable.** The pattern was `X-Kaed-Hop`, which exists only in kai's
+  tree — so the search demonstrably reached and read the other hosts rather
+  than quietly narrowing.
+- **Descriptors flat at 16 on every host** after those six fan-outs, from a
+  14–15 idle baseline. Before the fix the fleet sat at 1021–1023 of 1024.
+- **Zero panic lines on any host** across the whole window, against ~50k an
+  hour each before.
+
+### The standing warning is lifted
+
+The instruction not to call `roots`, or `search`/`list` with a root pattern,
+is withdrawn as of this deploy: all three hosts run the guard, so there is no
+level left that can recurse. karc legs are unblocked — `start-sprint` calls
+`roots`, which is what the warning had stopped.
+
+### Still open, deliberately
+
+`ls /proc/$(pgrep -x kaed)/fd | wc -l` hourly over a day of real traffic is
+the measurement korg:2589 needs, and it can only be taken now that this is
+live. Six fan-outs proves the bound holds under a burst; it does not prove
+inbound client sessions stop accumulating over a host's uptime, which is
+exactly what that item is for.
