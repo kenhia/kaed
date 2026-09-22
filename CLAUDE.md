@@ -440,10 +440,34 @@ fails, and what the journal structurally cannot tell you — see
   every IO failure already passes through (D-4, on 014 D-1's precedent);
   **"call `roots` first" stays in the instructions** (D-5 — the recursion is
   impossible now, and the advice is how an agent learns host-qualified names);
-  and the **inbound** half is deliberately still open (korg #2589 — rmcp's
-  server has no session idle TTL, `legacy_session_mode` is on by default, and
-  choosing between a custom `session_store` and stateless legacy service needs
-  a measurement that only exists after this deploy).
+  and the **inbound** half was left open for a measurement (korg #2589),
+  which 026 took — **see the 026 bullet: the premise it was filed on turned
+  out to be false**, so don't act on 025's framing of it.
+- **Inbound sessions do not accumulate, and rmcp always had the reaper 025
+  said it lacked** (`sprints/026-inbound-session-measurement/decisions.md`;
+  korg #2589, slice 16 of program 3062). Measured fleet-wide on 2026-09-21
+  after eight days of live traffic: **23 / 15 / 14 open descriptors** on
+  kai / kubs0 / kubsdb against a 65536 limit. Four things not to re-derive:
+  **the idle TTL is `SessionConfig::keep_alive`, defaulting to 300s, on the
+  SESSION MANAGER — not on `StreamableHttpServerConfig`** (D-1 — #2589 read
+  the server config, correctly found no expiry field, and inferred there was
+  none anywhere; `LocalSessionManager::default()` has carried a 300s idle
+  TTL and a 60s `init_timeout` since sprint 001, because rmcp has been pinned
+  at 3.1.0 that whole time. Reading the struct the constructor takes is not
+  reading the configuration); **the 339 descriptors of 2026-09-12 were the
+  fan-out outrunning that reaper**, not an absent one (D-2 — a held legacy
+  SSE stream shows `lastrcv` under 15s because `sse_keep_alive` is 15s, and
+  that is the discriminator: today the two *outbound* peer sockets pinned at
+  `2025-11-25` show 6.6s and 10.8s, while all eight *inbound* sockets show
+  90–251s, so they hold no stream); **neither filed option ships** (D-3 — a
+  custom `session_store` is unnecessary because the knob already exists, and
+  flipping `legacy_session_mode` would change protocol behaviour for every
+  `2025-11-25` client on the fleet, peer clients included, to fix an
+  accumulation that is not happening); and **the negotiated revision is read
+  off the wire, not out of a log** (D-4 — kaed logs no revision, and
+  `initialize` at `2026-07-28` returns no `mcp-session-id` while
+  `2025-11-25` does, which is SEP-2567 and is enough). This also answers
+  WI 2587's third acceptance bullet.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is
