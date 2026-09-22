@@ -140,6 +140,13 @@ friends are unchanged wrappers.
   measurement that would choose between them can only be taken after this
   deploys. Filed with that measurement named. This is WI 2587's third
   acceptance bullet, and it is not delivered.
+
+  > **Corrected by sprint 026 (2026-09-21):** the measurement was taken and
+  > the premise is false — rmcp has had a 300s idle session TTL all along
+  > (`SessionConfig::keep_alive`, on the session manager rather than on
+  > `StreamableHttpServerConfig`). Nothing accumulates; neither closure
+  > ships; WI 2587's third bullet is answered by the measurement. See
+  > `sprints/026-inbound-session-measurement/`.
 - **`LimitNOFILE`** — k-homelab korg:2590, because the unit's source of truth
   is that repo's recipe and applying it is an ops action on three hosts. The
   item names the decision: raise it for margin, or leave it low precisely

@@ -166,3 +166,17 @@ and neither has a measurement behind it yet. That is a decision this sprint
 cannot make from the evidence it has: the correct next step is to measure
 inbound sockets over a day of normal traffic *after* this deploy, when the
 storm is no longer drowning the signal. Filed with that measurement named.
+
+> **Corrected by sprint 026 (2026-09-21).** The measurement was taken and the
+> premise above is **false**: rmcp's streamable-HTTP server *does* have an
+> idle session TTL and a reaper. `SessionConfig::keep_alive` defaults to 300
+> seconds and lives on `LocalSessionManager`, not on
+> `StreamableHttpServerConfig` — which is the struct this paragraph was
+> written from, and which genuinely has no expiry field. kaed takes
+> `LocalSessionManager::default()`, so it has had that TTL since sprint 001.
+> The sockets counted here were the fan-out creating legacy peer sessions
+> faster than a 300s TTL could retire them, not sessions that never expire.
+> Neither closure named above ships. See
+> `sprints/026-inbound-session-measurement/decisions.md` D-1 and D-2. The
+> narrative above is left as written, because what this sprint believed is
+> part of its record.
