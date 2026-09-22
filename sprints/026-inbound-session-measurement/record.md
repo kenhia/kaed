@@ -203,3 +203,27 @@ with nothing older surviving across eight days of uptime. For a `2025-11-25`
 client, an abandoned session is retired by `SessionConfig::keep_alive` at 300
 seconds whether or not its close ever reaches kaed through `tailscale serve`
 — which was the specific worry, and it is handled.
+
+## Deploy — deliberately not run
+
+**Phase 7 (`deploy-fleet`) was skipped, by the overseer's explicit ruling**
+(korg:3060, clearance comment 2888). This section exists so a later reader
+sees a decision rather than a missing step: kaed declares a deploy in
+`.sprint-deploy`, and this is the sprint that did not run it.
+
+Three reasons, the third of which the leg could not have known:
+
+1. **No code changed.** A deploy would move all three hosts to a new version
+   string for a binary that is byte-for-byte equivalent in behaviour. A
+   version bump that does not mean a behaviour change spends the one signal
+   anyone has for "something is different here".
+2. **A kaed restart is scarce.** WI 2943 (the kimac identities) is already
+   waiting on Ken's window precisely because a restart interrupts every live
+   agent session. Spending that interruption on a docs-only change spends the
+   scarce thing on nothing.
+3. **Nine sibling legs of program korg:3062 were running on kai at the time.**
+   Restarting kaed under them is the same self-inflicted failure the
+   program's sequencing notes forbid for karc.
+
+The fleet therefore remains on `0.1.0-5c89bc5`, which is the build this
+sprint measured. **The next code-carrying sprint moves the version.**
