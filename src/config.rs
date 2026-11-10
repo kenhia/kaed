@@ -393,7 +393,7 @@ impl Config {
     pub fn resolve(&self, config_path: Option<&Path>) -> anyhow::Result<Resolved> {
         let journal_path = match &self.journal.path {
             Some(p) => expand_home(p),
-            None => base_dir("XDG_DATA_HOME", ".local/share").join("kaed/journal.db"),
+            None => default_journal_path(),
         };
 
         // Built-ins first: they must hold whatever the roots turn out to be.
@@ -758,6 +758,13 @@ pub struct Identity {
     /// Tailnet nodes this identity may arrive from. Empty = unpinned.
     /// Consulted only when `[whois] enforce` is on (D-5).
     pub nodes: Arc<Vec<String>>,
+}
+
+/// Where the journal lives when `[journal] path` is unset. Public since 027:
+/// the redaction hook opens the same database (read-only) for its
+/// known-digest tier, and must not re-derive the location.
+pub fn default_journal_path() -> PathBuf {
+    base_dir("XDG_DATA_HOME", ".local/share").join("kaed/journal.db")
 }
 
 fn base_dir(xdg_var: &str, home_fallback: &str) -> PathBuf {

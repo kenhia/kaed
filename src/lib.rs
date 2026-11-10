@@ -11,6 +11,7 @@ pub mod errors;
 pub mod fleet;
 pub mod fsops;
 pub mod history;
+pub mod hook;
 pub mod journal;
 pub mod leak;
 pub mod perm;
