@@ -468,6 +468,24 @@ fails, and what the journal structurally cannot tell you — see
   `initialize` at `2026-07-28` returns no `mcp-session-id` while
   `2025-11-25` does, which is SEP-2567 and is enough). This also answers
   WI 2587's third acceptance bullet.
+- **`kaed-redact-hook` is a spike, not a deployed thing, since 027**
+  (`sprints/027-shell-redaction-hook-spike/`; korg WI 2372). It is a Claude
+  Code `PostToolUse` hook built from this crate: `leak::redact`, the
+  rewriting twin of 012's `scan`, applied to tool output. It is **installed
+  nowhere and not in the deploy bundle**, and rollout is Ken's call on the
+  record's recommendation. Four things not to re-derive:
+  - **The session `.jsonl` stores the REPLACEMENT**, measured on Claude Code
+    2.1.308, so transcript mirrors inherit the redaction.
+  - **The precise tiers are precise but catch about 15%.** One non-secret
+    value in 158k tool results, 6 real secrets caught, about 35 missed. The
+    misses are unprefixed homelab tokens the 19-digest index has never seen.
+  - **`secret_shaped` touches 8.6% of all tool results at about 0.2%
+    precision**, so it stays off.
+  - **Don't match `Read`/`Edit`/`Grep`** (D-5). A placeholder in `Read`
+    output becomes an `Edit` `old_string` that matches nothing.
+
+  `MIN_PREFIXED_REDACT_LEN` (20) applies to redaction only. The write path
+  keeps `provider_prefix`'s own floor (D-3).
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is
