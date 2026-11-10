@@ -208,3 +208,14 @@ tier until (2) exists. That routing is the overseer's.
 
 None filed, per the overseer's brief. The two follow-ons above and the
 rollout are for the overseer to route.
+
+## Deployed
+
+**Nothing was deployed, deliberately.** The overseer's clearance (korg:4424
+comment 4495) was "merge only": no kaed restart or redeploy while other legs
+are using it, the same call 026 made. Merged as `2f2aeb1` (PR #33) on
+2026-11-10. `deploy-fleet` was not run, so the fleet stays on its previous
+build. The armor-label narrowing in `leak::scan`, the only daemon-behaviour
+change, ships with the next kaed deploy. `kaed-redact-hook` is not in the
+bundle and is in no live settings file on any host; whether to roll it out
+is Ken's decision on the recommendation above.
