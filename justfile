@@ -45,6 +45,17 @@ publish:
     echo "==> publishing kaed $v as $stamp"
     d=$(ssh -n kubsdb mktemp -d)
     scp target/release/kaed kubsdb:"$d/kaed-$arch"
+    # 028: the PostToolUse redaction hook rides the same bundle. install.sh
+    # puts it on PATH; switching it ON is a settings.json entry this repo
+    # does not own (docs/redact-hook.md).
+    scp target/release/kaed-redact-hook kubsdb:"$d/kaed-redact-hook-$arch"
     scp deploy/install.sh deploy/kaed.service deploy/config.example.toml \
         kubsdb:"$d"/
     ssh -n kubsdb "kpkg artifact $latest_arg kaed $v $d/* && rm -rf $d"
+
+# Values-free inventory of credentials in a transcript corpus (sprint 028;
+# examples/leak_inventory.rs). Fingerprints, key names and counts — never a
+# value. Not part of the deploy bundle and not run by `check`.
+#   just leak-inventory .scratch/inventory.json /ai-data/kagviz-data/live/*/projects
+leak-inventory out +dirs:
+    cargo run --release --example leak_inventory -- --out {{out}} {{dirs}}

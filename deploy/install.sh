@@ -14,8 +14,14 @@
 #                  how the fleet deploys (korg #1015).
 #   (default)      build from this checkout with cargo.
 #
-# What this owns:      the binary, the unit file, and (only if absent) a
-#                      starter config.
+# What this owns:      the binary, the unit file, (only if absent) a
+#                      starter config, and since sprint 028 the
+#                      `kaed-redact-hook` binary beside kaed.
+# What it does NOT do: switch that hook on. A PostToolUse entry in
+#                      ~/.claude/settings.json is what makes Claude Code run
+#                      it, and that file is not this repo's to write
+#                      (docs/redact-hook.md). Installing the binary changes
+#                      nothing until something points at it.
 # What it never
 # touches:             any config that already exists.
 # What it deliberately
@@ -125,6 +131,11 @@ REPO_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 BIN_DST_DIR="$HOME/.local/bin"
 BIN_DST="$BIN_DST_DIR/kaed"
+HOOK_DST="$BIN_DST_DIR/kaed-redact-hook"
+# Where the hook comes from, resolved below alongside the daemon. Empty
+# means "this source has no hook" — an older published version, or --bin —
+# and any hook already installed is left exactly as it is.
+HOOK_SRC=""
 # Sprint 023 retired token minting and rotation: an identity is a declared
 # name, so there is nothing to mint and nothing to rotate. The path is kept
 # only so a stale copy can be REMOVED — a retired tool left on PATH looks
@@ -201,6 +212,24 @@ if [ "$FROM_STORE" -eq 1 ]; then
     BIN_SRC="$WORK/kaed-$SUFFIX"
     chmod 0755 "$BIN_SRC"
 
+    # The hook is optional in the bundle: versions published before 028 do
+    # not carry it, and a rollback to one of them must still install. Its
+    # absence from SHA256SUMS is the signal; a listed file that fails to
+    # fetch or verify is still fatal, as for everything above.
+    HOOK_NAME="kaed-redact-hook-$SUFFIX"
+    hook_line=$(printf '%s\n' "$SUMS" | grep -E "[[:space:]][*]?$HOOK_NAME\$" | head -1 || true)
+    if [ -n "$hook_line" ]; then
+        curl -fsS -o "$WORK/$HOOK_NAME" "$VERSION_URL/$HOOK_NAME" \
+            || fail "fetch failed: $VERSION_URL/$HOOK_NAME (listed in SHA256SUMS)"
+        ( cd "$WORK" && printf '%s\n' "$hook_line" | sha256sum -c --status - ) \
+            || fail "checksum MISMATCH for $HOOK_NAME — refusing to install"
+        note "$HOOK_NAME  checksum OK"
+        HOOK_SRC="$WORK/$HOOK_NAME"
+        chmod 0755 "$HOOK_SRC"
+    else
+        note "$STORE_VERSION predates kaed-redact-hook (sprint 028): hook left as it is"
+    fi
+
     # The checksum proves the transfer; this proves the *label*. A binary
     # published under the wrong version installs cleanly and then lies to
     # `kaed --version` — which is precisely the signal k-homelab's
@@ -213,6 +242,14 @@ if [ "$FROM_STORE" -eq 1 ]; then
         "the fetched binary reports $reported but is published as $STORE_VERSION — the store's labelling is wrong, not this host"
     note "reports $stamp"
 
+    if [ -n "$HOOK_SRC" ]; then
+        hstamp=$("$HOOK_SRC" --version 2>/dev/null) \
+            || fail "the fetched $HOOK_NAME will not run --version here"
+        hreported=$(printf '%s\n' "$hstamp" | awk '{ gsub(/[()]/, "", $3); print $2 "-" $3 }')
+        [ "$hreported" = "$STORE_VERSION" ] || fail \
+            "the fetched hook reports $hreported but is published as $STORE_VERSION"
+    fi
+
     ASSET_DIR="$WORK"
 fi
 
@@ -224,14 +261,20 @@ done
 
 if [ -n "$BIN_SRC" ]; then
     [ -x "$BIN_SRC" ] || fail "no executable at $BIN_SRC"
+    # --bin names one binary. The hook is not guessed from a sibling path.
+    [ "$FROM_STORE" -eq 1 ] || note "--bin: kaed-redact-hook not installed (left as it is)"
 elif [ "$NO_BUILD" -eq 1 ]; then
     BIN_SRC="$REPO_DIR/target/release/kaed"
     [ -x "$BIN_SRC" ] || fail "no binary at $BIN_SRC (drop --no-build, or pass --bin)"
+    if [ -x "$REPO_DIR/target/release/kaed-redact-hook" ]; then
+        HOOK_SRC="$REPO_DIR/target/release/kaed-redact-hook"
+    fi
 else
     command -v cargo >/dev/null 2>&1 \
         || fail "cargo not found; install from the store instead (--from-store), or pass --bin PATH"
     run "cd '$REPO_DIR' && cargo build --release"
     BIN_SRC="$REPO_DIR/target/release/kaed"
+    HOOK_SRC="$REPO_DIR/target/release/kaed-redact-hook"
     if [ "$DRY_RUN" -eq 0 ] && [ ! -x "$BIN_SRC" ]; then
         fail "cargo build produced no binary at $BIN_SRC"
     fi
@@ -249,6 +292,14 @@ if [ -f "$BIN_DST" ]; then
     run "mv -f '$BIN_DST' '$BIN_DST.prev'"
 fi
 run "mv -f '$BIN_DST.new' '$BIN_DST'"
+
+# The hook: temp name + mv, like the daemon, because Claude Code may be
+# exec'ing it at this very moment. No .prev — the off switch for a bad hook
+# is its settings.json entry, not a binary swap, and it fails open anyway.
+if [ -n "$HOOK_SRC" ]; then
+    run "install -m 0755 '$HOOK_SRC' '$HOOK_DST.new'"
+    run "mv -f '$HOOK_DST.new' '$HOOK_DST'"
+fi
 
 if [ -f "$RETIRED_TOKEN_TOOL" ]; then
     note "removing kaed-new-token: rotation is retired (sprint 023)"

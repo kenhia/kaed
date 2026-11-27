@@ -16,7 +16,10 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    version,
+    name = "kaed-redact-hook",
+    // The daemon's stamp, so `install.sh` can hold the hook to the version
+    // it was published under exactly as it holds `kaed` (sprint 028).
+    version = kaed::version::FULL,
     about = "Redact secrets from Claude Code tool output (PostToolUse hook)"
 )]
 struct Args {
