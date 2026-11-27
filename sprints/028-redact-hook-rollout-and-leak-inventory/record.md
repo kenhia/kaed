@@ -119,3 +119,35 @@ Ken ruled on two things at the 2026-11-27 staff meeting:
   so the bundle does not reach them. kubsdb gets the binary with the
   deploy, because it is in the fleet, but it has no Claude Code sessions
   and no settings entry is proposed for it.
+
+## Deployed
+
+`deploy-fleet` (`.sprint-deploy`) ran from merged `main` (`36ee2ce`, PR #35)
+on 2026-11-27 after the overseer's clearance. `just publish` published
+`0.1.0-36ee2ce` as the first bundle to carry `kaed-redact-hook-x86_64-linux`,
+and moved `latest` to it. Every host installed that pinned version with
+`install.sh --from-store`, and every fetched file passed its checksum,
+including the hook.
+
+kaed restarted at these times (PST), each for about a second:
+
+| host | restarted | `kaed --version` | hook `--version` | unit | `check-config` | MCP `serverInfo.version` |
+|---|---|---|---|---|---|---|
+| kai | 12:14:22 | 0.1.0-36ee2ce | 0.1.0-36ee2ce | active | ok | 0.1.0 (36ee2ce 2026-11-27) |
+| kubs0 | 12:14:27 | 0.1.0-36ee2ce | 0.1.0-36ee2ce | active | ok | 0.1.0 (36ee2ce 2026-11-27) |
+| kubsdb | 12:14:28 | 0.1.0-36ee2ce | 0.1.0-36ee2ce | active | ok | 0.1.0 (36ee2ce 2026-11-27), as `claude-kai` |
+
+kubsdb returns 401 to `claude-kubsdb`. That is correct: no agent runs there,
+so its `[auth]` allow-list does not name one.
+
+**Fail-open, on the installed binary.** The checks ran on kai locally and on
+kubs0 from kubs0, each with a fake `ghp_` token minted on that host.
+
+- Garbage input, empty input, an odd `tool_response` shape and clean output
+  each exit 0 with empty stdout.
+- With a missing index, a corrupt index and the real index, the hook exits
+  0, seals the token and lets no copy of it through.
+
+**Not switched on.** No `settings.json` was touched on any host. Per the
+overseer's ruling (korg:5109 comment 5239), the entry and its `claude -p`
+acceptance proof belong to the k-homelab UPS slice, korg:5106.
