@@ -64,3 +64,55 @@ fn garbage_input_fails_open() {
     assert!(out.is_empty());
     assert!(err.contains("unredacted"), "{err}");
 }
+
+/// `install.sh` holds the hook to its published version with the same awk it
+/// uses on `kaed --version` (028), so the stamp has to have the same shape.
+#[test]
+fn version_carries_the_daemon_stamp() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kaed-redact-hook"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let got = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        got.trim(),
+        format!("kaed-redact-hook {}", kaed::version::FULL)
+    );
+}
+
+/// A journal that exists but is not a database (or is mid-migration, or
+/// locked) costs the known-digest tier, never the tool call.
+#[test]
+fn an_unreadable_index_fails_open_to_the_index_free_tiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("journal.db");
+    std::fs::write(&journal, "this is not sqlite").unwrap();
+    let token = "ghp_Q3x9LmA7vK2pR8sT1wY4zB6nC0dE5fGh2J";
+    let input = serde_json::json!({
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_response": {"stdout": format!("GH={token}\n"), "stderr": ""},
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_kaed-redact-hook"))
+        .arg("--journal")
+        .arg(&journal)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stdout.contains(token), "{stdout}");
+    assert!(stdout.contains("\u{27E8}kaed:ghp@"), "{stdout}");
+    assert!(stderr.contains("index-free tiers only"), "{stderr}");
+}

@@ -108,6 +108,15 @@ Every detection is journaled, so "how often does this almost happen?" is a
 query. A file that already contains a token stays editable, including the
 edit that removes it.
 
+Shell output is the one route those two checks cannot see: `cat .env` or
+`docker inspect` puts a live token into the transcript without kaed being
+involved. **`kaed-redact-hook`** is a Claude Code `PostToolUse` hook, installed
+beside the daemon, that runs the same detectors over `Bash`/`PowerShell`
+output and seals what they recognise before the model sees it. It is
+deliberately narrow and measured at roughly **15%** of real leaks: a partial
+guard, not a clean-transcript guarantee. See
+[docs/redact-hook.md](docs/redact-hook.md).
+
 The `secret` tool runs the whole lifecycle on the same terms: kaed mints
 values server-side from a closed shape grammar (`hex(64)`,
 `base64url(43)`, `uuid4`, `prefixed(tag,inner)`), so an agent can create
@@ -147,6 +156,9 @@ is what lets the security story be stated in one paragraph. See
   (re-running it is the upgrade path — building from the checkout, or
   fetching a published, checksum-verified build with `--from-store`), the
   systemd unit and a config template. It never overwrites a config.
+- **[docs/redact-hook.md](docs/redact-hook.md)** — the shell-output
+  redaction hook: what it catches (and the roughly 85% it does not), how to
+  switch it on, and how it fails open.
 - **[docs/kaed-explained.html](docs/kaed-explained.html)** — a single-page
   visual explainer
   ([rendered preview](https://htmlpreview.github.io/?https://github.com/kenhia/kaed/blob/main/docs/kaed-explained.html)).

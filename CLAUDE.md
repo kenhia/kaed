@@ -479,12 +479,13 @@ fails, and what the journal structurally cannot tell you — see
   `initialize` at `2026-07-28` returns no `mcp-session-id` while
   `2025-11-25` does, which is SEP-2567 and is enough). This also answers
   WI 2587's third acceptance bullet.
-- **`kaed-redact-hook` is a spike, not a deployed thing, since 027**
+- **`kaed-redact-hook` began as a spike in 027** — superseded on rollout by
+  the 028 bullet below, which owns its current state
   (`sprints/027-shell-redaction-hook-spike/`; korg WI 2372). It is a Claude
   Code `PostToolUse` hook built from this crate: `leak::redact`, the
-  rewriting twin of 012's `scan`, applied to tool output. It is **installed
-  nowhere and not in the deploy bundle**, and rollout is Ken's call on the
-  record's recommendation. Four things not to re-derive:
+  rewriting twin of 012's `scan`, applied to tool output. Ken adopted the
+  recommendation on 2026-11-27 ("roll out as measured"). Four things not to
+  re-derive:
   - **The session `.jsonl` stores the REPLACEMENT**, measured on Claude Code
     2.1.308, so transcript mirrors inherit the redaction.
   - **The precise tiers are precise but catch about 15%.** One non-secret
@@ -497,6 +498,24 @@ fails, and what the journal structurally cannot tell you — see
 
   `MIN_PREFIXED_REDACT_LEN` (20) applies to redaction only. The write path
   keeps `provider_prefix`'s own floor (D-3).
+- **The hook ships in the bundle since 028, and switching it on is not this
+  repo's job** (`sprints/028-redact-hook-rollout-and-leak-inventory/`;
+  `docs/redact-hook.md`). `just publish` adds `kaed-redact-hook-<arch>` and
+  `install.sh` puts it in `~/.local/bin` beside `kaed`, held to the same
+  published version. Three things not to re-derive:
+  - **The `settings.json` entry belongs to k-homelab**, one recipe per hook
+    (the `ksitrep` and `claude-hooks` recipes are the pattern). Never write
+    it from here or by hand on a managed host.
+  - **The hook is optional in a bundle.** A version published before 028
+    lacks it, a rollback to that version must still install, and an
+    installed hook is then left alone. A hook that IS listed in `SHA256SUMS`
+    and fails to verify is fatal, like any other file.
+  - **cleo cannot have it yet.** The kaed library does not build for Windows
+    (unix-only `perm`/`fsops`/`journal`/`server`), and kaed has no Windows
+    delivery route.
+  `examples/leak_inventory.rs` (`just leak-inventory`) is the values-free
+  corpus inventory from 2026-11-10. Its never-a-value test runs under
+  `cargo test` because the example is declared `test = true`.
 - No exec/shell tool and no git tool in the MCP surface — by design; see
   "What kaed is not" in `sprints/planning/overview.md`.
 - **`search`/`list`: `glob` is matched against ROOT-relative paths and is

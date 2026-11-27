@@ -298,3 +298,79 @@ async fn store_mode_and_build_mode_are_mutually_exclusive() {
     let (run, _home) = install(Some(&store.base), &["--bin", "/bin/true"]).await;
     assert_failed(&run);
 }
+
+// --- the redaction hook (028) ---------------------------------------------
+
+/// Add a `kaed-redact-hook` stub reporting `stamp` to a published version,
+/// and re-sum the directory — what `just publish` has done since 028.
+fn add_hook(store: &Store, version: &str, stamp: &str) -> PathBuf {
+    let vdir = store.version_dir(version);
+    let hook = vdir.join(format!("kaed-redact-hook-{}", target_suffix()));
+    std::fs::write(&hook, format!("#!/bin/sh\nprintf '%s\\n' '{stamp}'\n")).unwrap();
+    write_sums(&vdir);
+    hook
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_with_the_hook_installs_it_beside_kaed() {
+    let store = store_with("0.1.0-b08ce9f", "kaed 0.1.0 (b08ce9f 2026-08-02)").await;
+    add_hook(
+        &store,
+        "0.1.0-b08ce9f",
+        "kaed-redact-hook 0.1.0 (b08ce9f 2026-08-02)",
+    );
+    let (run, _home) = install(Some(&store.base), &[]).await;
+
+    assert_ok(&run);
+    run.says(&format!(
+        "kaed-redact-hook-{}  checksum OK",
+        target_suffix()
+    ))
+    .says("/.local/bin/kaed-redact-hook.new' '")
+    .says("/.local/bin/kaed-redact-hook'");
+}
+
+/// A rollback to a version published before 028 must still install: the
+/// hook's absence is not a broken bundle, and an installed hook is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bundle_without_the_hook_still_installs_and_says_so() {
+    let store = store_with("0.1.0-b08ce9f", "kaed 0.1.0 (b08ce9f 2026-08-02)").await;
+    let (run, _home) = install(Some(&store.base), &[]).await;
+
+    assert_ok(&run);
+    run.says("predates kaed-redact-hook");
+    assert!(
+        !run.output.contains("kaed-redact-hook.new"),
+        "no hook to install, but the plan installs one:\n{}",
+        run.output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_under_the_wrong_label_refuses() {
+    let store = store_with("0.1.0-b08ce9f", "kaed 0.1.0 (b08ce9f 2026-08-02)").await;
+    add_hook(
+        &store,
+        "0.1.0-b08ce9f",
+        "kaed-redact-hook 0.1.0 (0000000 2026-01-01)",
+    );
+    let (run, _home) = install(Some(&store.base), &[]).await;
+
+    assert_failed(&run);
+    run.says("the fetched hook reports 0.1.0-0000000");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tampered_hook_refuses() {
+    let store = store_with("0.1.0-b08ce9f", "kaed 0.1.0 (b08ce9f 2026-08-02)").await;
+    let hook = add_hook(
+        &store,
+        "0.1.0-b08ce9f",
+        "kaed-redact-hook 0.1.0 (b08ce9f 2026-08-02)",
+    );
+    std::fs::write(&hook, "#!/bin/sh\necho swapped\n").unwrap();
+    let (run, _home) = install(Some(&store.base), &[]).await;
+
+    assert_failed(&run);
+    run.says("checksum MISMATCH for kaed-redact-hook");
+}

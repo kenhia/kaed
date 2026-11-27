@@ -64,8 +64,19 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zeroize = "1.8.2"
 
 [dev-dependencies]
+# 028: examples/leak_inventory.rs only. aho-corasick is already in the tree
+# (via grep-regex); sha2 because krot fingerprints are sha256[:12], and the
+# inventory's whole use is joining against them.
+aho-corasick = "1.1.4"
+sha2 = "0.10.9"
 proptest = "1.11.0"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
 rmcp = { version = "3.1.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3.27.0"
 tokio-util = "0.7.19"
+
+# 028: the inventory's "never prints a value" test lives in the example, so
+# `cargo test` (and therefore `just check`) has to run example unit tests.
+[[example]]
+name = "leak_inventory"
+test = true
